@@ -198,7 +198,7 @@ const SignIn = () => {
               modal.querySelector('.swal2-html-container').innerHTML = `
                 <div class="text-center">
                   <div class="checkmark-circle mb-2"><div class="checkmark draw"></div></div>
-                  <div class="text-muted mb-2">SAS Field Service Portal is ready. Verifying session...</div>
+                  <div class="text-muted mb-2">SAS Field Service Portal SANDBOX environment is ready. Verifying session...</div>
                   <div class="progress mb-2" style="height: 6px;"><div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div></div>
                 </div>
               `;
@@ -278,7 +278,7 @@ const SignIn = () => {
               <div className="overlay-gradient d-flex flex-column justify-content-center text-white p-5 h-100">
                 <h1 className="display-4 fw-bold mb-4">Welcome Back!</h1>
                 <p className="lead">
-                  Access your SAS Field Service Management dashboard to manage your operations efficiently.
+                  Access your SAS Field Service Management SANDBOX environment dashboard to manage your operations efficiently.
                 </p>
               </div>
             </div>

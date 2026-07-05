@@ -64,6 +64,21 @@ const DashboardIndexTop = (props) => {
 								style={{ height: '76px', minWidth: '120px', maxWidth: '220px', width: 'auto', objectFit: 'contain' }} 
 							/>
 						</Navbar.Brand>
+						<span
+							className="ms-2 ms-md-3 flex-shrink-0 fw-bold text-uppercase"
+							style={{
+								fontSize: '0.9rem',
+								letterSpacing: '0.14em',
+								color: '#d97706',
+								border: '2px solid #d97706',
+								borderRadius: '4px',
+								padding: '4px 10px',
+								lineHeight: 1.2,
+							}}
+							aria-label="Sandbox environment"
+						>
+							SANDBOX
+						</span>
 						<CompanyMemoTicker />
 					</div>
 					{/* search box */}
