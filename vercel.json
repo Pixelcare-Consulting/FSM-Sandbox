@@ -1,11 +1,4 @@
 {
-  "installCommand": "ENABLE_EXPERIMENTAL_COREPACK=1 corepack enable && pnpm install --frozen-lockfile --config.production=false",
-  "build": {
-    "env": {
-      "ENABLE_EXPERIMENTAL_COREPACK": "1",
-      "NODE_OPTIONS": "--max-old-space-size=6144"
-    }
-  },
   "headers": [
     {
       "source": "/site.webmanifest",
