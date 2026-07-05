@@ -2,6 +2,7 @@
   "name": "sas-sapb1-portal",
   "version": "3.15.0",
   "private": true,
+  "packageManager": "pnpm@11.1.1",
   "scripts": {
     "dev": "next dev --turbopack -H 0.0.0.0 -p 4000",
     "dev:webpack": "next dev --webpack -H 0.0.0.0 -p 4000",
@@ -98,6 +99,7 @@
     "@mui/material": "^6.1.4",
     "@mui/system": "^6.1.4",
     "@mui/x-data-grid": "^7.19.0",
+    "@mui/x-date-pickers": "^7.29.3",
     "@pathofdev/react-tag-input": "^1.0.7",
     "@react-google-maps/api": "^2.20.3",
     "@react-pdf/renderer": "^4.3.1",
