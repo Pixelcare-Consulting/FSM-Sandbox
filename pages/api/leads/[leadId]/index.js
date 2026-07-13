@@ -16,6 +16,8 @@ import {
   AUDIT_STATUS,
   buildChanges,
 } from '../../../../lib/services/auditLog';
+import { invalidateListCache } from '../../../../lib/supabase/listQueryHelpers';
+import { PORTAL_LIST_CACHE_PREFIX } from '../../../../lib/leads/portalListCache';
 
 export default async function handler(req, res) {
   // Add CORS headers
@@ -148,6 +150,8 @@ export default async function handler(req, res) {
         status: AUDIT_STATUS.SUCCESS,
       });
 
+      invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
+
       return res.status(200).json({
         success: true,
         lead,
@@ -157,6 +161,8 @@ export default async function handler(req, res) {
     if (req.method === 'DELETE') {
       const leadToDelete = await leadService.findById(leadId);
       await leadService.delete(leadId);
+
+      invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
 
       await writeAuditLogFromRequest(req, {
         action: AUDIT_ACTIONS.LEAD_DELETE,

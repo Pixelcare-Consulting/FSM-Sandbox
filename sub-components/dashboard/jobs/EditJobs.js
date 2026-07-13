@@ -20,13 +20,13 @@ import { getSupabaseClient } from "../../../lib/supabase/client";
 import { refreshTechnicianHoursForJobId } from "../../../lib/supabase/technicianHours";
 import { jobService, userService, customerService } from "../../../lib/supabase/database";
 import { emitJobStakeholderNotifications } from "../../../lib/notifications/jobStakeholderNotificationsClient";
-import { dispatchSchedulerInvalidate } from "../../../lib/scheduler/schedulerCache";
 import {
   emitJobAssignmentEmails,
   emitJobCompletedEmail,
 } from "../../../lib/notifications/transactionalJobEmailClient";
 import { showJobCompletedEmailToast } from "../../../lib/email/jobEmailToastMessages";
-import { fetchJobStatuses, getDefaultJobStatuses } from "../../../utils/jobStatusSettings";
+import { fetchJobStatuses, getDefaultJobStatuses, formatJobStatusDisplayLabel } from "../../../utils/jobStatusSettings";
+import { findJobStatusEntry } from "../../../utils/jobStatusDefaults";
 import { clientAuditLog, buildAuditChanges } from "../../../utils/clientAuditLog";
 import { buildJobEditAuditSnapshot } from "../../../utils/jobEditAudit";
 import { toLocalYmd } from "../../../lib/utils/localDate";
@@ -36,7 +36,11 @@ import {
   toSingaporeYmd,
 } from "../../../lib/utils/singaporeDateTime";
 import { findServiceJobContactTypeOption } from "../../../lib/jobs/portalDefaultJobContactType";
-import { isJobStatusCompleted } from "../../../lib/jobs/isJobStatusCompleted";
+import {
+  resolveJobStatusForDb,
+  mapJobStatusToAssignmentStatus,
+  toDbStatus,
+} from "../../../lib/jobs/jobStatusPersistence";
 import {
   buildGroupedLocationOptions,
   countGroupedLocationOptions,
@@ -45,6 +49,10 @@ import {
   locationSelectOptionLabel,
   locationSelectStyles,
 } from "../../../lib/jobs/jobFormLocationSelect";
+import {
+  mapAssignableWorkersToOptions,
+  mergeWorkerSelectOptions,
+} from "../../../lib/jobs/assignableWorkerSelect";
 import { upsertJobCustomerLocation } from "../../../lib/jobs/upsertJobCustomerLocation";
 import { resolveContactIdFromSelection } from "../../../lib/jobs/upsertJobContactFromSelection";
 import {
@@ -57,6 +65,10 @@ import {
 import { sanitizeAifmEmbeddedTagValue } from "../../../lib/utils/aifmLocationFormat";
 import { normalizeRichTextHtml } from "../../../lib/utils/normalizeRichTextHtml";
 import mapDbContactsToSelectOptions from "../../../lib/jobs/mapDbContactsToSelectOptions";
+import {
+  invalidateJobCachesAfterMutation,
+} from "../../../lib/jobs/invalidateJobMutationCaches";
+import { queryKeys } from "../../../lib/cache/queryKeys";
 import JobRecurrenceModal from "./_components/JobRecurrenceModal";
 import EditJobFormSkeleton from "./_components/EditJobFormSkeleton";
 import {
@@ -74,6 +86,7 @@ import toast from "react-hot-toast";
 import JobTask from "./tabs/JobTasklist";
 import EquipmentsTableWithAddDelete from "pages/dashboard/tables/datatable-equipments-update";
 import { useRouter } from "next/router";
+import { useQueryClient } from "react-query";
 import { FlatPickr, FormSelect, DropFiles, ReactQuillEditor } from "widgets";
 import Flatpickr from "react-flatpickr";
 import { OverlayTrigger, Tooltip } from "react-bootstrap";
@@ -108,35 +121,6 @@ const mapPriorityToDatabase = (priority) => {
     High: 'HIGH',
   };
   return priorityMap[v] ?? priorityMap[v.charAt(0).toUpperCase() + v.slice(1).toLowerCase()] ?? 'MEDIUM';
-};
-
-// Job status: use Settings > Job Statuses only. DB expects CANCELLED (two Ls), not CANCELED.
-const toDbStatus = (val) => {
-  if (!val || !String(val).trim()) return "";
-  const s = String(val).trim().toUpperCase().replace(/\s+/g, "_");
-  return s === "CANCELED" ? "CANCELLED" : s;
-};
-
-// Persist numeric U_JobStatusID as-is when from SAP API; otherwise use toDbStatus for legacy values.
-const resolveJobStatusForDb = (formStatus, jobStatusesList) => {
-  const v = formStatus && String(formStatus).trim();
-  if (v) {
-    if (/^-?\d+$/.test(v)) return v;
-    const normalized = toDbStatus(v);
-    const fromList = jobStatusesList?.find((s) => toDbStatus(s.value) === normalized || String(s.value || "").trim() === v);
-    if (fromList?.value) return /^-?\d+$/.test(String(fromList.value)) ? fromList.value : toDbStatus(fromList.value);
-    return normalized;
-  }
-  return jobStatusesList?.[0]?.value != null ? String(jobStatusesList[0].value) : "554";
-};
-
-// Maps a resolved jobs.status value to the allowed technician_jobs.assignment_status value.
-const mapJobStatusToAssignmentStatus = (jobStatus) => {
-  if (isJobStatusCompleted(jobStatus)) return 'COMPLETED';
-  const s = (jobStatus || '').toUpperCase();
-  if (s.includes('CANCEL')) return 'CANCELLED';
-  if (s.includes('STARTED') || s.includes('IN_PROGRESS') || s.includes('INPROGRESS')) return 'STARTED';
-  return 'ASSIGNED';
 };
 
 // Reverse mapping functions to convert database values to form values
@@ -446,18 +430,70 @@ function findMatchingContactOption(formattedContacts, savedContact) {
   return null;
 }
 
-function buildSavedServiceCallOption(serviceCallID) {
-  const id = String(serviceCallID);
+/**
+ * Synthetic Select option when the job's Service Call ID is not in the live SAP list.
+ * Prefers local service_call.subject; never uses "(saved)" as subject (avoids DB pollution on upsert).
+ */
+async function buildSavedServiceCallOption(serviceCallID) {
+  const id = String(serviceCallID ?? "").trim();
+  if (!id) return null;
+
+  let callNumber = id;
+  let subject = "";
+
+  try {
+    const supabase = getSupabaseClient();
+    if (supabase) {
+      const isUUID = id.includes("-") && id.length === 36;
+      const { data: row } = isUUID
+        ? await supabase
+            .from("service_call")
+            .select("call_number, subject")
+            .eq("id", id)
+            .is("deleted_at", null)
+            .maybeSingle()
+        : await supabase
+            .from("service_call")
+            .select("call_number, subject")
+            .eq("call_number", id)
+            .is("deleted_at", null)
+            .maybeSingle();
+
+      if (row?.call_number) {
+        callNumber = String(row.call_number).trim();
+      }
+      const rawSubject = row?.subject != null ? String(row.subject).trim() : "";
+      if (rawSubject && rawSubject !== "(saved)") {
+        subject = rawSubject;
+      }
+    }
+  } catch (err) {
+    console.warn("buildSavedServiceCallOption lookup:", err);
+  }
+
   return {
-    value: serviceCallID,
-    label: `${id} - (saved)`,
-    serviceCallID,
-    subject: "(saved)",
+    value: callNumber,
+    label: subject ? `${callNumber} - ${subject}` : callNumber,
+    serviceCallID: callNumber,
+    subject,
   };
+}
+
+function resolveServiceCallSubjectForUpsert(selectedServiceCall) {
+  const raw =
+    selectedServiceCall?.subject != null
+      ? String(selectedServiceCall.subject).trim()
+      : "";
+  if (raw && raw !== "(saved)") return raw;
+  const id = selectedServiceCall?.value ?? selectedServiceCall?.serviceCallID;
+  return id != null && String(id).trim() !== ""
+    ? `Service Call ${String(id).trim()}`
+    : "Service Call";
 }
 
 const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const { startDate, endDate, startTime, endTime, workerId, scheduleSession } =
     router.query;
   // UI states
@@ -565,6 +601,10 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
   const [selectedCustomer, setSelectedCustomer] = useState(null);
   const [selectedContact, setSelectedContact] = useState(null);
   const [selectedLocation, setSelectedLocation] = useState(null);
+  /** Explicit Site/Location clear — honor null location_id on save even if job still has a stale FK. */
+  const [locationClearedByUser, setLocationClearedByUser] = useState(false);
+  /** User edited address fields — write form values (incl. clears) and skip bare-address guard. */
+  const [locationAddressTouched, setLocationAddressTouched] = useState(false);
   const [selectedWorkers, setSelectedWorkers] = useState([]);
   const [selectedServiceCall, setSelectedServiceCall] = useState(null);
   const [selectedSalesOrder, setSelectedSalesOrder] = useState(null);
@@ -575,6 +615,8 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
   const [contacts, setContacts] = useState([]);
   const [locations, setLocations] = useState([]);
   const [workers, setWorkers] = useState([]);
+  const [workersLoading, setWorkersLoading] = useState(false);
+  const [workerSearchInput, setWorkerSearchInput] = useState("");
   const [equipments, setEquipments] = useState([]);
   const [serviceCalls, setServiceCalls] = useState([]);
   const [salesOrders, setSalesOrders] = useState([]);
@@ -596,14 +638,16 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
   const customerSeededRef = useRef(false);
   const jobHydratedFromFetchRef = useRef(false);
   const workersHydratedRef = useRef(false);
+  const workerQueryPrefillHandledRef = useRef(false);
   const pendingJobContactTypeRef = useRef(null);
   const initialCustomerAppliedRef = useRef(false);
   const customerChangeInFlightRef = useRef(false);
 
+  // Match Create Job: show the form once core lookups are ready. SAP contacts /
+  // locations / service calls hydrate in the background (customerRelatedDataLoaded).
   const isFormReady =
     jobDataLoaded &&
     customersLoaded &&
-    customerRelatedDataLoaded &&
     workersLoaded &&
     jobStatusesLoaded &&
     jobContactTypesLoaded &&
@@ -904,13 +948,18 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       });
     }
 
-    // Handle worker selection if workerId is provided
-    if (router.query.workerId && workers.length > 0) {
+    // Handle worker selection if workerId is provided (once only)
+    if (
+      !workerQueryPrefillHandledRef.current &&
+      router.query.workerId &&
+      workers.length > 0
+    ) {
       const selectedWorker = workers.find(
-        (worker) => worker.value === router.query.workerId
+        (worker) => String(worker.value) === String(router.query.workerId)
       );
       if (selectedWorker) {
         setSelectedWorkers([selectedWorker]);
+        workerQueryPrefillHandledRef.current = true;
       }
     }
   }, [router.isReady, router.query, workers]);
@@ -1021,14 +1070,24 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
     setFormData((prev) => {
       if (!prev) return prev;
       const raw = prev.jobStatus != null ? String(prev.jobStatus).trim() : "";
-      const hasMatch =
-        raw &&
-        jobStatuses.some(
-          (s) =>
-            String(s.value || "").trim() === raw ||
-            toDbStatus(s.value) === toDbStatus(raw)
-        );
+      if (!raw) return prev;
+
+      const hasMatch = jobStatuses.some(
+        (s) =>
+          String(s.value || "").trim() === raw ||
+          toDbStatus(s.value) === toDbStatus(raw)
+      );
       if (hasMatch) return prev;
+
+      // Name match (e.g. saved "On Progress" → Settings option value)
+      const byName = findJobStatusEntry(raw, jobStatuses);
+      if (byName?.value != null && String(byName.value).trim() !== "") {
+        const matchedVal = String(byName.value).trim();
+        if (matchedVal !== raw) {
+          return { ...prev, jobStatus: matchedVal };
+        }
+        return prev;
+      }
 
       const resolved = resolveJobStatusForDb(prev.jobStatus, jobStatuses);
       if (String(resolved || "").trim() === raw) return prev;
@@ -1115,6 +1174,7 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
           customer_address: c.customer_address,
           email: c.email || "",
           phone_number: c.phone_number || "",
+          sap_card_code: c.sap_card_code || null,
         }));
       } else {
         const rows = Array.isArray(data) ? data : [];
@@ -1317,56 +1377,76 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
     }));
   }, [jobDataLoaded, jobContactTypes, selectedJobContactType]);
 
-  useEffect(() => {
-    const fetchUsers = async () => {
-      try {
-        const res = await fetch("/api/workers/summary?limit=200", {
-          credentials: "same-origin",
-        });
-        if (!res.ok) {
-          throw new Error(`Workers summary failed (${res.status})`);
-        }
+  const workerSearchDebounceRef = useRef(null);
+  const workerSearchSeqRef = useRef(0);
 
-        const payload = await res.json();
-        const usersList = (payload.workers || [])
-          .filter(
-            (worker) =>
-              worker.role === "TECHNICIAN" && worker.status === "ACTIVE"
-          )
-          .map((worker) => ({
-            value: worker.id,
-            label: worker.fullName || worker.username,
-            workerId: worker.id,
-            technicianId: worker.workerId,
-            status: worker.status || "ACTIVE",
-          }));
+  const fetchAssignableWorkers = useCallback(async (search = "") => {
+    const seq = ++workerSearchSeqRef.current;
+    setWorkersLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "200" });
+      const trimmed = String(search || "").trim();
+      if (trimmed) params.set("search", trimmed);
+      const res = await fetch(`/api/workers/assignable?${params.toString()}`, {
+        credentials: "same-origin",
+      });
+      if (!res.ok) {
+        throw new Error(`Assignable workers failed (${res.status})`);
+      }
 
-        if (usersList.length === 0) {
-          console.warn("No technicians found in database");
-          setWorkers([]);
-          toast.warning(
-            "No workers available. Please check technician records.",
-            {
-              duration: 5000,
-            }
-          );
-          return;
-        }
+      const payload = await res.json();
+      if (seq !== workerSearchSeqRef.current) return;
 
-        setWorkers(usersList);
-      } catch (error) {
-        console.error("Error fetching users:", error);
-        toast.error("Failed to fetch workers. Please try again.", {
-          duration: 5000,
-        });
+      const usersList = mapAssignableWorkersToOptions(payload.workers);
+
+      if (usersList.length === 0 && !trimmed) {
+        console.warn("No technicians found in database");
         setWorkers([]);
-      } finally {
+        toast.warning(
+          "No workers available. Please check technician records.",
+          {
+            duration: 5000,
+          }
+        );
+        return;
+      }
+
+      setWorkers(usersList);
+    } catch (error) {
+      if (seq !== workerSearchSeqRef.current) return;
+      console.error("Error fetching assignable workers:", error);
+      toast.error("Failed to fetch workers. Please try again.", {
+        duration: 5000,
+      });
+      setWorkers([]);
+    } finally {
+      if (seq === workerSearchSeqRef.current) {
+        setWorkersLoading(false);
         setWorkersLoaded(true);
       }
-    };
-
-    fetchUsers();
+    }
   }, []);
+
+  const workerSelectOptions = useMemo(
+    () => mergeWorkerSelectOptions(workers, selectedWorkers),
+    [workers, selectedWorkers]
+  );
+
+  useEffect(() => {
+    fetchAssignableWorkers("");
+    return () => {
+      if (workerSearchDebounceRef.current) clearTimeout(workerSearchDebounceRef.current);
+    };
+  }, [fetchAssignableWorkers]);
+
+  const handleWorkerSearchInputChange = (inputValue, { action }) => {
+    if (action !== "input-change") return;
+    setWorkerSearchInput(inputValue);
+    if (workerSearchDebounceRef.current) clearTimeout(workerSearchDebounceRef.current);
+    workerSearchDebounceRef.current = setTimeout(() => {
+      fetchAssignableWorkers(inputValue);
+    }, 300);
+  };
 
   // Match assigned workers with workers list once on initial load only
   useEffect(() => {
@@ -1411,6 +1491,9 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       (worker) => String(worker.status || "ACTIVE").toUpperCase() === "ACTIVE"
     );
     setSelectedWorkers(activeSelections);
+    setWorkerSearchInput("");
+    if (workerSearchDebounceRef.current) clearTimeout(workerSearchDebounceRef.current);
+    fetchAssignableWorkers("");
 
     const formattedWorkers = activeSelections.map((worker) => ({
       workerId: worker.value,
@@ -1630,7 +1713,8 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
             selectablePortalLocations[0] ||
             fallbackPrimaryLocation;
           await handleLocationChange(
-            enrichPortalLocationOption(baseLocation, savedLocation, portalAddress)
+            enrichPortalLocationOption(baseLocation, savedLocation, portalAddress),
+            { skipGeocode: true }
           );
         }
       } else {
@@ -1671,7 +1755,10 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         jobHydratedFromFetchRef.current = true;
       }
     } else {
-    setIsLoading(true);
+    // Background SAP hydration on mount — do not block the form with isLoading.
+    if (!isInitialHydration) {
+      setIsLoading(true);
+    }
 
     const cardCode = resolveCustomerCardCode(initialJobData, selectedOption);
     if (!cardCode) {
@@ -1784,11 +1871,19 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       let formattedServiceCalls = [];
       let matchedServiceCall = null;
 
+      const relatedCardCodes = [];
+      if (selectedCustomer?.sap_card_code) {
+        const sapCode = String(selectedCustomer.sap_card_code).trim();
+        if (sapCode && sapCode.toUpperCase() !== String(cardCode).toUpperCase()) {
+          relatedCardCodes.push(sapCode);
+        }
+      }
+
       const serviceCallResponse = await fetch("/api/getServiceCall", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cardCode }),
+        body: JSON.stringify({ cardCode, relatedCardCodes }),
       });
 
       if (serviceCallResponse.ok) {
@@ -1796,16 +1891,23 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         formattedServiceCalls = (Array.isArray(serviceCallsData)
           ? serviceCallsData
           : []
-        ).map((item) => ({
-          value: item.serviceCallID,
-          label: `${item.serviceCallID} - ${item.subject}`,
-          serviceCallID: item.serviceCallID,
-          subject: item.subject,
-          customerName: item.customerName,
-          createDate: item.createDate,
-          createTime: item.createTime,
-          description: item.description,
-        }));
+        ).map((item) => {
+          const subject = item.subject || "";
+          const suffix = item.fetchedForCardCode && item.fetchedForCardCode !== cardCode
+            ? ` (${item.fetchedForCardCode})`
+            : "";
+          return {
+            value: item.serviceCallID,
+            label: `${item.serviceCallID} - ${subject}${suffix}`,
+            serviceCallID: item.serviceCallID,
+            subject: item.subject,
+            customerName: item.customerName,
+            createDate: item.createDate,
+            createTime: item.createTime,
+            description: item.description,
+            fetchedForCardCode: item.fetchedForCardCode,
+          };
+        });
       }
 
       if (existingServiceCallID) {
@@ -1846,8 +1948,10 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         }
 
         if (!matchedServiceCall && isSameAsInitialCustomer) {
-          matchedServiceCall = buildSavedServiceCallOption(existingServiceCallID);
-          formattedServiceCalls = [...formattedServiceCalls, matchedServiceCall];
+          matchedServiceCall = await buildSavedServiceCallOption(existingServiceCallID);
+          if (matchedServiceCall) {
+            formattedServiceCalls = [...formattedServiceCalls, matchedServiceCall];
+          }
         }
       }
 
@@ -1924,7 +2028,8 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
             savedLocation
           );
           if (matchedLocation) {
-            await handleLocationChange(matchedLocation);
+            // Initial hydration: keep job coordinates; geocode only on user change.
+            await handleLocationChange(matchedLocation, { skipGeocode: true });
           }
         }
         if (countGroupedLocationOptions(groupedLocations) === 0) {
@@ -1983,7 +2088,11 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       }
 
       if (formattedServiceCalls.length === 0 && !matchedServiceCall) {
-        toast("No service calls found for this customer.", {
+        const sapLeadCode = selectedCustomer?.sap_card_code;
+        const emptyHint = sapLeadCode
+          ? `No service calls under ${cardCode}. Open quotations do not create service calls — check SAP Lead ${sapLeadCode} or create a Service Call in SAP first.`
+          : `No service calls found. Open quotations do not create service calls — convert this portal customer to SAP (L*) first, then check the Lead code.`;
+        toast(emptyHint, {
           icon: "⚠️",
           duration: 5000,
           style: warningToastStyle,
@@ -1995,54 +2104,16 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         setServiceCalls([]);
         setSalesOrders([]);
       } else if (existingServiceCallID) {
-        matchedServiceCall = buildSavedServiceCallOption(existingServiceCallID);
-        setServiceCalls([matchedServiceCall]);
-        setSelectedServiceCall(matchedServiceCall);
-      }
-    }
-
-    if (matchedServiceCall) {
-      try {
-        const salesOrderResponse = await fetch("/api/getSalesOrder", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            cardCode,
-            serviceCallID:
-              matchedServiceCall.serviceCallID || matchedServiceCall.value,
-          }),
-        });
-
-        if (salesOrderResponse.ok) {
-          const salesOrderData = await salesOrderResponse.json();
-          if (salesOrderData && Array.isArray(salesOrderData.value)) {
-            const formattedSalesOrders = salesOrderData.value.map((order) => ({
-              value: order.DocNum.toString(),
-              label: `${order.DocNum} - ${getStatusText(order.DocStatus)}`,
-              docTotal: order.DocTotal,
-              docStatus: order.DocStatus,
-            }));
-            setSalesOrders(formattedSalesOrders);
-
-            const existingSalesOrderID =
-              formData.salesOrderID || initialJobData?.salesOrderID;
-            if (existingSalesOrderID) {
-              const matchedSalesOrder = formattedSalesOrders.find(
-                (so) =>
-                  so.value === existingSalesOrderID?.toString() ||
-                  so.value?.toString() === existingSalesOrderID?.toString()
-              );
-              if (matchedSalesOrder) {
-                setSelectedSalesOrder(matchedSalesOrder);
-              }
-            }
-          }
+        matchedServiceCall = await buildSavedServiceCallOption(existingServiceCallID);
+        if (matchedServiceCall) {
+          setServiceCalls([matchedServiceCall]);
+          setSelectedServiceCall(matchedServiceCall);
         }
-      } catch (salesOrderError) {
-        console.error("Error fetching sales orders:", salesOrderError);
       }
     }
+
+    // Sales orders are deferred until service-call change or sales-order menu open
+    // (selectedSalesOrder is already seeded from initialJobData).
 
     setHasChanges(!isSameAsInitialCustomer);
     if (isInitialHydration) {
@@ -2086,7 +2157,27 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
   };
 
   const handleContactChange = (selectedOption) => {
-    if (!selectedOption) return;
+    if (!selectedOption) {
+      setSelectedContact(null);
+      setFormData((prev) => ({
+        ...prev,
+        contact: {
+          contactID: "",
+          contactFullname: "",
+          firstName: "",
+          middleName: "",
+          lastName: "",
+          email: "",
+          mobilePhone: "",
+          phoneNumber: "",
+          notification: {
+            notifyCustomer: prev?.contact?.notification?.notifyCustomer || false,
+          },
+        },
+      }));
+      setHasChanges(true);
+      return;
+    }
 
     setFormData((prevFormData) => ({
       ...prevFormData,
@@ -2097,10 +2188,14 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
     setHasChanges(true);
   };
 
-  const handleLocationChange = async (selectedOption) => {
+  const handleLocationChange = async (selectedOption, options = {}) => {
+    const { skipGeocode = false } = options;
+
     if (!selectedOption) {
       // Handle clearing the selection
       setSelectedLocation(null);
+      setLocationClearedByUser(true);
+      setLocationAddressTouched(false);
       setFormData(prev => ({
         ...prev,
         location: {
@@ -2128,6 +2223,8 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
     // Find the selected location from the flattened options
     const selectedLocation = selectedOption;
 
+    setLocationClearedByUser(false);
+    setLocationAddressTouched(false);
     setSelectedLocation(selectedLocation);
 
     // Update nested `location` and `address` in `formData`
@@ -2135,6 +2232,12 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       ...prevFormData,
       location: buildJobFormLocationPatch(selectedLocation, prevFormData.location),
     }));
+
+    // Initial hydration: keep coordinates already on the job; geocode only when the user changes location.
+    if (skipGeocode) {
+      setHasChanges(true);
+      return;
+    }
 
     // Construct full address for geocoding
     const fullAddress = [
@@ -2271,6 +2374,7 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         location: { ...prev.location, locationName: value },
       }));
     } else {
+      setLocationAddressTouched(true);
       setFormData((prev) => ({
         ...prev,
         location: {
@@ -2322,35 +2426,39 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
     setHasChanges(true);
   };
 
-  const handleSelectedServiceCallChange = async (selectedServiceCall) => {
-    setSelectedServiceCall(selectedServiceCall);
-    setSelectedSalesOrder(null); // Reset sales order when service call changes
-    setHasChanges(true);
-
-    if (!selectedServiceCall) {
+  const fetchSalesOrdersForServiceCall = async (
+    serviceCall,
+    { quiet = false } = {}
+  ) => {
+    if (!serviceCall) {
       setSalesOrders([]);
       return;
     }
 
     const cardCode = resolveCustomerCardCode(formData, selectedCustomer);
     if (!selectedCustomer || !cardCode) {
-      toast.error("Please select a customer first", {
-        duration: 3000,
-      });
+      if (!quiet) {
+        toast.error("Please select a customer first", {
+          duration: 3000,
+        });
+      }
       return;
     }
 
+    const toastId = "salesOrdersFetch";
     try {
-      // Show loading toast
-      toast.loading("Fetching sales orders...", { id: "salesOrdersFetch" });
+      if (!quiet) {
+        toast.loading("Fetching sales orders...", { id: toastId });
+      }
 
       const requestPayload = {
         cardCode,
-        serviceCallID: selectedServiceCall.value || selectedServiceCall.serviceCallID,
+        serviceCallID: serviceCall.value || serviceCall.serviceCallID,
       };
 
       const response = await fetch("/api/getSalesOrder", {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
         },
@@ -2358,14 +2466,16 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        toast.dismiss("salesOrdersFetch");
-        toast.error(
-          `Error fetching sales orders: ${errorData.error || "Unknown error"}`,
-          {
-            duration: 5000,
-          }
-        );
+        const errorData = await response.json().catch(() => ({}));
+        if (!quiet) {
+          toast.dismiss(toastId);
+          toast.error(
+            `Error fetching sales orders: ${errorData.error || "Unknown error"}`,
+            {
+              duration: 5000,
+            }
+          );
+        }
         setSalesOrders([]);
         return;
       }
@@ -2381,40 +2491,74 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         }));
 
         setSalesOrders(formattedSalesOrders);
-        toast.dismiss("salesOrdersFetch");
-        
-        if (formattedSalesOrders.length === 0) {
+
+        const existingSalesOrderID =
+          selectedSalesOrder?.value ||
+          formData.salesOrderID ||
+          initialJobData?.salesOrderID;
+        if (existingSalesOrderID) {
+          const matchedSalesOrder = formattedSalesOrders.find(
+            (so) =>
+              so.value === existingSalesOrderID?.toString() ||
+              so.value?.toString() === existingSalesOrderID?.toString()
+          );
+          if (matchedSalesOrder) {
+            setSelectedSalesOrder(matchedSalesOrder);
+          }
+        }
+
+        if (!quiet) {
+          toast.dismiss(toastId);
+          if (formattedSalesOrders.length === 0) {
+            toast("No sales orders found for this service call", {
+              icon: "⚠️",
+              duration: 5000,
+            });
+          } else {
+            toast.success(
+              `Found ${formattedSalesOrders.length} sales order${
+                formattedSalesOrders.length > 1 ? "s" : ""
+              } for Service Call ${serviceCall.value}`,
+              {
+                duration: 5000,
+              }
+            );
+          }
+        }
+      } else {
+        setSalesOrders([]);
+        if (!quiet) {
+          toast.dismiss(toastId);
+          console.warn("No sales orders found or invalid data format:", data);
           toast("No sales orders found for this service call", {
             icon: "⚠️",
             duration: 5000,
           });
-        } else {
-          toast.success(
-            `Found ${formattedSalesOrders.length} sales order${
-              formattedSalesOrders.length > 1 ? "s" : ""
-            } for Service Call ${selectedServiceCall.value}`,
-            {
-              duration: 5000,
-            }
-          );
         }
-      } else {
-        setSalesOrders([]);
-        toast.dismiss("salesOrdersFetch");
-        console.warn('No sales orders found or invalid data format:', data);
-        toast("No sales orders found for this service call", {
-          icon: "⚠️",
-          duration: 5000,
-        });
       }
     } catch (error) {
       console.error("Error fetching sales orders:", error);
-      toast.dismiss("salesOrdersFetch");
-      toast.error(`Failed to fetch sales orders: ${error.message}`, {
-        duration: 5000,
-      });
+      if (!quiet) {
+        toast.dismiss(toastId);
+        toast.error(`Failed to fetch sales orders: ${error.message}`, {
+          duration: 5000,
+        });
+      }
       setSalesOrders([]);
     }
+  };
+
+  const handleSelectedServiceCallChange = async (selectedServiceCall) => {
+    setSelectedServiceCall(selectedServiceCall);
+    setSelectedSalesOrder(null); // Reset sales order when service call changes
+    setHasChanges(true);
+
+    if (!selectedServiceCall) {
+      setSalesOrders([]);
+      return;
+    }
+
+    await fetchSalesOrdersForServiceCall(selectedServiceCall);
   };
 
   // Add a new function to handle equipment selection changes
@@ -2882,10 +3026,13 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
         customerId && previousCustomerId && customerId !== previousCustomerId;
 
       // Get or find location_id if location is selected (aligned with CreateJobs.js)
-      // When customer changes, clear stale location unless user picked a new one below
-      let locationId = customerChanged ? null : (currentJobData?.location_id || null);
+      // When customer changes, clear stale location unless user picked a new one below.
+      // Explicit Site/Location clear must null jobs.location_id.
+      let locationId = null;
       let resolvedCustomerLocationId = null;
-      if (selectedLocation && customerId) {
+      if (locationClearedByUser) {
+        locationId = null;
+      } else if (selectedLocation && customerId) {
         const locationName =
           selectedLocation.value ||
           selectedLocation.siteId ||
@@ -2896,11 +3043,29 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
           '';
 
         // Prefer the richer of the selected option vs the nested form address so a
-        // bare site label never wins over a full street address.
-        const mergedLocation = mergeSelectedLocationWithFormAddress(
-          selectedLocation,
-          formData.location
-        );
+        // bare site label never wins over a full street address — unless the user
+        // intentionally edited address fields (incl. clears).
+        const formAddr = formData.location?.address || {};
+        const formStreet = String(formAddr.streetAddress || '').trim() || null;
+        const mergedLocation = locationAddressTouched
+          ? {
+              ...selectedLocation,
+              street: formStreet,
+              building: String(formAddr.buildingNo || '').trim() || null,
+              block: String(formAddr.block || '').trim() || null,
+              city: String(formAddr.city || '').trim() || null,
+              zipCode: String(formAddr.postalCode || '').trim() || null,
+              streetNo: String(formAddr.streetNo || '').trim() || null,
+              countryName: String(formAddr.country || '').trim() || null,
+              stateProvince: String(formAddr.stateProvince || '').trim() || null,
+              address: formStreet,
+              addressType:
+                selectedLocation.addressType || selectedLocation.address_type || '',
+            }
+          : mergeSelectedLocationWithFormAddress(
+              selectedLocation,
+              formData.location
+            );
         const siteLabel = siteLabelFromLocationOption(selectedLocation);
 
         if (locationName) {
@@ -2933,20 +3098,8 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
               address_type: mergedLocation.addressType || null,
             };
 
-            // Guard: don't clobber a richer existing address with a bare site label
-            // (e.g. a technician-only save). Still allow legitimate full-address changes.
-            const computedAddress = String(
-              mergedLocation.address || mergedLocation.street || ''
-            ).trim();
-            const existingAddress = String(
-              existingLocation.address || existingLocation.street || ''
-            ).trim();
-            const newAddressIsBare = isBareSiteLabelAddress(computedAddress, siteLabel);
-            const existingIsRicher =
-              !isBareSiteLabelAddress(existingAddress, siteLabel) &&
-              existingAddress.length > computedAddress.length;
-
-            if (!(newAddressIsBare && existingIsRicher)) {
+            if (locationAddressTouched) {
+              // Intentional address edits (incl. clears): write form values; skip bare-address guard.
               updateData.building = mergedLocation.building || null;
               updateData.street_number = mergedLocation.streetNo || null;
               updateData.street = mergedLocation.street || null;
@@ -2955,6 +3108,30 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
               updateData.city = mergedLocation.city || null;
               updateData.country_name = mergedLocation.countryName || null;
               updateData.zip_code = mergedLocation.zipCode || null;
+            } else {
+              // Guard: don't clobber a richer existing address with a bare site label
+              // (e.g. a technician-only save). Still allow legitimate full-address changes.
+              const computedAddress = String(
+                mergedLocation.address || mergedLocation.street || ''
+              ).trim();
+              const existingAddress = String(
+                existingLocation.address || existingLocation.street || ''
+              ).trim();
+              const newAddressIsBare = isBareSiteLabelAddress(computedAddress, siteLabel);
+              const existingIsRicher =
+                !isBareSiteLabelAddress(existingAddress, siteLabel) &&
+                existingAddress.length > computedAddress.length;
+
+              if (!(newAddressIsBare && existingIsRicher)) {
+                updateData.building = mergedLocation.building || null;
+                updateData.street_number = mergedLocation.streetNo || null;
+                updateData.street = mergedLocation.street || null;
+                updateData.block = mergedLocation.block || null;
+                updateData.address = mergedLocation.address || null;
+                updateData.city = mergedLocation.city || null;
+                updateData.country_name = mergedLocation.countryName || null;
+                updateData.zip_code = mergedLocation.zipCode || null;
+              }
             }
 
             if (latStr && lngStr) {
@@ -3041,6 +3218,8 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
             }
           }
         }
+      } else {
+        locationId = customerChanged ? null : (currentJobData?.location_id || null);
       }
 
       if (
@@ -3084,7 +3263,7 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
             .insert({
               customer_id: customerId,
               call_number: selectedServiceCall.value.toString(),
-              subject: selectedServiceCall.subject || `Service Call ${selectedServiceCall.value}`,
+              subject: resolveServiceCallSubjectForUpsert(selectedServiceCall),
               description: selectedServiceCall.description || null,
               status: 'OPEN',
               priority: 'MEDIUM',
@@ -3706,14 +3885,31 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
       });
 
       toast.success('Job updated successfully!');
-      dispatchSchedulerInvalidate();
-      
+      // Await full mutation cache bust (detail + list/calendar/history/scheduler).
+      await invalidateJobCachesAfterMutation(queryClient, jobIdProp, {
+        customerCode:
+          selectedCustomer?.cardCode ||
+          initialJobData?.customerCode ||
+          formData?.customerCode,
+        customerId:
+          selectedCustomer?.value ||
+          initialJobData?.customerId ||
+          formData?.customerId,
+        aliasIds: [
+          currentJobData?.id,
+          currentJobData?.job_number,
+          formData.jobNo,
+          jobNo,
+        ].filter((id) => id && id !== jobIdProp),
+      });
+      await queryClient.refetchQueries(queryKeys.jobDetail(jobIdProp));
+
       // Reset states
       setHasChanges(false);
       setOriginalEquipments(selectedEquipments);
-      
+
       // Optionally refresh the data
-      router.push(`/jobs/view/${jobIdProp}`);
+      router.push(`/dashboard/jobs/${jobIdProp}`);
 
     } catch (error) {
       console.error('Error updating job:', error);
@@ -4425,6 +4621,13 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
                     setSelectedSalesOrder(selectedOption);
                     setHasChanges(true);
                   }}
+                  onMenuOpen={() => {
+                    if (selectedServiceCall && salesOrders.length === 0) {
+                      void fetchSalesOrdersForServiceCall(selectedServiceCall, {
+                        quiet: true,
+                      });
+                    }
+                  }}
                   placeholder={
                     selectedServiceCall
                       ? "Select Sales Order"
@@ -4487,17 +4690,54 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
                   instanceId="job-status-select-edit"
                   isClearable={false}
                   isDisabled={isFormDisabled}
-                  options={jobStatuses.map((s) => ({
-                    value: s.value,
-                    label: s.name,
-                    color: s.color,
-                  }))}
+                  options={(() => {
+                    const opts = jobStatuses.map((s) => ({
+                      value: s.value,
+                      label: s.name,
+                      color: s.color,
+                    }));
+                    const raw =
+                      formData.jobStatus != null
+                        ? String(formData.jobStatus).trim()
+                        : "";
+                    if (!raw) return opts;
+                    const hasMatch =
+                      opts.some(
+                        (s) =>
+                          String(s.value || "").trim() === raw ||
+                          toDbStatus(s.value) === toDbStatus(raw)
+                      ) || Boolean(findJobStatusEntry(raw, jobStatuses));
+                    if (!hasMatch) {
+                      opts.push({
+                        value: raw,
+                        label: formatJobStatusDisplayLabel(raw),
+                      });
+                    }
+                    return opts;
+                  })()}
                   value={
-                    jobStatuses.length > 0 && formData.jobStatus != null && String(formData.jobStatus).trim() !== ""
+                    formData.jobStatus != null &&
+                    String(formData.jobStatus).trim() !== ""
                       ? (() => {
                           const raw = String(formData.jobStatus).trim();
-                          const opt = jobStatuses.find((s) => String(s.value || "").trim() === raw || toDbStatus(s.value) === toDbStatus(raw));
-                          return opt ? { value: opt.value, label: opt.name, color: opt.color } : null;
+                          const opt =
+                            jobStatuses.find(
+                              (s) =>
+                                String(s.value || "").trim() === raw ||
+                                toDbStatus(s.value) === toDbStatus(raw)
+                            ) || findJobStatusEntry(raw, jobStatuses);
+                          if (opt) {
+                            return {
+                              value: opt.value,
+                              label: opt.name,
+                              color: opt.color,
+                            };
+                          }
+                          // Synthetic: saved status not in Settings list — keep field visible
+                          return {
+                            value: raw,
+                            label: formatJobStatusDisplayLabel(raw),
+                          };
                         })()
                       : null
                   }
@@ -4533,12 +4773,16 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
                   instanceId="worker-select"
                   isMulti={true}
                   name="workers"
-                  options={workers}
+                  options={workerSelectOptions}
                   value={selectedWorkers}
                   onChange={handleWorkersChange}
+                  onInputChange={handleWorkerSearchInputChange}
+                  inputValue={workerSearchInput}
+                  filterOption={() => true}
                   placeholder="Search Worker"
                   isSearchable={true}
                   isClearable={true}
+                  isLoading={workersLoading}
                   isDisabled={isFormDisabled}
                   closeMenuOnSelect={false}
                   getOptionLabel={(option) => option.label || option.name || 'Unknown'}

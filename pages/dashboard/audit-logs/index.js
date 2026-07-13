@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Container,
   Card,
@@ -42,6 +42,7 @@ import {
 } from '../../../utils/auditLogDisplay';
 import { fetchJobStatuses } from '../../../utils/jobStatusSettings';
 import { readCachedJobStatuses, writeCachedJobStatuses } from '../../../utils/jobStatusDefaults';
+import { useAuditLogsQuery } from '../../../hooks/queries/useAuditLogsQuery';
 
 const TH = {
   backgroundColor: '#f8fafc',
@@ -129,12 +130,12 @@ function categoryBadge(category) {
 function formatTs(iso) {
   if (!iso) return '—';
   try {
-    return format(new Date(iso), 'MMM d, yyyy HH:mm:ss');
+    return format(new Date(iso), 'MMM d, yyyy h:mm:ss a');
   } catch {
     return iso;
   }
 }
-
+   
 const SECTION_CARD = {
   background: '#f8fafc',
   border: '1px solid #e2e8f0',
@@ -495,10 +496,6 @@ function TechnicalDetails({ log, show, onToggle }) {
 }
 
 const AuditLogsPage = () => {
-  const [logs, setLogs] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(1);
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedLog, setSelectedLog] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -516,39 +513,24 @@ const AuditLogsPage = () => {
     dateTo: null,
   });
 
-  const fetchLogs = useCallback(async () => {
-    setLoading(true);
-    try {
-      const params = new URLSearchParams({
-        page: String(currentPage),
-        limit: String(itemsPerPage),
-      });
-      if (filters.category !== 'all') params.set('category', filters.category);
-      if (filters.status !== 'all') params.set('status', filters.status);
-      if (filters.search.trim()) params.set('search', filters.search.trim());
-      if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
-      if (filters.dateTo) params.set('dateTo', filters.dateTo);
+  const auditLogsParams = useMemo(
+    () => ({
+      page: currentPage,
+      limit: itemsPerPage,
+      ...filters,
+    }),
+    [currentPage, filters]
+  );
 
-      const res = await fetch(`/api/audit-logs?${params.toString()}`, { credentials: 'include' });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'Failed to load logs');
+  const {
+    data: auditLogsData,
+    isLoading: loading,
+    refetch: refetchAuditLogs,
+  } = useAuditLogsQuery(auditLogsParams);
 
-      setLogs(json.logs || []);
-      setTotal(json.total || 0);
-      setTotalPages(json.totalPages || 1);
-    } catch (err) {
-      console.error(err);
-      setLogs([]);
-      setTotal(0);
-      setTotalPages(1);
-    } finally {
-      setLoading(false);
-    }
-  }, [currentPage, filters]);
-
-  useEffect(() => {
-    fetchLogs();
-  }, [fetchLogs]);
+  const logs = auditLogsData?.logs || [];
+  const total = auditLogsData?.total || 0;
+  const totalPages = auditLogsData?.totalPages || 1;
 
   useEffect(() => {
     let cancelled = false;
@@ -609,7 +591,7 @@ const AuditLogsPage = () => {
           <Button
             variant="light"
             size="sm"
-            onClick={fetchLogs}
+            onClick={() => refetchAuditLogs()}
             disabled={loading}
             className="d-flex align-items-center gap-2"
           >

@@ -277,7 +277,7 @@ const JobStatusPage = () => {
                     return (
                       <tr key={raw.id}>
                         <td className="px-4 py-2">
-                          <Link href={`/jobs/view/${raw.id}`} style={{ color: "#4171F5", fontWeight: 600 }}>
+                          <Link href={`/dashboard/jobs/${raw.id}`} style={{ color: "#4171F5", fontWeight: 600 }}>
                             {raw.job_number || raw.id?.slice(0, 8)}
                           </Link>
                         </td>

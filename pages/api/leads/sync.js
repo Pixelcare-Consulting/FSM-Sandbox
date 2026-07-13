@@ -8,6 +8,7 @@ import { leadService, customerService } from '../../../lib/supabase/database';
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 import { getCustomerAddressFromLead } from '../../../lib/utils/leadLocationName';
 import { ensurePortalCustomerAddressFromLead } from '../../../lib/customers/ensurePortalCustomerAddressFromLead';
+import { findPortalDuplicate } from '../../../lib/customers/portalDuplicateCheck';
 import jwt from 'jsonwebtoken';
 import {
   writeAuditLogFromRequest,
@@ -16,6 +17,8 @@ import {
   AUDIT_STATUS,
   buildChanges,
 } from '../../../lib/services/auditLog';
+import { invalidateListCache } from '../../../lib/supabase/listQueryHelpers';
+import { PORTAL_LIST_CACHE_PREFIX } from '../../../lib/leads/portalListCache';
 
 /**
  * Map a transformed Google form response to DB lead row (same as sync loop).
@@ -481,6 +484,7 @@ export default async function handler(req, res) {
     // Preview mode: return list for confirmation modal without saving
     const preview = req.body && (req.body.preview === true || req.body.preview === 'true');
     if (preview) {
+      const supabase = getSupabaseAdmin();
       const rowFromLeadData = (l) => ({
         google_form_response_id: l.google_form_response_id || null,
         email: l.email,
@@ -490,7 +494,47 @@ export default async function handler(req, res) {
         block: l.block || null,
         unit: l.unit || null
       });
-      const willFromNew = leadsToCreate.map((l) => ({ ...rowFromLeadData(l), action: 'new' }));
+
+      const skippedExisting = [];
+      for (const { existing, leadData } of leadUpdates) {
+        let customer_code = null;
+        if (existing?.customer_id && supabase) {
+          const { data: cust } = await supabase
+            .from('customer')
+            .select('customer_code')
+            .eq('id', existing.customer_id)
+            .is('deleted_at', null)
+            .maybeSingle();
+          customer_code = cust?.customer_code || null;
+        }
+        skippedExisting.push({
+          email: existing.email || leadData.email,
+          full_name: existing.full_name || leadData.full_name,
+          customer_code,
+        });
+      }
+
+      const willFromNew = [];
+      const skippedEmailDuplicates = [];
+      for (const leadData of leadsToCreate) {
+        const duplicate = supabase
+          ? await findPortalDuplicate(supabase, {
+              email: leadData.email,
+              phone: leadData.handphone,
+            })
+          : null;
+        if (duplicate?.existingCode) {
+          skippedEmailDuplicates.push({
+            email: leadData.email,
+            full_name: leadData.full_name,
+            existing_customer_code: duplicate.existingCode,
+            existingType: duplicate.existingType,
+          });
+        } else {
+          willFromNew.push({ ...rowFromLeadData(leadData), action: 'new' });
+        }
+      }
+
       const willSync = [...willFromNew];
       const skippedMissing = skipped.filter((s) => s.reason && String(s.reason).includes('Missing'));
       return res.status(200).json({
@@ -501,6 +545,8 @@ export default async function handler(req, res) {
         willUpdateCount: 0,
         skippedExistingCount,
         skippedExistingChangedCount,
+        skippedExisting,
+        skippedEmailDuplicates: skippedEmailDuplicates.length > 0 ? skippedEmailDuplicates : undefined,
         skippedMissing,
         totalResponses: googleResponses.length,
         newOrRestoreCount: willSync.length,
@@ -709,6 +755,8 @@ export default async function handler(req, res) {
       status: errors.length > 0 ? AUDIT_STATUS.WARNING : AUDIT_STATUS.SUCCESS,
     });
     
+    invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
+
     // Return the response to the client
     return res.status(200).json(responseData);
   } catch (error) {

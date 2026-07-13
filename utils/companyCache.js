@@ -1,4 +1,5 @@
 import { getSupabaseClient } from '../lib/supabase/client';
+import { readCachedDashboardBootstrap } from './dashboardBootstrapCache';
 import { readCachedSettingsBundle } from './settingsBundleCache';
 
 const COMPANY_CACHE_KEY = 'companyDetails';
@@ -6,6 +7,11 @@ const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 
 export const getCompanyDetails = async () => {
   try {
+    const bootstrapCached = readCachedDashboardBootstrap();
+    if (bootstrapCached?.companyInfo) {
+      return bootstrapCached.companyInfo;
+    }
+
     const bundleCached = readCachedSettingsBundle();
     if (bundleCached?.companyInfo) {
       return bundleCached.companyInfo;

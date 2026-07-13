@@ -2,11 +2,11 @@ import React, { Fragment, useCallback, useEffect, useMemo, useState } from 'reac
 import { Modal, Button } from 'react-bootstrap';
 import Link from 'next/link';
 import { useQuery } from 'react-query';
-import Cookies from 'js-cookie';
 import { FaBullhorn, FaChevronLeft, FaChevronRight } from 'react-icons/fa';
-import { userService } from '../../../lib/supabase/database';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { memoCreatorDisplayName } from '../../../lib/utils/memoCreatorDisplayName';
 import { memoBodyToPlainText, memoHtmlForDisplay } from '../../../lib/utils/memoHtml';
+import richTextStyles from '../../../styles/richTextContent.module.css';
 import styles from './CompanyMemoTicker.module.css';
 
 const ROTATE_MS = 7000;
@@ -26,10 +26,11 @@ function usePrefersReducedMotion() {
 
 export default function CompanyMemoTicker() {
   const reducedMotion = usePrefersReducedMotion();
+  const { user } = useCurrentUser();
+  const isAdmin = user?.role === 'ADMIN';
   const [index, setIndex] = useState(0);
   const [paused, setPaused] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
 
   const { data: memos = [], isLoading } = useQuery(
     ['company-memos', 'header'],
@@ -50,24 +51,11 @@ export default function CompanyMemoTicker() {
     },
     {
       staleTime: 2 * 60 * 1000,
-      refetchOnWindowFocus: true,
+      refetchOnWindowFocus: false,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
     }
   );
-
-  useEffect(() => {
-    const uid = Cookies.get('uid');
-    if (!uid) return;
-    let cancelled = false;
-    userService
-      .findById(uid)
-      .then((u) => {
-        if (!cancelled) setIsAdmin(u?.role === 'ADMIN');
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     setIndex(0);
@@ -122,7 +110,7 @@ export default function CompanyMemoTicker() {
     const safe = memoHtmlForDisplay(current.body);
     detailBodyEl = (
       <div
-        className={styles.memoDetailHtml}
+        className={`${styles.memoDetailHtml} ${richTextStyles.memoReadContent}`}
         dangerouslySetInnerHTML={{ __html: safe }}
       />
     );

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Container,
   Row,
@@ -19,13 +19,20 @@ import { emitJobAssignmentEmails } from "../../../lib/notifications/transactiona
 import { fetchJobStatuses, getDefaultJobStatuses } from "../../../utils/jobStatusSettings";
 import { findJobStatusEntry } from "../../../utils/jobStatusDefaults";
 import { findServiceJobContactTypeOption } from "../../../lib/jobs/portalDefaultJobContactType";
+import { normalizeJobTaskNameForInsert } from "../../../lib/jobs/jobTaskFields";
 import {
   buildGroupedLocationOptions,
   countGroupedLocationOptions,
+  flattenLocationOptions,
   locationSelectGroupLabel,
   locationSelectOptionLabel,
   locationSelectStyles,
 } from "../../../lib/jobs/jobFormLocationSelect";
+import { useCurrentUser } from "@/hooks/useCurrentUser";
+import {
+  mapAssignableWorkersToOptions,
+  mergeWorkerSelectOptions,
+} from "../../../lib/jobs/assignableWorkerSelect";
 import { upsertJobCustomerLocation } from "../../../lib/jobs/upsertJobCustomerLocation";
 import { resolveContactIdFromSelection } from "../../../lib/jobs/upsertJobContactFromSelection";
 import { buildSingaporeDateTimeFromForm } from "../../../lib/utils/singaporeDateTime";
@@ -36,8 +43,10 @@ import {
   generateOccurrenceDates,
   getDefaultRecurrenceRule,
   normalizeRecurrenceRule,
+  validateRecurrenceRule,
 } from "../../../lib/jobs/recurrence";
 import JobRecurrenceModal from "./_components/JobRecurrenceModal";
+import EditJobFormSkeleton from "./_components/EditJobFormSkeleton";
 import {
   getNextJobNumber,
   isDuplicateJobNumberError,
@@ -206,6 +215,84 @@ const generateRepeatGroupId = () => {
   return `R${Date.now()}`;
 };
 
+const FALLBACK_JOB_CONTACT_TYPES = [{ value: "3", label: "Service" }];
+
+function hasUsableJobAddress(formData, selectedCustomer) {
+  const loc = formData?.location;
+  const addr = loc?.address;
+  if (loc?.locationName?.trim()) return true;
+  if (addr?.streetAddress?.trim()) return true;
+  if (selectedCustomer?.customer_address?.trim()) return true;
+  return false;
+}
+
+function buildSyntheticLocationFromForm(formData, selectedCustomer) {
+  const loc = formData?.location || {};
+  const addr = loc.address || {};
+  const name =
+    loc.locationName?.trim() ||
+    addr.streetAddress?.trim() ||
+    selectedCustomer?.customer_address?.trim() ||
+    "Primary";
+  return {
+    value: name,
+    label: name,
+    siteId: loc.locationName?.trim() || name,
+    address: addr.streetAddress || selectedCustomer?.customer_address || "",
+    street: addr.streetAddress || "",
+    streetNo: addr.streetNo || "",
+    block: addr.block || "",
+    building: addr.buildingNo || "",
+    city: addr.city || "",
+    countryName: addr.country || "",
+    zipCode: addr.postalCode || "",
+    addressType: loc.addressType === "Billing" ? "B" : "S",
+  };
+}
+
+function resolveEffectiveLocation(selectedLocation, formData, selectedCustomer) {
+  if (selectedLocation) return selectedLocation;
+  if (hasUsableJobAddress(formData, selectedCustomer)) {
+    return buildSyntheticLocationFromForm(formData, selectedCustomer);
+  }
+  return null;
+}
+
+function buildLocationFormPatchFromSelection(selectedLocation) {
+  return {
+    locationName:
+      selectedLocation.value ||
+      selectedLocation.siteId ||
+      selectedLocation.address ||
+      "",
+    addressType: selectedLocation.addressType || "",
+    address: {
+      streetNo: selectedLocation.streetNo || "",
+      streetAddress: selectedLocation.street || "",
+      block: selectedLocation.block || "",
+      buildingNo: selectedLocation.building || "",
+      country: selectedLocation.countryName || "",
+      stateProvince: selectedLocation.stateProvince || "",
+      city: selectedLocation.city || "",
+      postalCode: selectedLocation.zipCode || "",
+      addressType:
+        selectedLocation.addressType === "B" ? "Billing" : "Shipping",
+    },
+    displayAddress: `${
+      selectedLocation.building ? `${selectedLocation.building} - ` : ""
+    }${selectedLocation.address}`,
+    fullAddress: [
+      selectedLocation.value || selectedLocation.siteId || selectedLocation.address,
+      selectedLocation.street,
+      selectedLocation.building,
+      selectedLocation.countryName,
+      selectedLocation.zipCode,
+    ]
+      .filter(Boolean)
+      .join(", "),
+  };
+}
+
 // Calculate duration function - moved outside component to avoid initialization issues
 const calculateDuration = (startTime, endTime) => {
   if (!startTime || !endTime) return { hours: 0, minutes: 0 };
@@ -247,7 +334,11 @@ const AddNewJobs = ({ validateJobForm }) => {
   const [jobStatuses, setJobStatuses] = useState(() => getDefaultJobStatuses()); // From Settings > Job Statuses; init with defaults so dropdown is never empty
 
   const [workers, setWorkers] = useState([]);
+  const [workersLoading, setWorkersLoading] = useState(false);
+  const [workerSearchInput, setWorkerSearchInput] = useState("");
   const [selectedWorkers, setSelectedWorkers] = useState([]);
+  const workerSearchDebounceRef = useRef(null);
+  const workerSearchSeqRef = useRef(0);
   const [tasks, setTasks] = useState([]); // Initialize tasks
 
   const [serviceCalls, setServiceCalls] = useState([]);
@@ -454,6 +545,13 @@ const AddNewJobs = ({ validateJobForm }) => {
   const [activeKey, setActiveKey] = useState("summary");
   const [editorResetKey, setEditorResetKey] = useState(0); // Key to force ReactQuillEditor remount
   const [isLoading, setIsLoading] = useState(true);
+  const [customersLoaded, setCustomersLoaded] = useState(false);
+  const [workersLoaded, setWorkersLoaded] = useState(false);
+  const [jobStatusesLoaded, setJobStatusesLoaded] = useState(false);
+  const [jobContactTypesLoaded, setJobContactTypesLoaded] = useState(false);
+  const [schedulingWindowsLoaded, setSchedulingWindowsLoaded] = useState(false);
+  const [jobCategoriesLoaded, setJobCategoriesLoaded] = useState(false);
+  const [initialBootstrapDone, setInitialBootstrapDone] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const MAX_RETRY_ATTEMPTS = 3;
   const isFetchingCustomersRef = useRef(false);
@@ -465,6 +563,18 @@ const AddNewJobs = ({ validateJobForm }) => {
     fullName: "",
     uid: "",
   });
+  const { user: bootstrapUser } = useCurrentUser();
+
+  useEffect(() => {
+    if (!bootstrapUser) return;
+    const workerId = bootstrapUser.workerId || bootstrapUser.id;
+    if (!workerId) return;
+    setCurrentUser({
+      workerId,
+      fullName: bootstrapUser.fullName || bootstrapUser.name || "anonymous",
+      uid: bootstrapUser.uid || bootstrapUser.id || "",
+    });
+  }, [bootstrapUser]);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -517,69 +627,47 @@ const AddNewJobs = ({ validateJobForm }) => {
     ...getDefaultRecurrenceRule(""),
     isRepeat: false,
   }));
+  const [repeatConfigured, setRepeatConfigured] = useState(false);
   const [showRecurrenceModal, setShowRecurrenceModal] = useState(false);
   const openRepeatHandledRef = useRef(false);
+  const workerQueryPrefillHandledRef = useRef(false);
+  const urlCustomerPrefillHandledRef = useRef(false);
+  const urlCustomerPrefillInFlightRef = useRef(false);
 
-  // useEffect to handle router query params - MUST be after all state declarations
+  // Apply schedule fields from router query params
   useEffect(() => {
-    if (router.isReady) {
-      let updatedFormData = { ...formData };
+    if (!router.isReady) return;
 
-      if (startDate) {
-        updatedFormData.startDate = startDate;
-      }
+    setFormData((prev) => ({
+      ...prev,
+      ...(startDate && { startDate }),
+      ...(endDate && { endDate }),
+      ...(startTime && { startTime }),
+      ...(endTime && { endTime }),
+      ...(scheduleSession && { scheduleSession }),
+    }));
+  }, [router.isReady, startDate, endDate, startTime, endTime, scheduleSession]);
 
-      if (endDate) {
-        updatedFormData.endDate = endDate;
-      }
+  // One-time worker prefill from scheduler URL (do not reset on every workers refetch)
+  useEffect(() => {
+    if (!router.isReady || workerQueryPrefillHandledRef.current) return;
+    if (!workerId || workers.length === 0) return;
 
-      if (startTime) {
-        updatedFormData.startTime = startTime;
-      }
+    let selectedWorker = workers.find(
+      (worker) => String(worker.value) === String(workerId)
+    );
 
-      if (endTime) {
-        updatedFormData.endTime = endTime;
-      }
-
-      if (scheduleSession) {
-        updatedFormData.scheduleSession = scheduleSession;
-      }
-
-
-      setFormData(updatedFormData);
-
-      // Handle worker selection if workerId is provided
-      // workerId from scheduler can be either user.id or technician.id
-      if (workerId && workers.length > 0) {
-        // First try to match by user.id (value field)
-        let selectedWorker = workers.find(
-          (worker) => String(worker.value) === String(workerId)
-        );
-        
-        // If not found, try to match by technicianId
-        if (!selectedWorker) {
-          selectedWorker = workers.find(
-            (worker) => worker.technicianId && String(worker.technicianId) === String(workerId)
-          );
-        }
-        
-        if (selectedWorker) {
-          setSelectedWorkers([selectedWorker]);
-        } else {
-          console.warn(`Worker with ID ${workerId} not found in workers list`);
-        }
-      }
+    if (!selectedWorker) {
+      selectedWorker = workers.find(
+        (worker) => worker.technicianId && String(worker.technicianId) === String(workerId)
+      );
     }
-  }, [
-    router.isReady,
-    startDate,
-    endDate,
-    startTime,
-    endTime,
-    workerId,
-    scheduleSession,
-    workers,
-  ]);
+
+    if (selectedWorker) {
+      setSelectedWorkers([selectedWorker]);
+      workerQueryPrefillHandledRef.current = true;
+    }
+  }, [router.isReady, workerId, workers]);
 
   useEffect(() => {
     if (!router.isReady || openRepeat !== "1" || openRepeatHandledRef.current) {
@@ -591,6 +679,7 @@ const AddNewJobs = ({ validateJobForm }) => {
       ...getDefaultRecurrenceRule(anchor),
       isRepeat: true,
     });
+    setRepeatConfigured(false);
     setShowRecurrenceModal(true);
   }, [router.isReady, openRepeat, formData.startDate, startDate]);
 
@@ -601,97 +690,40 @@ const AddNewJobs = ({ validateJobForm }) => {
         ...getDefaultRecurrenceRule(anchor),
         isRepeat: true,
       });
+      setRepeatConfigured(false);
       setShowRecurrenceModal(true);
       return;
     }
+    setRepeatConfigured(false);
     setRepeatSettings((prev) => ({ ...prev, isRepeat: false }));
   };
 
   const handleRecurrenceSave = (rule) => {
     setRepeatSettings(rule);
+    setRepeatConfigured(true);
     setFormData((prev) => ({
       ...prev,
       startDate: rule.startDate,
+      endDate: rule.startDate || prev.endDate,
     }));
     setShowRecurrenceModal(false);
+  };
+
+  const handleRecurrenceModalHide = () => {
+    setShowRecurrenceModal(false);
+    if (!repeatConfigured) {
+      setRepeatSettings((prev) => ({ ...prev, isRepeat: false }));
+    }
   };
 
   const recurrenceSummary = repeatSettings.isRepeat
     ? buildRecurrenceSummary(repeatSettings)
     : "";
 
-  useEffect(() => {
-    const getCurrentUserInfo = async () => {
-      try {
-        // Fetch user info from the existing endpoint
-        const response = await fetch("/api/getUserInfo", {
-          method: 'GET',
-          credentials: 'include', // Ensure cookies are sent
-          cache: 'no-store',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-
-        if (!response.ok) {
-          // Get more detailed error information
-          const errorData = await response.json().catch(() => ({}));
-          console.error('❌ API Error:', {
-            status: response.status,
-            statusText: response.statusText,
-            errorData
-          });
-
-          throw new Error(
-            errorData.message ||
-            `HTTP ${response.status}: ${response.statusText}`
-          );
-        }
-
-        const responseData = await response.json();
-
-        const { user } = responseData;
-
-        if (!user) {
-          throw new Error("No user data in response");
-        }
-
-        if (!user.workerId) {
-          console.warn('⚠️ Worker ID missing in user data:', user);
-          throw new Error("Worker ID not found in user data");
-        }
-
-        // Set the current user data with actual full name from Firestore
-        setCurrentUser({
-          workerId: user.workerId,
-          fullName: user.name || user.fullName || "anonymous",
-          uid: user.uid || "",
-        });
-
-        //toast.success("User information loaded successfully");
-      } catch (error) {
-        console.error("❌ Error getting user info:", error);
-
-        // Show more specific error messages
-        if (error.message.includes('401')) {
-          toast.error("Authentication required. Please sign in again.");
-        } else if (error.message.includes('404')) {
-          toast.error("User profile not found. Please contact support.");
-        } else {
-          toast.error(`Unable to get user information: ${error.message}`);
-        }
-
-        // Set fallback user data
-        setCurrentUser({
-          workerId: "unknown",
-          fullName: "anonymous",
-          uid: "",
-        });
-      }
-    };
-
-    getCurrentUserInfo();
-  }, []);
+  const displayStartDate =
+    repeatSettings.isRepeat && repeatSettings.startDate
+      ? repeatSettings.startDate
+      : formData.startDate;
 
   const fetchSchedulingWindows = async () => {
     try {
@@ -730,6 +762,8 @@ const AddNewJobs = ({ validateJobForm }) => {
       setSchedulingWindows(windows); // Use the windows directly without formatting
     } catch (error) {
       console.error("Error fetching scheduling windows:", error);
+    } finally {
+      setSchedulingWindowsLoaded(true);
     }
   };
 
@@ -751,7 +785,7 @@ const AddNewJobs = ({ validateJobForm }) => {
           "Unknown error";
         console.error("Job contact types API error:", errorData);
         toast.error(`Failed to fetch job contact types: ${message}`);
-        setJobContactTypes([]);
+        setJobContactTypes(FALLBACK_JOB_CONTACT_TYPES);
         return;
       }
 
@@ -759,7 +793,7 @@ const AddNewJobs = ({ validateJobForm }) => {
 
       if (!Array.isArray(jobContactTypeData)) {
         console.error("Job contact types data is not an array:", jobContactTypeData);
-        setJobContactTypes([]);
+        setJobContactTypes(FALLBACK_JOB_CONTACT_TYPES);
         return;
       }
 
@@ -768,11 +802,17 @@ const AddNewJobs = ({ validateJobForm }) => {
         label: item.name,
       }));
 
-      setJobContactTypes(formattedJobContactTypes);
+      setJobContactTypes(
+        formattedJobContactTypes.length > 0
+          ? formattedJobContactTypes
+          : FALLBACK_JOB_CONTACT_TYPES
+      );
     } catch (error) {
       console.error("Error fetching job contact types:", error);
       toast.error(`Failed to fetch job contact types: ${error.message}`);
-      setJobContactTypes([]);
+      setJobContactTypes(FALLBACK_JOB_CONTACT_TYPES);
+    } finally {
+      setJobContactTypesLoaded(true);
     }
   };
 
@@ -798,6 +838,8 @@ const AddNewJobs = ({ validateJobForm }) => {
       console.error("Error fetching job categories:", error);
       toast.error(`Failed to load job categories: ${error.message}`);
       setJobCategories([]);
+    } finally {
+      setJobCategoriesLoaded(true);
     }
   };
 
@@ -807,6 +849,7 @@ const AddNewJobs = ({ validateJobForm }) => {
       return;
     }
 
+    setCustomersLoaded(false);
     const controller = new AbortController();
     let timeoutId = null;
 
@@ -872,6 +915,7 @@ const AddNewJobs = ({ validateJobForm }) => {
           customer_address: c.customer_address,
           email: c.email || "",
           phone_number: c.phone_number || "",
+          sap_card_code: c.sap_card_code || null,
         }));
       } else {
         if (!Array.isArray(data)) throw new Error("Invalid data format: Expected array");
@@ -884,6 +928,7 @@ const AddNewJobs = ({ validateJobForm }) => {
           email: item.email || "",
           phone_number: item.phone_number || "",
           customer_address: item.customer_address || "",
+          sap_card_code: item.sap_card_code || null,
         }));
       }
 
@@ -981,6 +1026,10 @@ const AddNewJobs = ({ validateJobForm }) => {
         retryCountRef.current = 0;
         isFetchingCustomersRef.current = false;
       }
+    } finally {
+      if (!isFetchingCustomersRef.current) {
+        setCustomersLoaded(true);
+      }
     }
   };
   fetchCustomersRef.current = fetchCustomers;
@@ -1044,53 +1093,104 @@ const AddNewJobs = ({ validateJobForm }) => {
   useEffect(() => {
     let mounted = true;
     const loadJobStatuses = async () => {
-      const statuses = await fetchJobStatuses();
-      if (mounted && Array.isArray(statuses) && statuses.length > 0) {
-        setJobStatuses(statuses);
-        // Default new jobs to "Created" (match list value: CREATED or settings/SAP row named Created), not first API row (often "Worker on the Way").
-        setFormData((prev) => {
-          if (String(prev.jobStatus || "").trim().toUpperCase() !== "CREATED") {
+      try {
+        const statuses = await fetchJobStatuses();
+        if (mounted && Array.isArray(statuses) && statuses.length > 0) {
+          setJobStatuses(statuses);
+          // Default new jobs to "Created" (match list value: CREATED or settings/SAP row named Created), not first API row (often "Worker on the Way").
+          setFormData((prev) => {
+            if (String(prev.jobStatus || "").trim().toUpperCase() !== "CREATED") {
+              return prev;
+            }
+            const created =
+              findJobStatusEntry("CREATED", statuses) ||
+              statuses.find(
+                (s) => String(s.name || "").trim().toLowerCase() === "created"
+              );
+            if (created?.value != null && String(created.value).trim() !== "") {
+              return { ...prev, jobStatus: String(created.value).trim() };
+            }
             return prev;
-          }
-          const created =
-            findJobStatusEntry("CREATED", statuses) ||
-            statuses.find(
-              (s) => String(s.name || "").trim().toLowerCase() === "created"
-            );
-          if (created?.value != null && String(created.value).trim() !== "") {
-            return { ...prev, jobStatus: String(created.value).trim() };
-          }
-          return prev;
-        });
+          });
+        }
+      } finally {
+        if (mounted) {
+          setJobStatusesLoaded(true);
+        }
       }
     };
     loadJobStatuses();
     return () => { mounted = false; };
   }, []);
 
-  useEffect(() => {
-    const fetchUsers = async () => {
-      try {
-        const res = await fetch('/api/workers/summary', { credentials: 'same-origin' });
-        if (!res.ok) throw new Error(`Workers summary failed (${res.status})`);
-        const payload = await res.json();
-        const usersList = (payload.workers || [])
-          .filter((worker) => worker.role === 'TECHNICIAN' && worker.status === 'ACTIVE')
-          .map((worker) => ({
-            value: worker.id,
-            label: worker.fullName || worker.username,
-            workerId: worker.id,
-            technicianId: worker.workerId,
-            status: worker.status || 'ACTIVE',
-          }));
-        setWorkers(usersList);
-      } catch (error) {
-        console.error('Error fetching users:', error);
+  const fetchAssignableWorkers = useCallback(async (search = "") => {
+    const seq = ++workerSearchSeqRef.current;
+    setWorkersLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "200" });
+      const trimmed = String(search || "").trim();
+      if (trimmed) params.set("search", trimmed);
+      const res = await fetch(`/api/workers/assignable?${params.toString()}`, {
+        credentials: "same-origin",
+      });
+      if (!res.ok) throw new Error(`Assignable workers failed (${res.status})`);
+      const payload = await res.json();
+      if (seq !== workerSearchSeqRef.current) return;
+      setWorkers(mapAssignableWorkersToOptions(payload.workers));
+    } catch (error) {
+      if (seq !== workerSearchSeqRef.current) return;
+      console.error("Error fetching assignable workers:", error);
+      toast.error("Failed to search workers. Please try again.", { duration: 5000 });
+    } finally {
+      if (seq === workerSearchSeqRef.current) {
+        setWorkersLoading(false);
+        if (search === "") {
+          setWorkersLoaded(true);
+        }
       }
-    };
-
-    fetchUsers();
+    }
   }, []);
+
+  const workerSelectOptions = useMemo(
+    () => mergeWorkerSelectOptions(workers, selectedWorkers),
+    [workers, selectedWorkers]
+  );
+
+  const isFormReady =
+    customersLoaded &&
+    workersLoaded &&
+    jobStatusesLoaded &&
+    jobContactTypesLoaded &&
+    schedulingWindowsLoaded &&
+    jobCategoriesLoaded;
+
+  const isFormDisabled =
+    !isFormReady ||
+    isLoading ||
+    isSubmitting ||
+    (repeatSettings.isRepeat && !repeatConfigured);
+
+  useEffect(() => {
+    if (isFormReady) {
+      setInitialBootstrapDone(true);
+    }
+  }, [isFormReady]);
+
+  useEffect(() => {
+    fetchAssignableWorkers("");
+    return () => {
+      if (workerSearchDebounceRef.current) clearTimeout(workerSearchDebounceRef.current);
+    };
+  }, [fetchAssignableWorkers]);
+
+  const handleWorkerSearchInputChange = (inputValue, { action }) => {
+    if (action !== "input-change") return;
+    setWorkerSearchInput(inputValue);
+    if (workerSearchDebounceRef.current) clearTimeout(workerSearchDebounceRef.current);
+    workerSearchDebounceRef.current = setTimeout(() => {
+      fetchAssignableWorkers(inputValue);
+    }, 300);
+  };
 
   // Function to format duration to required format
   const formatDuration = (hours, minutes) => {
@@ -1209,6 +1309,9 @@ const AddNewJobs = ({ validateJobForm }) => {
       (worker) => String(worker.status || "ACTIVE").toUpperCase() === "ACTIVE"
     );
     setSelectedWorkers(activeSelections);
+    setWorkerSearchInput("");
+    if (workerSearchDebounceRef.current) clearTimeout(workerSearchDebounceRef.current);
+    fetchAssignableWorkers("");
   };
 
   const handleCustomerChange = async (selectedOption) => {
@@ -1222,16 +1325,17 @@ const AddNewJobs = ({ validateJobForm }) => {
     setSelectedServiceCall(null);
     setSelectedSalesOrder(null);
 
-    const selectedCustomer = customers.find(
-      (option) => option.value === selectedOption.value
-    );
+    // Prefer list match; fall back to the option itself (URL prefill / synthesized).
+    const selectedCustomer =
+      customers.find((option) => option.value === selectedOption?.value) ||
+      selectedOption;
 
     //// console.log("Selected customer:", selectedCustomer);
 
     setFormData((prevFormData) => ({
       ...prevFormData,
-      customerID: selectedCustomer ? selectedCustomer.cardCode : "", // Use separate cardCode
-      customerName: selectedCustomer ? selectedCustomer.cardName : "", // Use separate cardName
+      customerID: selectedCustomer?.cardCode || selectedOption?.cardCode || "",
+      customerName: selectedCustomer?.cardName || selectedOption?.cardName || "",
     }));
 
     // Portal (generic) customers: build contact from stored email/phone and location from customer_address
@@ -1437,6 +1541,18 @@ const AddNewJobs = ({ validateJobForm }) => {
         if (items.length > 0) {
           const groupedLocations = buildGroupedLocationOptions(items);
           setLocations(groupedLocations);
+          const flatLocations = flattenLocationOptions(groupedLocations);
+          if (flatLocations.length === 1) {
+            const onlyLocation = flatLocations[0];
+            setSelectedLocation(onlyLocation);
+            setFormData((prevFormData) => ({
+              ...prevFormData,
+              location: {
+                ...prevFormData.location,
+                ...buildLocationFormPatchFromSelection(onlyLocation),
+              },
+            }));
+          }
           const locationCount = countGroupedLocationOptions(groupedLocations);
           toast.success(`Successfully fetched ${locationCount} locations.`, {
             duration: 5000,
@@ -1452,17 +1568,47 @@ const AddNewJobs = ({ validateJobForm }) => {
             },
           });
         } else {
-          setLocations([]);
-          toast("No locations found for this customer.", {
-            icon: "⚠️",
-            duration: 5000,
-            style: {
-              background: "#fff",
-              color: "#856404",
-              padding: "16px",
-              borderLeft: "6px solid #ffc107",
-            },
-          });
+          if (selectedCustomer?.customer_address) {
+            const fallbackLocation = {
+              value: "primary",
+              label: selectedCustomer.customer_address,
+              address: selectedCustomer.customer_address,
+              siteId: "Primary",
+              street: selectedCustomer.customer_address,
+              streetNo: "",
+              block: "",
+              building: "",
+              city: "",
+              countryName: "",
+              zipCode: "",
+            };
+            setLocations([fallbackLocation]);
+            setSelectedLocation(fallbackLocation);
+            setFormData((prevFormData) => ({
+              ...prevFormData,
+              location: {
+                ...prevFormData.location,
+                ...buildLocationFormPatchFromSelection(fallbackLocation),
+              },
+            }));
+          } else {
+            setLocations([]);
+          }
+          toast(
+            selectedCustomer?.customer_address
+              ? "No SAP sites found — using customer address from masterlist."
+              : "No locations found for this customer.",
+            {
+              icon: "⚠️",
+              duration: 5000,
+              style: {
+                background: "#fff",
+                color: "#856404",
+                padding: "16px",
+                borderLeft: "6px solid #ffc107",
+              },
+            }
+          );
         }
       }
     } catch (error) {
@@ -1552,50 +1698,144 @@ const AddNewJobs = ({ validateJobForm }) => {
       });
     }
 
-    // Fetch service calls from SAP Service Layer (sql10)
+    // Fetch service calls from SAP Service Layer (sql10 + OData fallback; sibling L/C codes)
     try {
-      const cardCode = String(selectedOption.value || "").trim();
+      const cardCode = String(
+        selectedCustomer?.cardCode || selectedOption?.cardCode || selectedOption?.value || ""
+      ).trim();
+      const relatedCardCodes = [];
+      const relatedSapCode = String(
+        selectedCustomer?.sap_card_code || selectedOption?.sap_card_code || ""
+      ).trim();
+      if (
+        relatedSapCode &&
+        relatedSapCode.toUpperCase() !== cardCode.toUpperCase()
+      ) {
+        relatedCardCodes.push(relatedSapCode);
+      }
       const serviceCallResponse = await fetch("/api/getServiceCall", {
         method: "POST",
         credentials: "include",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ cardCode }),
+        body: JSON.stringify({ cardCode, relatedCardCodes }),
       });
 
       if (!serviceCallResponse.ok) {
-        const errorText = await serviceCallResponse.text();
-        console.error("Failed to fetch service calls:", serviceCallResponse.status, errorText);
+        let errorPayload = null;
+        try {
+          errorPayload = await serviceCallResponse.json();
+        } catch {
+          errorPayload = null;
+        }
+        console.error(
+          "Failed to fetch service calls:",
+          serviceCallResponse.status,
+          errorPayload
+        );
         setServiceCalls([]);
-        toast.error("Failed to fetch service calls from SAP. Please try again.", {
-          duration: 5000,
-          style: {
-            background: "#fff",
-            color: "#dc3545",
-            padding: "16px",
-            borderLeft: "6px solid #dc3545",
-          },
-        });
-      } else {
-          const serviceCallsData = await serviceCallResponse.json();
-        // // console.log("Fetched service calls:", serviceCallsData);
+        setSalesOrders([]);
 
-        const formattedServiceCalls = serviceCallsData.map((item) => ({
-          value: item.serviceCallID,
-          label: item.serviceCallID + " - " + item.subject,
-          // Preserve full data for creating service call in Supabase if needed
-          serviceCallID: item.serviceCallID,
-          subject: item.subject,
-          customerName: item.customerName,
-          createDate: item.createDate,
-          createTime: item.createTime,
-          description: item.description
-        }));
+        if (
+          serviceCallResponse.status === 401 ||
+          errorPayload?.sessionMissing
+        ) {
+          toast.error(
+            "SAP session unavailable — log in to SAP (or renew B1 session) to load service calls.",
+            {
+              duration: 6000,
+              style: {
+                background: "#fff",
+                color: "#dc3545",
+                padding: "16px",
+                borderLeft: "6px solid #dc3545",
+              },
+            }
+          );
+        } else {
+          toast.error("Failed to fetch service calls from SAP. Please try again.", {
+            duration: 5000,
+            style: {
+              background: "#fff",
+              color: "#dc3545",
+              padding: "16px",
+              borderLeft: "6px solid #dc3545",
+            },
+          });
+        }
+      } else {
+        const serviceCallsData = await serviceCallResponse.json();
+        const sapRows = Array.isArray(serviceCallsData) ? serviceCallsData : [];
+
+        let formattedServiceCalls = sapRows.map((item) => {
+          const subject = item.subject || "";
+          const suffix =
+            item.fetchedForCardCode && item.fetchedForCardCode !== cardCode
+              ? ` (${item.fetchedForCardCode})`
+              : "";
+          return {
+            value: item.serviceCallID,
+            label: item.serviceCallID + " - " + subject + suffix,
+            serviceCallID: item.serviceCallID,
+            subject: item.subject,
+            customerName: item.customerName,
+            createDate: item.createDate,
+            createTime: item.createTime,
+            description: item.description,
+            fetchedForCardCode: item.fetchedForCardCode,
+          };
+        });
+
+        // Align with Edit Job: when SAP returns nothing, surface open local service_call rows.
+        if (formattedServiceCalls.length === 0) {
+          try {
+            const supabase = getSupabaseClient();
+            const customerId =
+              selectedCustomer?.customerId || selectedOption?.customerId;
+            if (supabase && customerId) {
+              const { data: localRows } = await supabase
+                .from("service_call")
+                .select(
+                  "call_number, subject, description, status, customer_name_sap, sap_create_date, sap_create_time"
+                )
+                .eq("customer_id", customerId)
+                .in("status", ["OPEN", "IN_PROGRESS"])
+                .is("deleted_at", null)
+                .order("call_number", { ascending: false })
+                .limit(50);
+
+              if (Array.isArray(localRows) && localRows.length > 0) {
+                formattedServiceCalls = localRows
+                  .filter((row) => row?.call_number)
+                  .map((row) => ({
+                    value: row.call_number,
+                    label: `${row.call_number} - ${row.subject || "(local)"}`,
+                    serviceCallID: row.call_number,
+                    subject: row.subject || "",
+                    customerName: row.customer_name_sap || "",
+                    createDate: row.sap_create_date || "",
+                    createTime: row.sap_create_time || "",
+                    description: row.description || "",
+                    fetchedForCardCode: cardCode,
+                    fromLocal: true,
+                  }));
+              }
+            }
+          } catch (localScErr) {
+            console.warn("Local service_call fallback:", localScErr);
+          }
+        }
+
         setServiceCalls(formattedServiceCalls);
 
         if (formattedServiceCalls.length === 0) {
-          toast("No service calls found for this customer.", {
+          const sapLeadCode =
+            selectedCustomer?.sap_card_code || selectedOption?.sap_card_code;
+          const emptyHint = sapLeadCode
+            ? `No open service calls under ${cardCode} (also checked ${sapLeadCode}). Open quotations do not create service calls — create a Service Call in SAP first.`
+            : `No open service calls found for ${cardCode}. Open quotations do not create service calls — create a Service Call in SAP first.`;
+          toast(emptyHint, {
             icon: "⚠️",
             duration: 5000,
             style: {
@@ -1606,8 +1846,11 @@ const AddNewJobs = ({ validateJobForm }) => {
             },
           });
         } else {
+          const fromLocal = formattedServiceCalls.some((sc) => sc.fromLocal);
           toast.success(
-            `Successfully fetched ${formattedServiceCalls.length} service calls.`,
+            fromLocal
+              ? `Loaded ${formattedServiceCalls.length} local service call(s) (SAP returned none).`
+              : `Successfully fetched ${formattedServiceCalls.length} service calls.`,
             {
               duration: 5000,
               style: {
@@ -2109,6 +2352,40 @@ const AddNewJobs = ({ validateJobForm }) => {
 
   const handleNextClick = () => {
     if (activeKey === "summary") {
+      if (!selectedCustomer) {
+        toast.error("Please select a customer before continuing.", {
+          duration: 5000,
+          style: {
+            background: "#fff",
+            color: "#dc3545",
+            padding: "16px",
+            borderLeft: "6px solid #dc3545",
+          },
+        });
+        return;
+      }
+
+      const effectiveLocation = resolveEffectiveLocation(
+        selectedLocation,
+        formData,
+        selectedCustomer
+      );
+      if (!effectiveLocation) {
+        toast.error(
+          "Please select a site/location or enter a job address before continuing.",
+          {
+            duration: 5000,
+            style: {
+              background: "#fff",
+              color: "#dc3545",
+              padding: "16px",
+              borderLeft: "6px solid #dc3545",
+            },
+          }
+        );
+        return;
+      }
+
       setActiveKey("task");
     } else if (activeKey === "task") {
       setActiveKey("scheduling");
@@ -2117,6 +2394,14 @@ const AddNewJobs = ({ validateJobForm }) => {
 
   const handleScheduleSessionChange = (e) => {
     const selectedSessionLabel = e.target.value;
+    if (selectedSessionLabel === "") {
+      setFormData({
+        ...formData,
+        scheduleSession: "",
+      });
+      return;
+    }
+
     const selectedWindow = schedulingWindows.find(
       (window) => window.label === selectedSessionLabel
     );
@@ -2128,7 +2413,7 @@ const AddNewJobs = ({ validateJobForm }) => {
         startTime: selectedWindow.timeStart,
         endTime: selectedWindow.timeEnd
       });
-    } else {
+    } else if (selectedSessionLabel === "custom") {
       setFormData({
         ...formData,
         scheduleSession: "custom",
@@ -2288,9 +2573,11 @@ const AddNewJobs = ({ validateJobForm }) => {
         confirmButtonColor: "#3085d6",
         cancelButtonColor: "#6c757d",
       }).then(async (result) => {
+        setIsSubmitting(false);
+        setProgress(0);
         if (result.isConfirmed) {
           // Redirect to job details page using UUID
-          router.push(`/jobs/view/${jobId}`);
+          router.push(`/dashboard/jobs/${jobId}`);
         } else {
           // Reset form for creating another job
           const newJobNo = await generateNewJobNo();
@@ -2305,6 +2592,11 @@ const AddNewJobs = ({ validateJobForm }) => {
           setTasks([]);
           setProgress(0);
           setIsSubmitting(false);
+          setRepeatConfigured(false);
+          setRepeatSettings({
+            ...getDefaultRecurrenceRule(""),
+            isRepeat: false,
+          });
           setActiveKey("summary");
           setEditorResetKey(prev => prev + 1); // Force ReactQuillEditor to remount and clear description
           const serviceOption = findServiceJobContactTypeOption(jobContactTypes);
@@ -2322,6 +2614,8 @@ const AddNewJobs = ({ validateJobForm }) => {
       });
     } catch (error) {
       console.error("Error in success handling:", error);
+      setIsSubmitting(false);
+      setProgress(0);
       toast.error("Error handling success state", {
         duration: 5000,
         style: {
@@ -2337,29 +2631,16 @@ const AddNewJobs = ({ validateJobForm }) => {
   // Updated handleSubmitClick function
   const handleSubmitClick = async () => {
     try {
-      // Log all form data before submission
-      // console.log("=== FORM SUBMISSION DATA ===");
-      // console.log("Form Data:", {
-      // ...formData,
-      //   startDate: formData.startDate,
-      //   endDate: formData.endDate,
-      //   startTime: formData.startTime,
-      //   endTime: formData.endTime,
-      // });
-      //console.log("Selected Customer:", selectedCustomer);
-      //console.log("Selected Contact:", selectedContact);
-      //console.log("Selected Location:", selectedLocation);
-      //console.log("Selected Service Call:", selectedServiceCall);
-      //console.log("Selected Sales Order:", selectedSalesOrder);
-      //console.log("Selected Workers:", selectedWorkers);
-      //console.log("Tasks:", tasks);
-      //console.log("Job Contact Type:", selectedJobContactType);
-      //console.log("=== END FORM DATA ===");
+      const effectiveLocation = resolveEffectiveLocation(
+        selectedLocation,
+        formData,
+        selectedCustomer
+      );
 
       // Validation check
       const missingFields = [];
       if (!selectedCustomer) missingFields.push("Customer");
-      if (!selectedLocation) missingFields.push("Location");
+      if (!effectiveLocation) missingFields.push("Location");
       if (!formData.startDate) missingFields.push("Start Date");
       if (!formData.endDate) missingFields.push("End Date");
       if (!formData.startTime) missingFields.push("Start Time");
@@ -2368,8 +2649,53 @@ const AddNewJobs = ({ validateJobForm }) => {
       if (!formData.priority) missingFields.push("Priority");
       if (!selectedJobContactType) missingFields.push("Job Contact Type");
 
+      if (repeatSettings.isRepeat && !repeatConfigured) {
+        toast.error(
+          "Please save your repeat schedule before submitting. Click Configure schedule.",
+          {
+            duration: 5000,
+            style: {
+              background: "#fff",
+              color: "#dc3545",
+              padding: "16px",
+              borderLeft: "6px solid #dc3545",
+            },
+          }
+        );
+        setShowRecurrenceModal(true);
+        return;
+      }
+
+      if (repeatSettings.isRepeat) {
+        const recurrenceValidation = validateRecurrenceRule(repeatSettings);
+        if (!recurrenceValidation.valid) {
+          toast.error(
+            <div>
+              <strong>Repeat schedule is invalid:</strong>
+              <ul style={{ marginBottom: 0, paddingLeft: 20 }}>
+                {recurrenceValidation.errors.map((err, index) => (
+                  <li key={index}>{err}</li>
+                ))}
+              </ul>
+            </div>,
+            {
+              duration: 5000,
+              style: {
+                background: "#fff",
+                color: "#dc3545",
+                padding: "16px",
+                borderLeft: "6px solid #dc3545",
+                maxWidth: "500px",
+              },
+            }
+          );
+          setShowRecurrenceModal(true);
+          return;
+        }
+      }
+
       if (missingFields.length > 0) {
-       // console.log("Missing Required Fields:", missingFields);
+        console.warn("[CreateJob] Submit blocked — missing fields:", missingFields);
         toast.error(
           <div>
             <strong>Please fill in all required fields:</strong>
@@ -2393,20 +2719,44 @@ const AddNewJobs = ({ validateJobForm }) => {
         return;
       }
 
+      const jobDates = repeatSettings.isRepeat
+        ? generateOccurrenceDates(repeatSettings)
+        : formData.startDate
+          ? [new Date(formData.startDate + "T00:00:00")]
+          : [];
+
+      if (jobDates.length === 0) {
+        console.warn("[CreateJob] Submit blocked — no job dates generated", {
+          isRepeat: repeatSettings.isRepeat,
+          startDate: formData.startDate,
+          repeatSettings,
+        });
+        toast.error(
+          repeatSettings.isRepeat
+            ? "Could not generate repeat job dates. Open Configure schedule and check your settings."
+            : "No job date could be generated. Please set a valid start date.",
+          {
+            duration: 5000,
+            style: {
+              background: "#fff",
+              color: "#dc3545",
+              padding: "16px",
+              borderLeft: "6px solid #dc3545",
+            },
+          }
+        );
+        if (repeatSettings.isRepeat) {
+          setShowRecurrenceModal(true);
+        }
+        return;
+      }
+
       setProgress(0);
       setIsSubmitting(true);
 
       // Generate base job number
       const baseJobNo = await generateBaseJobNo();
       const repeatGroupId = repeatSettings.isRepeat ? generateRepeatGroupId() : null;
-
-      // Generate recurring dates if repeat is enabled
-      const jobDates = repeatSettings.isRepeat
-        ? generateOccurrenceDates(repeatSettings)
-        : formData.startDate
-          ? [new Date(formData.startDate + "T00:00:00")]
-          : [];
-      // console.log("Generated job dates:", jobDates);
 
       // Check for overlaps
       // console.log("Checking for schedule conflicts...");
@@ -2536,33 +2886,33 @@ const AddNewJobs = ({ validateJobForm }) => {
 
           // Location
           location: {
-            locationName: selectedLocation?.value || selectedLocation?.siteId || selectedLocation?.address || "", // FIXED: Location Name = siteId
-            siteId: selectedLocation?.value || selectedLocation?.siteId || "",
-            addressType: selectedLocation?.addressType || "",
+            locationName: effectiveLocation?.value || effectiveLocation?.siteId || effectiveLocation?.address || "", // FIXED: Location Name = siteId
+            siteId: effectiveLocation?.value || effectiveLocation?.siteId || "",
+            addressType: effectiveLocation?.addressType || "",
             address: {
-              streetNo: selectedLocation?.streetNo || "", // Street No. = streetNo
-              streetAddress: selectedLocation?.street || "", // Street Address = street (e.g., "16 RAFFLES QUAY")
-              block: selectedLocation?.block || "", // Block = block
-              buildingNo: selectedLocation?.building || "", // Building No. = building (e.g., "#11-01 HONG LEONG BUILDING")
-              city: selectedLocation?.city || "", // City = city
-              stateProvince: selectedLocation?.stateProvince || "", // State/Province = stateProvince
-              postalCode: selectedLocation?.zipCode || "", // Zip/Postal Code = zipCode
-              country: selectedLocation?.countryName || "", // Country = countryName
+              streetNo: effectiveLocation?.streetNo || "", // Street No. = streetNo
+              streetAddress: effectiveLocation?.street || "", // Street Address = street (e.g., "16 RAFFLES QUAY")
+              block: effectiveLocation?.block || "", // Block = block
+              buildingNo: effectiveLocation?.building || "", // Building No. = building (e.g., "#11-01 HONG LEONG BUILDING")
+              city: effectiveLocation?.city || "", // City = city
+              stateProvince: effectiveLocation?.stateProvince || "", // State/Province = stateProvince
+              postalCode: effectiveLocation?.zipCode || "", // Zip/Postal Code = zipCode
+              country: effectiveLocation?.countryName || "", // Country = countryName
             },
             coordinates: formData.location?.coordinates || {
               latitude: "",
               longitude: "",
             },
             displayAddress: `${
-              selectedLocation?.building ? `${selectedLocation.building} - ` : ""
-            }${selectedLocation?.address}`, // Building/Unit name for display
+              effectiveLocation?.building ? `${effectiveLocation.building} - ` : ""
+            }${effectiveLocation?.address}`, // Building/Unit name for display
             // Display Sequence: siteId, Street, Building No., Country, ZipCode
             fullAddress: [
-              selectedLocation?.value || selectedLocation?.siteId || selectedLocation?.address, // Location Name (siteId)
-              selectedLocation?.street, // Street Address
-              selectedLocation?.building, // Building No.
-              selectedLocation?.countryName, // Country
-              selectedLocation?.zipCode, // Zip/Postal Code
+              effectiveLocation?.value || effectiveLocation?.siteId || effectiveLocation?.address, // Location Name (siteId)
+              effectiveLocation?.street, // Street Address
+              effectiveLocation?.building, // Building No.
+              effectiveLocation?.countryName, // Country
+              effectiveLocation?.zipCode, // Zip/Postal Code
             ]
               .filter(Boolean)
               .join(", "),
@@ -2602,23 +2952,38 @@ const AddNewJobs = ({ validateJobForm }) => {
         }
 
         try {
-          // 1. Get customer UUID: from portal (customerId) or SAP (findOrCreate by cardCode)
+          // 1. Get customer UUID: from portal (customerId) or SAP (server resolve by cardCode)
           let customerId;
           if (selectedCustomer.customerId) {
             customerId = selectedCustomer.customerId;
           } else {
-            const customer = await customerService.findOrCreate(
-              selectedCustomer.cardCode,
-              selectedCustomer.cardName || selectedCustomer.label || 'Unknown Customer'
-            );
-            customerId = customer.id;
+            const resolveResponse = await fetch("/api/jobs/resolve-customer", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include",
+              body: JSON.stringify({
+                cardCode: selectedCustomer.cardCode,
+                cardName:
+                  selectedCustomer.cardName ||
+                  selectedCustomer.label ||
+                  "Unknown Customer",
+              }),
+            });
+            const resolveJson = await resolveResponse.json().catch(() => ({}));
+            if (!resolveResponse.ok || !resolveJson?.customerId) {
+              throw new Error(
+                resolveJson?.error ||
+                  "Could not resolve customer in masterlist. Sync the customer from SAP and try again."
+              );
+            }
+            customerId = resolveJson.customerId;
           }
 
           // 2. Get or create location UUID
           let locationId = null;
           /** customer_location.id for linking customer_address_details.customer_location_id */
           let resolvedCustomerLocationId = null;
-          if (!selectedLocation && selectedCustomer.customer_address && selectedCustomer.customerId) {
+          if (!effectiveLocation && selectedCustomer.customer_address && selectedCustomer.customerId) {
             // Portal customer with address but no location selected: create default location
             const { data: newLoc, error: locErr } = await supabase
               .from('locations')
@@ -2630,11 +2995,11 @@ const AddNewJobs = ({ validateJobForm }) => {
               .single();
             if (!locErr && newLoc) locationId = newLoc.id;
           }
-          if (selectedLocation) {
-            // selectedLocation.value is a siteId from SAP, not a UUID
+          if (effectiveLocation) {
+            // effectiveLocation.value is a siteId from SAP, not a UUID
             // Try to find existing location by customer_id and location_name
             // FIXED: Location Name = siteId (value is siteId from API)
-            const locationName = selectedLocation.value || selectedLocation.siteId || selectedLocation.address || selectedLocation.building || '';
+            const locationName = effectiveLocation.value || effectiveLocation.siteId || effectiveLocation.address || effectiveLocation.building || '';
             const { data: existingLocation } = await supabase
               .from('locations')
               .select('id')
@@ -2651,12 +3016,12 @@ const AddNewJobs = ({ validateJobForm }) => {
               let lat = formData.location?.coordinates?.latitude;
               let lng = formData.location?.coordinates?.longitude;
               
-              // If not in formData, try selectedLocation
-              if ((lat === null || lat === undefined || lat === '') && selectedLocation?.coordinates?.latitude) {
-                lat = selectedLocation.coordinates.latitude;
+              // If not in formData, try effectiveLocation
+              if ((lat === null || lat === undefined || lat === '') && effectiveLocation?.coordinates?.latitude) {
+                lat = effectiveLocation.coordinates.latitude;
               }
-              if ((lng === null || lng === undefined || lng === '') && selectedLocation?.coordinates?.longitude) {
-                lng = selectedLocation.coordinates.longitude;
+              if ((lng === null || lng === undefined || lng === '') && effectiveLocation?.coordinates?.longitude) {
+                lng = effectiveLocation.coordinates.longitude;
               }
               
               // Prepare update data
@@ -2664,16 +3029,16 @@ const AddNewJobs = ({ validateJobForm }) => {
               const lngStr = (lng !== null && lng !== undefined && lng !== '') ? String(lng) : null;
               
               const updateData = {
-                site_id: selectedLocation.value || selectedLocation.siteId || null,
-                building: selectedLocation.building || null,
-                street_number: selectedLocation.streetNo || null,
-                street: selectedLocation.street || null,
-                block: selectedLocation.block || null,
-                address: selectedLocation.address || null,
-                city: selectedLocation.city || null,
-                country_name: selectedLocation.countryName || null,
-                zip_code: selectedLocation.zipCode || null,
-                address_type: selectedLocation.addressType || null
+                site_id: effectiveLocation.value || effectiveLocation.siteId || null,
+                building: effectiveLocation.building || null,
+                street_number: effectiveLocation.streetNo || null,
+                street: effectiveLocation.street || null,
+                block: effectiveLocation.block || null,
+                address: effectiveLocation.address || null,
+                city: effectiveLocation.city || null,
+                country_name: effectiveLocation.countryName || null,
+                zip_code: effectiveLocation.zipCode || null,
+                address_type: effectiveLocation.addressType || null
               };
               
               // Add coordinates if available
@@ -2694,12 +3059,12 @@ const AddNewJobs = ({ validateJobForm }) => {
                 // Don't throw - location exists, update is optional
               }
               
-              if (selectedLocation.value || selectedLocation.siteId) {
+              if (effectiveLocation.value || effectiveLocation.siteId) {
                 try {
                   const { customerLocationId } = await upsertJobCustomerLocation(supabase, {
                     customerId,
                     locationId,
-                    selectedLocation,
+                    selectedLocation: effectiveLocation,
                   });
                   if (customerLocationId) resolvedCustomerLocationId = customerLocationId;
                 } catch (custLocErr) {
@@ -2708,17 +3073,17 @@ const AddNewJobs = ({ validateJobForm }) => {
               }
             } else {
               // Create new location with all address details
-              // Get coordinates from formData or selectedLocation
+              // Get coordinates from formData or effectiveLocation
               // Handle both null and empty string cases
               let lat = formData.location?.coordinates?.latitude;
               let lng = formData.location?.coordinates?.longitude;
               
-              // If not in formData, try selectedLocation
-              if ((lat === null || lat === undefined || lat === '') && selectedLocation?.coordinates?.latitude) {
-                lat = selectedLocation.coordinates.latitude;
+              // If not in formData, try effectiveLocation
+              if ((lat === null || lat === undefined || lat === '') && effectiveLocation?.coordinates?.latitude) {
+                lat = effectiveLocation.coordinates.latitude;
               }
-              if ((lng === null || lng === undefined || lng === '') && selectedLocation?.coordinates?.longitude) {
-                lng = selectedLocation.coordinates.longitude;
+              if ((lng === null || lng === undefined || lng === '') && effectiveLocation?.coordinates?.longitude) {
+                lng = effectiveLocation.coordinates.longitude;
               }
               
               // Convert to string if it's a number, otherwise keep as null
@@ -2731,16 +3096,16 @@ const AddNewJobs = ({ validateJobForm }) => {
                 .insert({
                   customer_id: customerId,
                   location_name: locationName,
-                  site_id: selectedLocation.value || selectedLocation.siteId || null,
-                  building: selectedLocation.building || null,
-                  street_number: selectedLocation.streetNo || null,
-                  street: selectedLocation.street || null,
-                  block: selectedLocation.block || null,
-                  address: selectedLocation.address || null,
-                  city: selectedLocation.city || null,
-                  country_name: selectedLocation.countryName || null,
-                  zip_code: selectedLocation.zipCode || null,
-                  address_type: selectedLocation.addressType || null,
+                  site_id: effectiveLocation.value || effectiveLocation.siteId || null,
+                  building: effectiveLocation.building || null,
+                  street_number: effectiveLocation.streetNo || null,
+                  street: effectiveLocation.street || null,
+                  block: effectiveLocation.block || null,
+                  address: effectiveLocation.address || null,
+                  city: effectiveLocation.city || null,
+                  country_name: effectiveLocation.countryName || null,
+                  zip_code: effectiveLocation.zipCode || null,
+                  address_type: effectiveLocation.addressType || null,
                   current_latitude: latStr,
                   current_longitude: lngStr,
                   destination_latitude: latStr,
@@ -2755,12 +3120,12 @@ const AddNewJobs = ({ validateJobForm }) => {
               }
               locationId = newLocation.id;
               
-              if (selectedLocation.value || selectedLocation.siteId) {
+              if (effectiveLocation.value || effectiveLocation.siteId) {
                 try {
                   const { customerLocationId } = await upsertJobCustomerLocation(supabase, {
                     customerId,
                     locationId,
-                    selectedLocation,
+                    selectedLocation: effectiveLocation,
                   });
                   if (customerLocationId) resolvedCustomerLocationId = customerLocationId;
                 } catch (custLocErr) {
@@ -2773,8 +3138,8 @@ const AddNewJobs = ({ validateJobForm }) => {
           if (
             resolvedCustomerLocationId &&
             selectedCustomer?.cardCode &&
-            selectedLocation &&
-            (selectedLocation.value || selectedLocation.siteId)
+            effectiveLocation &&
+            (effectiveLocation.value || effectiveLocation.siteId)
           ) {
             try {
               await fetch('/api/customers/address-details', {
@@ -2782,8 +3147,8 @@ const AddNewJobs = ({ validateJobForm }) => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   customerCode: selectedCustomer.cardCode,
-                  addressName: selectedLocation.value || selectedLocation.siteId,
-                  addressType: selectedLocation.addressType,
+                  addressName: effectiveLocation.value || effectiveLocation.siteId,
+                  addressType: effectiveLocation.addressType,
                   customerLocationId: resolvedCustomerLocationId,
                 }),
               });
@@ -3124,7 +3489,7 @@ const AddNewJobs = ({ validateJobForm }) => {
           if (tasks && tasks.length > 0) {
             const taskInserts = tasks.map((task, index) => ({
               job_id: job.id,
-              task_name: task.taskName || '',
+              task_name: normalizeJobTaskNameForInsert(task.taskName),
               task_description: task.taskDescription || '',
               task_order: index + 1,
               is_required: Boolean(task.isPriority)
@@ -3361,11 +3726,11 @@ const AddNewJobs = ({ validateJobForm }) => {
           const totalMinutes = (parseInt(durationHours) * 60) + parseInt(durationMinutes);
           const durationHoursDecimal = (totalMinutes / 60).toFixed(2);
           
-          // Get full address from formData.location or selectedLocation
+          // Get full address from formData.location or effectiveLocation
           const fullAddress = formData.location?.fullAddress || 
                              formData.location?.displayAddress || 
-                             selectedLocation?.address || 
-                             selectedLocation?.fullAddress || 
+                             effectiveLocation?.address || 
+                             effectiveLocation?.fullAddress || 
                              '';
           
           // Format time values for job_schedule table (ensure HH:MM:SS format)
@@ -3426,7 +3791,11 @@ const AddNewJobs = ({ validateJobForm }) => {
       setProgress(100);
 
       // Show success message
-      toast.success(`Successfully created ${jobDates.length} job(s)!`, {
+      const successLabel =
+        repeatSettings.isRepeat && jobDates.length > 1
+          ? `Successfully created ${jobDates.length} repeat jobs!`
+          : `Successfully created ${jobDates.length} job(s)!`;
+      toast.success(successLabel, {
         duration: 5000,
         style: {
           background: "#fff",
@@ -3506,24 +3875,134 @@ const AddNewJobs = ({ validateJobForm }) => {
     setShowEquipments(!showEquipments);
   };
 
-  // Add useEffect to handle initial customer selection
+  // Prefill customer from ?customerCode= even when missing from SAP masterlist dropdown
   useEffect(() => {
     const initializeCustomer = async () => {
-      const params = new URLSearchParams(window.location.search);
-      const customerCode = params.get("customerCode");
+      if (urlCustomerPrefillHandledRef.current || urlCustomerPrefillInFlightRef.current) {
+        return;
+      }
+      if (!customersLoaded) return;
 
-      if (customerCode && customers.length > 0) {
-        const customerOption = customers.find(
-          (customer) => customer.value === customerCode
+      const params = new URLSearchParams(window.location.search);
+      const customerCode = String(params.get("customerCode") || "").trim();
+      if (!customerCode) {
+        urlCustomerPrefillHandledRef.current = true;
+        return;
+      }
+
+      const codeUpper = customerCode.toUpperCase();
+      const matchInList = (list) =>
+        (list || []).find((customer) => {
+          const value = String(customer.value || "").trim().toUpperCase();
+          const card = String(customer.cardCode || "").trim().toUpperCase();
+          return value === codeUpper || card === codeUpper;
+        });
+
+      const customerOption = matchInList(customers);
+      if (customerOption) {
+        urlCustomerPrefillHandledRef.current = true;
+        await handleCustomerChange(customerOption);
+        return;
+      }
+
+      // Not in loaded list (e.g. source=portal still, or not yet synced) — fetch & synthesize.
+      urlCustomerPrefillInFlightRef.current = true;
+      try {
+        let synthesized = null;
+
+        const bundleRes = await fetch(
+          `/api/customers/masterlist-bundle/${encodeURIComponent(customerCode)}?refresh=1`,
+          { credentials: "include", headers: { Accept: "application/json" } }
         );
-        if (customerOption) {
-          handleCustomerChange(customerOption);
+        if (bundleRes.ok) {
+          const bundleJson = await bundleRes.json().catch(() => ({}));
+          const partner = bundleJson?.partner;
+          if (partner?.CardCode) {
+            synthesized = {
+              value: partner.CardCode,
+              label: `${partner.CardCode} - ${partner.CardName || ""}`,
+              cardCode: partner.CardCode,
+              cardName: partner.CardName || "",
+              customerId: bundleJson.customerUuid || null,
+              email: partner.EmailAddress || "",
+              phone_number: partner.Phone1 || "",
+              customer_address: partner.MailAddress || partner.Address || "",
+              sap_card_code: bundleJson.sapCardCode || null,
+            };
+          }
         }
+
+        if (!synthesized) {
+          try {
+            const sapRes = await fetch(
+              `/api/getCustomerCode?cardCode=${encodeURIComponent(customerCode)}`,
+              { credentials: "include" }
+            );
+            if (sapRes.ok) {
+              const sapPartner = await sapRes.json().catch(() => null);
+              if (sapPartner?.CardCode) {
+                synthesized = {
+                  value: sapPartner.CardCode,
+                  label: `${sapPartner.CardCode} - ${sapPartner.CardName || ""}`,
+                  cardCode: sapPartner.CardCode,
+                  cardName: sapPartner.CardName || "",
+                  customerId: null,
+                  email: sapPartner.EmailAddress || "",
+                  phone_number: sapPartner.Phone1 || "",
+                  customer_address:
+                    sapPartner.MailAddress || sapPartner.Address || "",
+                  sap_card_code: null,
+                };
+              }
+            }
+          } catch (sapPrefillErr) {
+            console.warn("URL customerCode SAP fallback:", sapPrefillErr);
+          }
+        }
+
+        urlCustomerPrefillHandledRef.current = true;
+
+        if (!synthesized) {
+          toast(
+            `Customer ${customerCode} was not found in the master list. Select the customer manually.`,
+            {
+              icon: "⚠️",
+              duration: 6000,
+              style: {
+                background: "#fff",
+                color: "#856404",
+                padding: "16px",
+                borderLeft: "6px solid #ffc107",
+              },
+            }
+          );
+          return;
+        }
+
+        setCustomers((prev) => {
+          if (matchInList(prev)) return prev;
+          return [...prev, synthesized];
+        });
+        await handleCustomerChange(synthesized);
+      } catch (prefillErr) {
+        console.error("URL customerCode prefill failed:", prefillErr);
+        urlCustomerPrefillHandledRef.current = true;
+        toast.error("Could not prefill customer from URL. Select the customer manually.", {
+          duration: 5000,
+          style: {
+            background: "#fff",
+            color: "#dc3545",
+            padding: "16px",
+            borderLeft: "6px solid #dc3545",
+          },
+        });
+      } finally {
+        urlCustomerPrefillInFlightRef.current = false;
       }
     };
 
     initializeCustomer();
-  }, [customers]); // Dependency on customers ensures we wait for customer data to load
+  }, [customers, customersLoaded]);
 
   // Required field indicator component
   const RequiredField = () => (
@@ -3574,6 +4053,15 @@ const AddNewJobs = ({ validateJobForm }) => {
     initializeJobNo();
   }, []); // Empty dependency array means this runs once when component mounts
 
+  if (!initialBootstrapDone && !isFormReady) {
+    return (
+      <EditJobFormSkeleton
+        message="Please wait while we prepare the job form"
+        subMessage="Loading customers, workers, job statuses, schedule options, and job categories."
+      />
+    );
+  }
+
   return (
     <>
       <Tabs
@@ -3584,6 +4072,7 @@ const AddNewJobs = ({ validateJobForm }) => {
       >
         <Tab eventKey="summary" title="Job Summary">
           <Form noValidate validated={validated} onSubmit={handleSubmit}>
+            <fieldset disabled={isFormDisabled}>
             <Row className="mb-3">
               <Form.Group as={Col} md="7" controlId="customerList">
                 <Form.Label>
@@ -3633,7 +4122,7 @@ const AddNewJobs = ({ validateJobForm }) => {
                   placeholder={
                     isLoading ? "Loading customers..." : "Enter Customer Name"
                   }
-                  isDisabled={isLoading}
+                  isDisabled={isFormDisabled}
                   noOptionsMessage={() =>
                     isLoading ? "Loading..." : "No customers found"
                   }
@@ -4052,6 +4541,7 @@ const AddNewJobs = ({ validateJobForm }) => {
               </>
             )}
             <hr className="my-4" />
+            </fieldset>
           </Form>
           <Row className="align-items-center">
             <Col md={{ span: 4, offset: 8 }} xs={12} className="mt-1">
@@ -4059,6 +4549,7 @@ const AddNewJobs = ({ validateJobForm }) => {
                 variant="primary"
                 onClick={handleNextClick}
                 className="float-end"
+                disabled={isFormDisabled}
               >
                 Next
               </Button>
@@ -4066,6 +4557,7 @@ const AddNewJobs = ({ validateJobForm }) => {
           </Row>
         </Tab>
         <Tab eventKey="task" title="Job Task">
+          <fieldset disabled={isFormDisabled}>
           <JobTask
             tasks={tasks}
             addTask={addTask}
@@ -4073,12 +4565,14 @@ const AddNewJobs = ({ validateJobForm }) => {
             handleCheckboxChange={handleCheckboxChange}
             deleteTask={deleteTask}
           />
+          </fieldset>
           <Row className="align-items-center">
             <Col md={{ span: 4, offset: 8 }} xs={12} className="mt-1">
               <Button
                 variant="primary"
                 onClick={handleNextClick}
                 className="float-end"
+                disabled={isFormDisabled}
               >
                 Next
               </Button>
@@ -4087,6 +4581,7 @@ const AddNewJobs = ({ validateJobForm }) => {
         </Tab>
         <Tab eventKey="scheduling" title="Job Scheduling">
           <Form>
+            <fieldset disabled={isFormDisabled}>
             <Row className="mb-3">
               <Col xs="auto">
                 <Form.Group as={Col} controlId="jobNo">
@@ -4250,10 +4745,22 @@ const AddNewJobs = ({ validateJobForm }) => {
                 <Select
                   instanceId="worker-select"
                   isMulti
-                  options={workers}
+                  options={workerSelectOptions}
                   value={selectedWorkers}
                   onChange={handleWorkersChange}
-                  placeholder="Search Worker"
+                  onInputChange={handleWorkerSearchInputChange}
+                  inputValue={workerSearchInput}
+                  filterOption={() => true}
+                  placeholder={isFormReady ? "Search Worker" : "Loading workers..."}
+                  isSearchable
+                  isLoading={workersLoading}
+                  isDisabled={isFormDisabled}
+                  closeMenuOnSelect={false}
+                  getOptionLabel={(option) => option.label || option.name || "Unknown"}
+                  getOptionValue={(option) => option.value || option.id}
+                  noOptionsMessage={() =>
+                    workersLoading ? "Loading workers..." : "No workers found"
+                  }
                 />
               </Form.Group>
             </Row>
@@ -4261,7 +4768,7 @@ const AddNewJobs = ({ validateJobForm }) => {
               <Form.Group as={Col} md="4" controlId="startDate">
                 <RequiredFieldWithTooltip label="Start Date" />
                 <Flatpickr
-                  value={formData.startDate ? new Date(formData.startDate + 'T00:00:00') : null}
+                  value={displayStartDate ? new Date(displayStartDate + 'T00:00:00') : null}
                   options={{
                     dateFormat: 'd/m/Y',
                     altInput: true,
@@ -4345,7 +4852,7 @@ const AddNewJobs = ({ validateJobForm }) => {
                   aria-label="Select schedule session"
                 >
                   <option value="">Select a session</option>
-                  <option value="">Custom</option>
+                  <option value="custom">Custom</option>
                   {schedulingWindows.map((window) => (
                     <option key={window.id} value={window.label}>
                       {window.label} ({window.timeStart} to {window.timeEnd})
@@ -4458,6 +4965,11 @@ const AddNewJobs = ({ validateJobForm }) => {
                 <Col md="9">
                   <div className="d-flex flex-wrap align-items-center gap-2">
                     <span className="text-muted small">{recurrenceSummary}</span>
+                    {!repeatConfigured && (
+                      <span className="text-warning small">
+                        Repeat schedule not saved — open Configure schedule and save.
+                      </span>
+                    )}
                     <Button
                       variant="outline-primary"
                       size="sm"
@@ -4476,7 +4988,7 @@ const AddNewJobs = ({ validateJobForm }) => {
                   variant="primary"
                   onClick={handleSubmitClick}
                   className="float-end"
-                  disabled={isSubmitting}
+                  disabled={isFormDisabled}
                 >
                   {isSubmitting ? (
                     <>
@@ -4493,6 +5005,7 @@ const AddNewJobs = ({ validateJobForm }) => {
                 </Button>
               </Col>
             </Row>
+            </fieldset>
           </Form>
         </Tab>
       </Tabs>
@@ -4519,7 +5032,7 @@ const AddNewJobs = ({ validateJobForm }) => {
 
       <JobRecurrenceModal
         show={showRecurrenceModal}
-        onHide={() => setShowRecurrenceModal(false)}
+        onHide={handleRecurrenceModalHide}
         initialRule={normalizeRecurrenceRule(repeatSettings, formData.startDate)}
         onSave={handleRecurrenceSave}
         mode="configure"

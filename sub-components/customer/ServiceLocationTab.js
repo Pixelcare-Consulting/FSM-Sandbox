@@ -19,6 +19,10 @@ import { CustomCountryFlag } from 'components/flags/CountryFlags';
 import { toast } from 'react-toastify';
 import TablePagination from 'components/common/TablePagination';
 import { ExtensionFriendlyPhone } from 'components/common/ExtensionFriendlyPhone';
+import PortalModal, {
+  PortalConfirmPanel,
+  PortalConfirmRow,
+} from 'components/portal/PortalModal';
 import {
   resolveCustomerAddressDetailRow,
   siteAddressLookupKeys,
@@ -253,14 +257,25 @@ export const ServiceLocationTab = ({
     return false;
   };
 
+  // Badge only when SAP/FSM default name matches this location of the correct type.
+  // Empty or ghost defaults must not invent a Default badge.
   const isDefaultAddress = (location) => {
     const name = location.AddressName;
+    if (!name) return false;
     const type = (location.AddressType || '').toString().trim().toUpperCase();
     if (type === 'BO_BILLTO' || type === 'B' || type === 'BILLTO') {
-      return name === customerData.BilltoDefault;
+      const def = (customerData.BilltoDefault || '').toString().trim();
+      return Boolean(def) && name === def;
     }
     if (type === 'BO_SHIPTO' || type === 'S' || type === 'SHIPTO') {
-      return name === customerData.ShipToDefault;
+      const def = (
+        customerData.ShipToDefault ||
+        customerData.ShiptoDefault ||
+        ''
+      )
+        .toString()
+        .trim();
+      return Boolean(def) && name === def;
     }
     return false;
   };
@@ -268,11 +283,7 @@ export const ServiceLocationTab = ({
   // Filter out blank addresses
   const validAddresses = localAddresses.filter((location) => !isAddressBlank(location));
 
-  if (validAddresses.length === 0) {
-    return <div className="p-4">No service locations found.</div>;
-  }
-
-const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
+  const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
 
   const findContactForAddress = (location) => {
     const portalList = Array.isArray(location?.PortalSiteContacts) ? location.PortalSiteContacts : [];
@@ -518,6 +529,9 @@ const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
         jobPropagation = locResult;
       }
 
+      // customer_location_id FK only references customer_location — omit for leads
+      // so status/notes key by customer_code (lead code) + address name only.
+      const isLeadDetails = effectiveMasterlistKind === 'lead';
       const response = await fetch('/api/customers/address-details', {
         method: 'POST',
         headers: {
@@ -529,7 +543,9 @@ const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
           addressType: addressTypeForApi(formData.addressType) ?? selectedLocation.AddressType,
           status: formData.status,
           addressNotes: formData.addressNotes,
-          customerLocationId: selectedLocation.PortalLocationId || undefined,
+          ...(isLeadDetails
+            ? {}
+            : { customerLocationId: selectedLocation.PortalLocationId || undefined }),
         }),
       });
 
@@ -642,12 +658,26 @@ const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
 
     try {
       setDeleting(true);
-      const res = await fetch(
-        `/api/customers/locations/${encodeURIComponent(locationToDelete.PortalLocationId)}?customerCode=${encodeURIComponent(customerData.CardCode)}`,
-        { method: 'DELETE' }
-      );
+      const isLead = effectiveMasterlistKind === 'lead';
+      const leadCode = effectiveMasterlistCode || customerData.CardCode;
+      const deleteUrl = isLead
+        ? `/api/leads/locations/${encodeURIComponent(locationToDelete.PortalLocationId)}?leadCode=${encodeURIComponent(leadCode)}`
+        : `/api/customers/locations/${encodeURIComponent(locationToDelete.PortalLocationId)}?customerCode=${encodeURIComponent(customerData.CardCode)}`;
+
+      const res = await fetch(deleteUrl, { method: 'DELETE' });
       const result = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (res.status === 409) {
+          const jobCount = result.jobCount;
+          const jobLabel =
+            typeof jobCount === 'number'
+              ? `${jobCount} active job${jobCount === 1 ? '' : 's'}`
+              : 'active jobs';
+          throw new Error(
+            result.error ||
+              `Cannot delete: ${jobLabel} reference this service location`,
+          );
+        }
         throw new Error(result.error || `Delete failed (${res.status})`);
       }
 
@@ -742,6 +772,80 @@ const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
   const indexOfFirstLocation = indexOfLastLocation - locationsPerPage;
   const currentLocations = sortedLocations.slice(indexOfFirstLocation, indexOfLastLocation);
   const totalPages = Math.ceil(sortedLocations.length / locationsPerPage);
+
+  const deleteConfirmModal = (
+    <PortalModal
+      show={showDeleteModal}
+      onHide={handleCloseDeleteModal}
+      title="Delete Service Location"
+      size="md"
+      footer={
+        <>
+          <Button
+            variant="outline-secondary"
+            className="rounded-3"
+            onClick={handleCloseDeleteModal}
+            disabled={deleting}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            className="rounded-3"
+            onClick={handleConfirmDelete}
+            disabled={deleting || !locationToDelete?.PortalLocationId}
+          >
+            {deleting ? (
+              <>
+                <Spinner animation="border" size="sm" className="me-2" />
+                Deleting...
+              </>
+            ) : (
+              <>
+                <Trash size={16} className="me-1" /> Delete
+              </>
+            )}
+          </Button>
+        </>
+      }
+    >
+      {locationToDelete ? (
+        <>
+          <p className="text-muted mb-3">
+            Delete this service location from the portal? This does not change SAP.
+          </p>
+          <PortalConfirmPanel>
+            <PortalConfirmRow
+              label="Address"
+              value={locationToDelete.AddressName || '—'}
+            />
+            <PortalConfirmRow
+              label="Type"
+              value={formatAddressTypeLabel(locationToDelete.AddressType)}
+            />
+            <PortalConfirmRow label="Location">
+              {formatAddress(locationToDelete) || '—'}
+            </PortalConfirmRow>
+          </PortalConfirmPanel>
+          {isDefaultAddress(locationToDelete) ? (
+            <Alert variant="warning" className="mt-3 mb-0">
+              This is a default billing or shipping address in SAP. Deleting it here only
+              removes the portal row — confirm you want to proceed.
+            </Alert>
+          ) : null}
+        </>
+      ) : null}
+    </PortalModal>
+  );
+
+  if (validAddresses.length === 0) {
+    return (
+      <>
+        <div className="p-4">No service locations found.</div>
+        {deleteConfirmModal}
+      </>
+    );
+  }
 
   return (
     <Row className="p-4">
@@ -988,49 +1092,7 @@ const formatAddress = (address) => formatPortalBpAddressSubtitle(address);
           disabled={loadingDetails}
         />
 
-        <Modal show={showDeleteModal} onHide={handleCloseDeleteModal} centered>
-          <Modal.Header closeButton>
-            <Modal.Title>Delete Service Location</Modal.Title>
-          </Modal.Header>
-          <Modal.Body>
-            {locationToDelete && (
-              <>
-                <p>
-                  Delete this service location from the portal? This does not change SAP.
-                </p>
-                <div className="border rounded p-3 bg-light">
-                  <div className="fw-semibold">{locationToDelete.AddressName || '—'}</div>
-                  <div className="text-muted small mt-1">
-                    {formatAddressTypeLabel(locationToDelete.AddressType)}
-                  </div>
-                </div>
-                {isDefaultAddress(locationToDelete) && (
-                  <Alert variant="warning" className="mt-3 mb-0">
-                    This is a default billing or shipping address in SAP. Deleting it here only
-                    removes the portal row — confirm you want to proceed.
-                  </Alert>
-                )}
-              </>
-            )}
-          </Modal.Body>
-          <Modal.Footer>
-            <Button variant="secondary" onClick={handleCloseDeleteModal} disabled={deleting}>
-              Cancel
-            </Button>
-            <Button variant="danger" onClick={handleConfirmDelete} disabled={deleting}>
-              {deleting ? (
-                <>
-                  <Spinner animation="border" size="sm" className="me-2" />
-                  Deleting...
-                </>
-              ) : (
-                <>
-                  <Trash size={16} className="me-1" /> Delete
-                </>
-              )}
-            </Button>
-          </Modal.Footer>
-        </Modal>
+        {deleteConfirmModal}
 
         <Modal show={showModal} onHide={handleCloseModal} size="xl">
           <Modal.Header closeButton>

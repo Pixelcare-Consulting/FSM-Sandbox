@@ -22,7 +22,8 @@ const NavbarDefault = [
 				id: uuid(),
 				menuitem: 'Portal Customers',
 				link: '/customer-leads',
-				icon: 'PersonFill'
+				icon: 'PersonFill',
+				badge: 'NEW'
 			},
 		{	
 			id: uuid(),
@@ -90,13 +91,13 @@ const NavbarDefault = [
 				link: '/jobs',
 				icon: 'ListTask'
 			},
-			// {
-			// 	id: uuid(),
-			// 	menuitem: 'Live tracking (BETA)',
-			// 	link: '/jobs/live-tracking',
-			// 	icon: 'GeoAlt',
-			// 	badge: 'NEW'
-			// },
+			{
+				id: uuid(),
+				menuitem: 'Live tracking (BETA)',
+				link: '/jobs/live-tracking',
+				icon: 'GeoAlt',
+				badge: 'NEW'
+			},
 			// {
 			// 	id: uuid(),
 			// 	menuitem: 'Jobs Calendar',

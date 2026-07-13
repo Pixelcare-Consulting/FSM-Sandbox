@@ -1,5 +1,5 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
-import { logResponseSize } from '../../../lib/supabase/listQueryHelpers';
+import { getListCache, logResponseSize, setListCache } from '../../../lib/supabase/listQueryHelpers';
 import {
   writeAuditLogFromRequest,
   queryAuditLogs,
@@ -7,6 +7,12 @@ import {
   AUDIT_STATUS,
   AUDIT_SOURCE,
 } from '../../../lib/services/auditLog';
+
+const AUDIT_LOGS_CACHE_TTL_MS = 30 * 1000;
+
+function auditLogsCacheKey(query) {
+  return `audit-logs:${JSON.stringify(query)}`;
+}
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Credentials', true);
@@ -39,6 +45,25 @@ export default async function handler(req, res) {
         dateTo,
       } = req.query;
 
+      const cacheKey = auditLogsCacheKey({
+        page,
+        limit,
+        category,
+        action,
+        status,
+        entityType,
+        entityId,
+        userId,
+        search,
+        dateFrom,
+        dateTo,
+      });
+      const cached = getListCache(cacheKey, AUDIT_LOGS_CACHE_TTL_MS);
+      if (cached) {
+        logResponseSize('audit-logs/index (cached)', cached);
+        return res.status(200).json(cached);
+      }
+
       const result = await queryAuditLogs({
         supabase,
         page,
@@ -55,6 +80,7 @@ export default async function handler(req, res) {
       });
 
       const payload = { success: true, ...result };
+      setListCache(cacheKey, payload, AUDIT_LOGS_CACHE_TTL_MS);
       logResponseSize('audit-logs/index', payload);
       return res.status(200).json(payload);
     }

@@ -30,6 +30,7 @@
  * schedule/category/assignment cleanup. New job numbers are assigned in scheduled_start
  * order (earliest first), not AIFM id / API page order — see sortAifmJobsForJobNumberAssignment.
  * Next number uses max(YYYY-000000…999999) via one query (avoids duplicate job_number_key errors).
+ * On update of an existing job, description is never overwritten (portal edits stick).
  */
 
 import { getSupabaseAdmin } from '../../../../lib/supabase/server';
@@ -501,7 +502,10 @@ export async function runAifmImportBatch(jobs, supabase, options = {}) {
       let savedJob;
       if (existingJob) {
         const previousStatus = existingJob.status;
-        savedJob = await jobService.update(existingJob.id, jobData, supabase);
+        // Preserve portal-edited descriptions: AIFM only writes description on create.
+        // Re-imports must not overwrite jobs.description (Edit Job / inline Job Details edits).
+        const { description: _omitDescription, ...updateData } = jobData;
+        savedJob = await jobService.update(existingJob.id, updateData, supabase);
         if (
           savedJob?.id &&
           isJobStatusCompleted(savedJob.status) &&

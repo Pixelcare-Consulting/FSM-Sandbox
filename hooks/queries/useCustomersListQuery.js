@@ -34,6 +34,8 @@ export function useCustomersListQuery(params, { enabled = true } = {}) {
     staleTime: STALE_TIME_MS,
     keepPreviousData: true,
     refetchOnWindowFocus: false,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
   });
 
   const patchRow = useCallback(

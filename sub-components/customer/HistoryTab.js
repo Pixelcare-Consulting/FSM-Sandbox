@@ -55,7 +55,7 @@ function renderJobDescriptionCell(description) {
   );
 }
 
-export const HistoryTab = ({ customerID }) => {
+export const HistoryTab = ({ customerID, hasVisited = true }) => {
   const [jobHistory, setJobHistory] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -79,7 +79,7 @@ export const HistoryTab = ({ customerID }) => {
     data: historyData,
     isLoading: loading,
     error: historyError,
-  } = useCustomerJobHistoryQuery(customerID, historyParams);
+  } = useCustomerJobHistoryQuery(customerID, historyParams, { enabled: hasVisited });
 
   const totalCount = historyData?.totalCount ?? 0;
 

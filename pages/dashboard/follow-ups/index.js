@@ -1,7 +1,6 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { Fragment, useState, useEffect, useRef, useMemo } from 'react';
 import { useRouter } from 'next/router';
 import {
-  Container,
   Card,
   Row,
   Col,
@@ -10,6 +9,9 @@ import {
   Button,
   Dropdown
 } from 'react-bootstrap';
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from '../../../sub-components/dashboard/DashboardListStickySearch';
 import { getSupabaseClient } from '../../../lib/supabase/client';
 import { format } from 'date-fns';
 import { FaFilter, FaEllipsisV } from 'react-icons/fa';
@@ -25,6 +27,7 @@ import {
   FOLLOW_UP_PRIORITY_LABELS,
 } from '../../../lib/followUps/followUpListSummary';
 import { useFollowUpsListQuery, fetchFollowUpsList } from '../../../hooks/queries/useFollowUpsListQuery';
+import { useEnterToSearch } from '../../../hooks/useEnterToSearch';
 
 /** List / grouped table cell styles (aligned with company memos table polish). */
 const FU_TH = {
@@ -47,7 +50,8 @@ const FU_TD = {
   borderBottom: '1px solid #f1f5f9',
 };
 
-const REALTIME_DEBOUNCE_MS = 400;
+const REALTIME_DEBOUNCE_MS = 2500;
+const REALTIME_FULL_REFETCH_MIN_MS = 30_000;
 
 const FollowUpsPage = () => {
   const router = useRouter();
@@ -61,11 +65,25 @@ const FollowUpsPage = () => {
     },
     assignedWorker: router.query.workerId || 'all',
     followUpId: router.query.followUpId || '',
-    customerSearch: '',
-    jobNumber: '',
     /** @type {'all' | 'Low' | 'Normal' | 'High' | 'Urgent'} matches followups.priority labels */
     priority: 'all'
   });
+
+  const {
+    draft: customerSearchDraft,
+    setDraft: setCustomerSearchDraft,
+    applied: appliedCustomerSearch,
+    clear: clearCustomerSearch,
+    onKeyDown: onCustomerSearchKeyDown,
+  } = useEnterToSearch();
+
+  const {
+    draft: jobNumberDraft,
+    setDraft: setJobNumberDraft,
+    applied: appliedJobNumber,
+    clear: clearJobNumber,
+    onKeyDown: onJobNumberKeyDown,
+  } = useEnterToSearch();
   const [workers, setWorkers] = useState([]);
   const [showDebug, setShowDebug] = useState(false);
   const { followUpTypes, followUpStatuses } = useSettings();
@@ -87,22 +105,21 @@ const FollowUpsPage = () => {
     }
   }, [router.isReady, router.query]);
 
-  // Fetch workers for filter dropdown (slim summary API)
+  // Fetch active technicians for filter dropdown (assignable API)
   useEffect(() => {
     const fetchWorkers = async () => {
       try {
-        const res = await fetch('/api/workers/summary', { credentials: 'same-origin' });
-        if (!res.ok) throw new Error(`Workers summary failed (${res.status})`);
+        const res = await fetch('/api/workers/assignable?limit=200', { credentials: 'same-origin' });
+        if (!res.ok) throw new Error(`Assignable workers failed (${res.status})`);
         const payload = await res.json();
         const workersData = (payload.workers || [])
-          .filter((worker) => worker.status === 'ACTIVE')
           .map((worker) => ({
-            workerId: worker.workerId,
-            fullName: worker.fullName || '',
-            email: worker.email || '',
-            role: worker.role || '',
-            status: worker.status || 'Active',
-            username: worker.username || worker.email || '',
+            workerId: worker.technicianId,
+            fullName: worker.fullName || worker.username || '',
+            email: worker.username || '',
+            role: 'TECHNICIAN',
+            status: 'ACTIVE',
+            username: worker.username || '',
           }))
           .sort((a, b) => a.fullName.localeCompare(b.fullName));
         setWorkers(workersData);
@@ -122,13 +139,13 @@ const FollowUpsPage = () => {
       status: filters.status,
       type: filters.type,
       assignedWorker: filters.assignedWorker,
-      customerSearch: filters.customerSearch,
-      jobNumber: filters.jobNumber,
+      customerSearch: appliedCustomerSearch,
+      jobNumber: appliedJobNumber,
       priority: filters.priority,
       dateFrom: filters.dateRange.start,
       dateTo: filters.dateRange.end,
     }),
-    [currentPage, itemsPerPage, filters]
+    [currentPage, itemsPerPage, filters, appliedCustomerSearch, appliedJobNumber]
   );
 
   const {
@@ -139,21 +156,39 @@ const FollowUpsPage = () => {
     removeRow,
   } = useFollowUpsListQuery(followUpsParams);
 
+  const patchRowRef = useRef(patchRow);
+  const removeRowRef = useRef(removeRow);
+  const refetchFollowUpsRef = useRef(refetchFollowUps);
+  patchRowRef.current = patchRow;
+  removeRowRef.current = removeRow;
+  refetchFollowUpsRef.current = refetchFollowUps;
+
+  const lastFullRefetchAtRef = useRef(0);
+
   const jobs = followUpsData?.followUps || [];
   const totalCount = followUpsData?.totalCount ?? 0;
 
-  // Helper function to format status for display (replace underscores with spaces)
   const formatStatusForDisplay = (status) => {
     if (!status) return 'N/A';
     return status.replace(/_/g, ' ');
   };
 
-  // Realtime: patch or remove a single row (debounced 400ms); refetch one row via API when needed.
+  // Realtime: batched patch/remove with throttled full refetch (mirrors list-jobs).
   useEffect(() => {
     const supabase = getSupabaseClient();
     if (!supabase) return;
 
     let cancelled = false;
+    const pendingEventsRef = { current: [] };
+
+    const throttledRefetch = () => {
+      const now = Date.now();
+      if (now - lastFullRefetchAtRef.current < REALTIME_FULL_REFETCH_MIN_MS) {
+        return;
+      }
+      lastFullRefetchAtRef.current = now;
+      void refetchFollowUpsRef.current();
+    };
 
     const patchOrRemoveRow = async (payload) => {
       if (cancelled) return;
@@ -162,12 +197,12 @@ const FollowUpsPage = () => {
       const rowId = payload.new?.id || payload.old?.id;
 
       if (eventType === 'DELETE' || payload.new?.deleted_at) {
-        removeRow(rowId);
+        removeRowRef.current(rowId);
         return;
       }
 
       if (!rowId) {
-        void refetchFollowUps();
+        throttledRefetch();
         return;
       }
 
@@ -180,14 +215,20 @@ const FollowUpsPage = () => {
         const row = singlePayload.followUps?.[0];
 
         if (!row) {
-          removeRow(rowId);
+          removeRowRef.current(rowId);
           return;
         }
 
-        patchRow(row, eventType);
+        patchRowRef.current(row, eventType);
       } catch (patchErr) {
         console.warn('Follow-up realtime patch failed:', patchErr);
-        void refetchFollowUps();
+        throttledRefetch();
+      }
+    };
+
+    const processBatchedEvents = async (events) => {
+      for (const payload of events) {
+        await patchOrRemoveRow(payload);
       }
     };
 
@@ -202,11 +243,14 @@ const FollowUpsPage = () => {
           filter: 'deleted_at=is.null',
         },
         (payload) => {
+          pendingEventsRef.current.push(payload);
           if (realtimeDebounceRef.current) {
             clearTimeout(realtimeDebounceRef.current);
           }
           realtimeDebounceRef.current = setTimeout(() => {
-            void patchOrRemoveRow(payload);
+            const batch = pendingEventsRef.current;
+            pendingEventsRef.current = [];
+            void processBatchedEvents(batch);
           }, REALTIME_DEBOUNCE_MS);
         }
       )
@@ -219,7 +263,7 @@ const FollowUpsPage = () => {
       }
       supabase.removeChannel(realtimeChannel);
     };
-  }, [patchRow, removeRow, refetchFollowUps]);
+  }, []);
 
   const getStatusBadge = (status) => {
     if (!status) {
@@ -412,11 +456,11 @@ const FollowUpsPage = () => {
   // Reset to page 1 when filters or view mode change
   useEffect(() => {
     setCurrentPage(1);
-  }, [filters.status, filters.type, filters.assignedWorker, filters.dateRange, filters.customerSearch, filters.jobNumber, filters.priority, viewMode]);
+  }, [filters.status, filters.type, filters.assignedWorker, filters.dateRange, appliedCustomerSearch, appliedJobNumber, filters.priority, viewMode]);
 
   const hasActiveFilters = !!(
-    filters.customerSearch ||
-    filters.jobNumber ||
+    appliedCustomerSearch ||
+    appliedJobNumber ||
     (filters.assignedWorker && filters.assignedWorker !== 'all') ||
     (filters.status && filters.status !== 'all') ||
     (filters.type && filters.type !== 'all') ||
@@ -426,31 +470,30 @@ const FollowUpsPage = () => {
   );
 
   const clearAllFilters = () => {
+    clearCustomerSearch();
+    clearJobNumber();
     setFilters(prev => ({
       ...prev,
-      customerSearch: '',
-      jobNumber: '',
       assignedWorker: 'all',
       status: 'all',
       type: 'all',
       priority: 'all',
       dateRange: { start: null, end: null }
     }));
+    setCurrentPage(1);
     if (router.isReady && (router.query.status || router.query.type || router.query.workerId || router.query.startDate || router.query.endDate)) {
       router.replace('/dashboard/follow-ups', undefined, { shallow: true });
     }
   };
 
   return (
-    <Container fluid className="px-3 pt-0 pb-2">
+    <Fragment>
       <GeeksSEO title="Follow-Ups | SAS M&E - SAP B1 | Portal" />
 
-      {/* Filter Panel - Matching Jobs/Workers Design */}
+      {/* Search filters + table share one Col so sticky has room to stick (matches customers list) */}
       <Row>
-        <Col md={12} xs={12} className="mb-2">
-          {/* Global Search Filter Card */}
-          <Card className="border-0 shadow-sm mb-2" style={{ background: 'linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)' }}>
-            <Card.Body className="p-3">
+        <Col md={12} xs={12} className="mb-5">
+          <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_BLUE} className="mb-2">
               {/* Customer Search Row */}
               <Row className="align-items-center mb-2">
                 <Col md={12}>
@@ -461,14 +504,15 @@ const FollowUpsPage = () => {
                         Search Filters
                       </h6>
                       <small className="text-white" style={{ opacity: 0.9, fontSize: '0.75rem' }}>
-                        ⚡ Live • All Fields
+                        Press Enter to search
                       </small>
                     </div>
                     <div className="flex-grow-1">
                       <Form.Control
                         type="text"
-                        value={filters.customerSearch}
-                        onChange={(e) => setFilters(prev => ({ ...prev, customerSearch: e.target.value }))}
+                        value={customerSearchDraft}
+                        onChange={(e) => setCustomerSearchDraft(e.target.value)}
+                        onKeyDown={onCustomerSearchKeyDown}
                         placeholder="🔍 Search customer name..."
                         style={{ 
                           fontSize: '0.95rem', 
@@ -525,8 +569,9 @@ const FollowUpsPage = () => {
                         <Form.Control
                           type="text"
                           placeholder="🔍 Search job number..."
-                          value={filters.jobNumber}
-                          onChange={(e) => setFilters(prev => ({ ...prev, jobNumber: e.target.value }))}
+                          value={jobNumberDraft}
+                          onChange={(e) => setJobNumberDraft(e.target.value)}
+                          onKeyDown={onJobNumberKeyDown}
                           style={{ 
                             paddingLeft: '40px', 
                             fontSize: '0.95rem',
@@ -741,10 +786,7 @@ const FollowUpsPage = () => {
                   </div>
                 </Col>
               </Row>
-            </Card.Body>
-          </Card>
-        </Col>
-      </Row>
+          </DashboardListStickySearch>
 
       {/* {process.env.NODE_ENV === 'development' && (
         <Row className="mb-3">
@@ -855,7 +897,7 @@ const FollowUpsPage = () => {
                           <div>
                             <div className="d-flex align-items-center gap-2">
                               <Link 
-                                href={`/jobs/view/${jobGroup.jobID}`}
+                                href={`/dashboard/jobs/${jobGroup.jobID}`}
                                 onClick={(e) => e.stopPropagation()}
                                 style={{ color: '#3b82f6', textDecoration: 'none', fontWeight: '600', fontSize: '1rem' }}
                               >
@@ -1046,7 +1088,7 @@ const FollowUpsPage = () => {
                       <td style={{ ...FU_TD, color: '#0f172a' }}>
                         <div className="d-flex align-items-center gap-2">
                           <Link 
-                            href={`/jobs/view/${followUp.jobID}`}
+                            href={`/dashboard/jobs/${followUp.jobID}`}
                             style={{ color: '#3b82f6', textDecoration: 'none', fontWeight: '600' }}
                           >
                             {followUp.jobNumber}
@@ -1070,7 +1112,7 @@ const FollowUpsPage = () => {
                                 }}
                                 onClick={(e) => {
                                   e.preventDefault();
-                                  router.push(`/jobs/view/${followUp.jobID}#follow-ups`);
+                                  router.push(`/dashboard/jobs/${followUp.jobID}#follow-ups`);
                                 }}
                               >
                                 {followUp.jobFollowUpCount}
@@ -1195,6 +1237,8 @@ const FollowUpsPage = () => {
           )}
         </Card.Body>
       </Card>
+        </Col>
+      </Row>
 
       <style jsx global>{`
         .follow-ups-view-switch {
@@ -1295,7 +1339,7 @@ const FollowUpsPage = () => {
           font-weight: 500;
         }
       `}</style>
-    </Container>
+    </Fragment>
   );
 };
 

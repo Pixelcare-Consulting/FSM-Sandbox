@@ -90,7 +90,7 @@ const TimelineScheduler = ({
 
   const handleViewFullJob = useCallback((jobId) => {
     if (!jobId) return;
-    window.open(`/jobs/view/${jobId}`, '_blank', 'noopener,noreferrer');
+    window.open(`/dashboard/jobs/${jobId}`, '_blank', 'noopener,noreferrer');
     handleCloseModal();
     onViewJob?.(jobId);
   }, [onViewJob, handleCloseModal]);

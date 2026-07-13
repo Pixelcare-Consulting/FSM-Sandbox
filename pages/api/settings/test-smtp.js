@@ -1,4 +1,5 @@
 import { requireSession } from '../../../lib/auth/requireSession';
+import { blockIfProduction } from '../../../lib/api/blockInProduction';
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 import nodemailer from 'nodemailer';
 import {
@@ -108,6 +109,8 @@ function requestAppOrigin(req) {
  * Body: { to?, draft?, previewTemplate?, sampleTechnicianId? } — draft overrides form; previewTemplate sends a template sample; sampleTechnicianId (technicians.id) picks tech for {{technician_name}} / {{assignee_name}} (else session tech, else first active).
  */
 export default async function handler(req, res) {
+  if (blockIfProduction(req, res)) return;
+
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Method not allowed' });
   }

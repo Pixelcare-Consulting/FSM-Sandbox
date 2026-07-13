@@ -1,10 +1,11 @@
 import { getSupabaseAdmin } from "../../../lib/supabase/server";
+import { withSession } from "../../../lib/api/withSession";
 import { fetchWorkerListStats, fetchWorkersListSummary } from "../../../lib/technicians/workerData";
 import { getListCache, logResponseSize, setListCache } from "../../../lib/supabase/listQueryHelpers";
 
 const CACHE_TTL_MS = 45000;
 
-export default async function handler(req, res) {
+export default withSession(async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -53,4 +54,4 @@ export default async function handler(req, res) {
       error: error.message || "Unable to load workers summary.",
     });
   }
-}
+});

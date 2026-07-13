@@ -16,14 +16,19 @@ import NotificationList from "data/Notification";
 import useMounted from "hooks/useMounted";
 import { useRouter } from "next/router";
 import Cookies from "js-cookie";
-import { useQueryClient } from 'react-query';
+import { useQueryClient, useQuery } from 'react-query';
 import { getSupabaseClient } from "../lib/supabase/client";
+import { queryKeys } from '../lib/cache/queryKeys';
+import { useNotificationsQuery } from '../hooks/queries/useNotificationsQuery';
 import { jobDisplayCustomerName } from "../lib/utils/embeddedCustomerName";
+import { useDashboardBootstrap } from '../hooks/useDashboardBootstrap';
+import { useCurrentUserProfile } from '@/hooks/useCurrentUser';
+import { readCachedDashboardBootstrap, invalidateDashboardBootstrapCache } from '../utils/dashboardBootstrapCache';
 import { userService } from "../lib/supabase/database";
 import DotBadge from "components/bootstrap/DotBadge";
 import { FaBriefcase, FaCheckCircle, FaExclamationCircle } from "react-icons/fa";
 import Swal from 'sweetalert2';
-import { getNotifications, updateNotificationCache, invalidateNotificationCache, getUnreadCount } from '../utils/notificationCache';
+import { invalidateNotificationCache } from '../utils/notificationCache';
 import { getCompanyDetails } from '../utils/companyCache';
 // Removed: useSessionRenewal and handleSessionError - Session management now handled by ActivityTracker in _app.js
 import { useLogo } from '../contexts/LogoContext';
@@ -384,7 +389,6 @@ const QuickMenu = ({ children }) => {
   const router = useRouter();
   const hasMounted = useMounted();
   const isDesktop = useMediaQuery({ query: "(min-width: 1224px)" });
-  const [userDetails, setUserDetails] = useState(null);
   const [unreadCount, setUnreadCount] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -394,50 +398,29 @@ const QuickMenu = ({ children }) => {
   // Session management is handled by ActivityTracker in _app.js
   // Removed duplicate initializeSessionRenewalCheck to prevent conflicts
 
-  // Memoize userDetails fetch
-  const fetchUserDetails = useCallback(async () => {
-    const email = sanitizeNameValue(Cookies.get("email")) || sanitizeNameValue(Cookies.get("username"));
-    if (email) {
-      try {
-        // Get user from Supabase
-        const userData = await userService.findByEmail(email);
-        
-        if (userData) {
-          // Map Supabase user data to expected format (similar to getUserInfo API)
-          const technician = userData.technicians?.[0] || userData.technicians;
-          // Never use a leftover fullName cookie from another session/user — it was ranked above username and caused wrong header after account switch
-          const fullName =
-            sanitizeNameValue(technician?.full_name) ||
-            sanitizeNameValue(userData.username) ||
-            sanitizeNameValue(email);
+  const { data: bootstrap } = useDashboardBootstrap();
+  const { profile: userDetails, user: currentUser } = useCurrentUserProfile();
 
-          if (fullName) {
-            Cookies.set("fullName", fullName, { expires: 7 });
-          }
-          if (userData.username) {
-            Cookies.set("username", userData.username, { expires: 7 });
-          }
-          
-          // Set user details with mapped fullName
-          setUserDetails({
-            ...userData,
-            fullName: fullName,
-            email: userData.username || email,
-            profilePicture: userData?.avatar_url || technician?.avatar_url
-          });
-        }
-      } catch (error) {
-        console.error("Error fetching user details:", error.message);
-      }
-    } else {
+  useEffect(() => {
+    const email = sanitizeNameValue(Cookies.get("email")) || sanitizeNameValue(Cookies.get("username"));
+    if (!email) {
       router.push("/sign-in");
     }
   }, [router]);
 
-  // Optimize useEffect for userDetails
   useEffect(() => {
-    fetchUserDetails();
-  }, [fetchUserDetails]);
+    if (!userDetails?.fullName) return;
+    Cookies.set("fullName", userDetails.fullName, { expires: 7 });
+    if (userDetails.username) {
+      Cookies.set("username", userDetails.username, { expires: 7 });
+    }
+  }, [userDetails?.fullName, userDetails?.username]);
+
+  useEffect(() => {
+    if (!bootstrap?.companyInfo?.logo || logo !== '/images/SAS-LOGO.png') return;
+    setLogo(bootstrap.companyInfo.logo);
+    localStorage.setItem('companyLogo', bootstrap.companyInfo.logo);
+  }, [bootstrap?.companyInfo?.logo, logo, setLogo]);
 
   // Sign out function
   const handleSignOut = async () => {
@@ -560,6 +543,7 @@ const QuickMenu = ({ children }) => {
             // Clear relevant localStorage items
             try {
               queryClient.clear();
+              invalidateDashboardBootstrapCache();
               localStorage.removeItem('welcomeShown');
               localStorage.removeItem('companyLogo');
               localStorage.removeItem('lastLoginTime');
@@ -680,16 +664,24 @@ const QuickMenu = ({ children }) => {
 
   // Add these states for notifications
   const [notifications, setNotifications] = useState([]);
-  const workerId = Cookies.get('workerId');
-  const uid = Cookies.get('uid');
-  /** `notifications.worker_id` is public.users.id — resolve profile id first, then cookies (uid + workerId may differ). */
+  const workerId = currentUser?.workerId;
+  const uid = currentUser?.id || currentUser?.uid;
+  /** Stable channel filter ids from bootstrap user (avoids resubscribe when profile loads). */
   const notificationSubjectIds = useMemo(() => {
     const ids = [];
-    if (userDetails?.id) ids.push(userDetails.id);
     if (uid) ids.push(uid);
-    if (workerId) ids.push(workerId);
+    if (workerId && workerId !== uid) ids.push(workerId);
     return [...new Set(ids.filter(Boolean))];
-  }, [userDetails?.id, uid, workerId]);
+  }, [uid, workerId]);
+
+  const allNotificationSubjectIdsRef = useRef([]);
+  allNotificationSubjectIdsRef.current = useMemo(() => {
+    const ids = [...notificationSubjectIds];
+    if (userDetails?.id && !ids.includes(userDetails.id)) {
+      ids.push(userDetails.id);
+    }
+    return ids;
+  }, [notificationSubjectIds, userDetails?.id]);
 
   const [notifMenuShow, setNotifMenuShow] = useState(false);
   const notifHoverCloseTimer = useRef(null);
@@ -698,8 +690,31 @@ const QuickMenu = ({ children }) => {
   const notificationDebounceRef = useRef(null);
   const followUpDebounceRef = useRef(null);
   const lastNotifFetchRef = useRef(0);
-  const REALTIME_DEBOUNCE_MS = 400;
+  const inFlightLoadRef = useRef(null);
+  const REALTIME_DEBOUNCE_MS = 2500;
   const MIN_VISIBILITY_REFETCH_MS = 30000;
+  const MIN_NOTIF_FETCH_MS = 30000;
+  const MIN_HOVER_REFETCH_MS = 5000;
+
+  const {
+    data: notificationsPayload,
+    refetch: refetchNotificationsQuery,
+  } = useNotificationsQuery({
+    enabled: notificationSubjectIds.length > 0,
+    limit: 20,
+  });
+
+  useEffect(() => {
+    const notificationsList = notificationsPayload?.notifications || [];
+    seenNotificationIdsRef.current = new Set(notificationsList.map((n) => n.id));
+    setNotifications(notificationsList);
+    setUnreadCount(
+      notificationsPayload?.unreadCount ?? notificationsList.filter((n) => !n.read).length
+    );
+    if (notificationsPayload?.fetchedAt) {
+      lastNotifFetchRef.current = Date.now();
+    }
+  }, [notificationsPayload]);
 
   const clearNotifHoverCloseTimer = () => {
     if (notifHoverCloseTimer.current) {
@@ -708,57 +723,30 @@ const QuickMenu = ({ children }) => {
     }
   };
 
-  const loadNotifications = useCallback(async () => {
+  const loadNotifications = useCallback(async (options = {}) => {
+    const { force = false } = options;
+
+    if (!notificationSubjectIds.length) return;
+
+    const now = Date.now();
+    if (!force && lastNotifFetchRef.current > 0 && now - lastNotifFetchRef.current < MIN_NOTIF_FETCH_MS) {
+      return;
+    }
+
     try {
-      if (!notificationSubjectIds.length) return;
-
-      const res = await fetch('/api/notifications/summary?limit=20', { cache: 'no-store' });
-      if (!res.ok) {
-        throw new Error(`notifications summary ${res.status}`);
-      }
-      const payload = await res.json();
-      const notificationsList = payload.notifications || [];
-      lastNotifFetchRef.current = Date.now();
-
-      // Toast popups disabled (too spammy — admins received a toast for every
-      // job update across the system). Notifications still surface in the bell
-      // dropdown + unread badge below. Keep this block for easy re-enable.
-      // const prevIds = seenNotificationIdsRef.current;
-      // const jobNotifTypes = new Set([
-      //   'job_assigned',
-      //   'job_created',
-      //   'job_reassigned',
-      //   'follow_up_created',
-      //   'job_updated',
-      // ]);
-      // if (prevIds.size > 0) {
-      //   for (const n of notificationsList) {
-      //     if (prevIds.has(n.id) || n.read) continue;
-      //     if (!jobNotifTypes.has(n.type)) continue;
-      //     const body = (n.message || n.title || 'New notification').trim();
-      //     toast.info(body, {
-      //       position: 'top-right',
-      //       autoClose: 7000,
-      //       hideProgressBar: false,
-      //     });
-      //   }
-      // }
-      seenNotificationIdsRef.current = new Set(notificationsList.map((n) => n.id));
-
-      setNotifications(notificationsList);
-      setUnreadCount(notificationsList.filter((n) => !n.read).length);
+      await refetchNotificationsQuery();
     } catch (error) {
       console.error('Error loading notifications:', error);
       setNotifications([]);
       setUnreadCount(0);
     }
-  }, [notificationSubjectIds]);
+  }, [notificationSubjectIds, refetchNotificationsQuery]);
 
   const handleNotifToggle = useCallback(
     (nextOpen) => {
       setNotifMenuShow(nextOpen);
       if (nextOpen) {
-        loadNotifications();
+        void loadNotifications({ force: true });
       }
     },
     [loadNotifications]
@@ -767,8 +755,16 @@ const QuickMenu = ({ children }) => {
   const handleNotifWrapperEnter = useCallback(() => {
     clearNotifHoverCloseTimer();
     setNotifMenuShow(true);
-    loadNotifications();
-  }, [loadNotifications]);
+    const now = Date.now();
+    if (
+      notifications.length > 0 &&
+      lastNotifFetchRef.current > 0 &&
+      now - lastNotifFetchRef.current < MIN_HOVER_REFETCH_MS
+    ) {
+      return;
+    }
+    void loadNotifications();
+  }, [loadNotifications, notifications.length]);
 
   const handleNotifWrapperLeave = useCallback(() => {
     clearNotifHoverCloseTimer();
@@ -786,13 +782,11 @@ const QuickMenu = ({ children }) => {
     }, REALTIME_DEBOUNCE_MS);
   }, [loadNotifications]);
 
-  const isNotificationForSubject = useCallback(
-    (row) => {
-      if (!row) return false;
-      return row.worker_id == null || notificationSubjectIds.includes(row.worker_id);
-    },
-    [notificationSubjectIds]
-  );
+  const isNotificationForSubject = useCallback((row) => {
+    if (!row) return false;
+    const ids = allNotificationSubjectIdsRef.current;
+    return row.worker_id == null || ids.includes(row.worker_id);
+  }, []);
 
   const sortNotificationsByCreatedAt = useCallback((rows) => {
     return [...rows].sort(
@@ -857,14 +851,23 @@ const QuickMenu = ({ children }) => {
     [isNotificationForSubject, scheduleNotificationRefresh, sortNotificationsByCreatedAt]
   );
 
-  // Add notification listener effect with Supabase Realtime
+  const loadNotificationsRef = useRef(loadNotifications);
+  loadNotificationsRef.current = loadNotifications;
+  const patchNotificationFromRealtimeRef = useRef(patchNotificationFromRealtime);
+  patchNotificationFromRealtimeRef.current = patchNotificationFromRealtime;
+
+  // Initial notification fetch (separate from realtime subscribe)
+  useEffect(() => {
+    if (!notificationSubjectIds.length) return;
+    void loadNotificationsRef.current();
+  }, [notificationSubjectIds]);
+
+  // Notification realtime subscribe
   useEffect(() => {
     if (!notificationSubjectIds.length) return;
 
     const supabase = getSupabaseClient();
     if (!supabase) return;
-
-    loadNotifications();
 
     const channelKey = notificationSubjectIds.slice().sort().join('-');
     const filter =
@@ -880,14 +883,14 @@ const QuickMenu = ({ children }) => {
           event: '*',
           schema: 'public',
           table: 'notifications',
-          filter
+          filter,
         },
         (payload) => {
           if (notificationDebounceRef.current) {
             clearTimeout(notificationDebounceRef.current);
           }
           notificationDebounceRef.current = setTimeout(() => {
-            patchNotificationFromRealtime(payload);
+            patchNotificationFromRealtimeRef.current(payload);
           }, REALTIME_DEBOUNCE_MS);
         }
       )
@@ -899,7 +902,7 @@ const QuickMenu = ({ children }) => {
       }
       supabase.removeChannel(channel);
     };
-  }, [notificationSubjectIds, loadNotifications, patchNotificationFromRealtime]);
+  }, [notificationSubjectIds]);
 
   /** Instant refresh after local emits (`jobStakeholderNotificationsClient`); also catches missed Realtime events. */
   useEffect(() => {
@@ -937,6 +940,10 @@ const QuickMenu = ({ children }) => {
   useEffect(() => {
     if (!notificationSubjectIds.length) return;
     const onRouteDone = () => {
+      const now = Date.now();
+      if (lastNotifFetchRef.current > 0 && now - lastNotifFetchRef.current < MIN_NOTIF_FETCH_MS) {
+        return;
+      }
       void loadNotifications();
     };
     router.events.on('routeChangeComplete', onRouteDone);
@@ -1104,20 +1111,28 @@ const QuickMenu = ({ children }) => {
     );
   }, [searchQuery, handleSearchChange, handleSearchSubmit, handleClearSearch]);
 
-  // Optimize company logo fetch
+  // Company logo from session bootstrap (fallback if bootstrap did not run yet)
   useEffect(() => {
     const loadCompanyDetails = async () => {
-      if (logo === '/images/SAS-LOGO.png') {
-        const cachedLogo = localStorage.getItem('companyLogo');
-        if (cachedLogo) {
-          setLogo(cachedLogo);
-        } else {
-          const companyData = await getCompanyDetails();
-          if (companyData?.logo) {
-            setLogo(companyData.logo);
-            localStorage.setItem('companyLogo', companyData.logo);
-          }
-        }
+      if (logo !== '/images/SAS-LOGO.png') return;
+
+      const cachedLogo = localStorage.getItem('companyLogo');
+      if (cachedLogo) {
+        setLogo(cachedLogo);
+        return;
+      }
+
+      const bootstrap = readCachedDashboardBootstrap();
+      if (bootstrap?.companyInfo?.logo) {
+        setLogo(bootstrap.companyInfo.logo);
+        localStorage.setItem('companyLogo', bootstrap.companyInfo.logo);
+        return;
+      }
+
+      const companyData = await getCompanyDetails();
+      if (companyData?.logo) {
+        setLogo(companyData.logo);
+        localStorage.setItem('companyLogo', companyData.logo);
       }
     };
 
@@ -1148,104 +1163,42 @@ const QuickMenu = ({ children }) => {
   });
   const [taskCount, setTaskCount] = useState(0);
 
-  // Modified task fetching logic
-  useEffect(() => {
-    const fetchJobTasks = async () => {
-      if (!workerId) return;
-      
-      try {
-        const supabase = getSupabaseClient();
-        if (!supabase) return;
-
-        // Get user to find technician ID
-        const user = await userService.findById(workerId);
-        const technicianId = user?.technicians?.[0]?.id;
-        
-        if (!technicianId) {
-          setTaskCategories({ followUps: [], appointments: [], reminders: [] });
-          setTaskCount(0);
-          return;
-        }
-
-        // Fetch jobs assigned to this technician
-        const { data: technicianJobs, error } = await supabase
-          .from('technician_jobs')
-          .select(`
-            *,
-            job:job_id(
-              *,
-              job_tasks(*)
-            )
-          `)
-          .eq('technician_id', technicianId)
-          .eq('assignment_status', 'ASSIGNED')
-          .is('deleted_at', null);
-
-        if (error) {
-          console.error('Error fetching jobs:', error);
-          throw error;
-        }
-
-        let tasks = {
-          followUps: [],
-          appointments: [],
-          reminders: []
-        };
-
-        // Process jobs and their tasks
-        (technicianJobs || [])
-          .filter(techJob => {
-            const jobData = techJob.job;
-            // Filter by job status
-            return jobData && ['Created', 'In Progress'].includes(jobData.status);
-          })
-          .forEach(techJob => {
-            const jobData = techJob.job;
-            if (!jobData) return;
-
-          // Process job_tasks if they exist
-          if (jobData.job_tasks && Array.isArray(jobData.job_tasks)) {
-            jobData.job_tasks.forEach(task => {
-              // Check if task is not done
-              if (!task.is_done) {
-                const taskWithContext = {
-                  ...task,
-                  jobID: jobData.id,
-                  jobName: jobData.job_name || jobData.name,
-                  customerName: jobData.customer?.name || '',
-                  startDate: jobData.start_date,
-                  endDate: jobData.end_date,
-                  priority: jobData.priority || 'Low'
-                };
-
-                // Categorize tasks based on type or default to reminders
-                if (task.type === 'follow-up') {
-                  tasks.followUps.push(taskWithContext);
-                } else if (task.type === 'appointment') {
-                  tasks.appointments.push(taskWithContext);
-                } else {
-                  tasks.reminders.push(taskWithContext);
-                }
-              }
-            });
-          }
-        });
-
-        setTaskCategories(tasks);
-        const totalTasks = Object.values(tasks).reduce((acc, arr) => acc + arr.length, 0);
-        setTaskCount(totalTasks);
-      } catch (error) {
+  const { data: tasksPanelData } = useQuery(
+    queryKeys.quickMenuTasks(workerId),
+    async () => {
+      const response = await fetch(
+        `/api/notifications/tasks-panel?workerId=${encodeURIComponent(workerId)}`,
+        { credentials: 'same-origin', cache: 'no-store' }
+      );
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to load tasks (${response.status})`);
+      }
+      return response.json();
+    },
+    {
+      enabled: Boolean(workerId),
+      staleTime: 30 * 1000,
+      cacheTime: 5 * 60 * 1000,
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+      onError: (error) => {
         console.error('Error loading tasks:', error);
         toast.error('Error loading tasks');
         setTaskCategories({ followUps: [], appointments: [], reminders: [] });
         setTaskCount(0);
-      }
-    };
-
-    if (workerId) {
-      fetchJobTasks();
+      },
     }
-  }, [workerId, userDetails?.fullName]); // Add userDetails.fullName as dependency
+  );
+
+  useEffect(() => {
+    if (!tasksPanelData) return;
+    setTaskCategories(
+      tasksPanelData.taskCategories || { followUps: [], appointments: [], reminders: [] }
+    );
+    setTaskCount(tasksPanelData.taskCount || 0);
+  }, [tasksPanelData]);
 
   // Add these states
   const [followUpFilters, setFollowUpFilters] = useState({
@@ -1269,21 +1222,23 @@ const QuickMenu = ({ children }) => {
     }
   });
 
+  const followUpFiltersRef = useRef(filters);
+  followUpFiltersRef.current = filters;
+  const lastFollowUpFullRefetchRef = useRef(0);
+  const FOLLOW_UP_FULL_REFETCH_MIN_MS = 30_000;
+
   useEffect(() => {
     if (!workerId) return;
 
-    const supabase = getSupabaseClient();
-    if (!supabase) return;
-
     let cancelled = false;
-    let realtimeChannel = null;
 
     const buildQuickSummaryParams = () => {
+      const f = followUpFiltersRef.current;
       const params = new URLSearchParams({ limit: '10' });
-      if (filters.status !== 'all') params.set('status', filters.status);
-      if (filters.type !== 'all') params.set('type', filters.type);
-      if (filters.dateRange.start) params.set('dateFrom', filters.dateRange.start);
-      if (filters.dateRange.end) params.set('dateTo', filters.dateRange.end);
+      if (f.status !== 'all') params.set('status', f.status);
+      if (f.type !== 'all') params.set('type', f.type);
+      if (f.dateRange.start) params.set('dateFrom', f.dateRange.start);
+      if (f.dateRange.end) params.set('dateTo', f.dateRange.end);
       return params;
     };
 
@@ -1313,83 +1268,6 @@ const QuickMenu = ({ children }) => {
 
         setFollowUps(items);
         setFollowUpCount(payload.openCount ?? items.length);
-
-        if (cancelled) return;
-
-        realtimeChannel = supabase
-          .channel(`quickmenu-followups-${workerId}`)
-          .on(
-            'postgres_changes',
-            {
-              event: '*',
-              schema: 'public',
-              table: 'followups',
-              filter: 'deleted_at=is.null',
-            },
-            (payload) => {
-              if (followUpDebounceRef.current) {
-                clearTimeout(followUpDebounceRef.current);
-              }
-              followUpDebounceRef.current = setTimeout(async () => {
-                if (cancelled) return;
-
-                const eventType = payload.eventType;
-                const rowId = payload.new?.id || payload.old?.id;
-
-                if (eventType === 'DELETE' || payload.new?.deleted_at) {
-                  setFollowUps((prev) => prev.filter((fu) => fu.id !== rowId));
-                  setFollowUpCount((c) => Math.max(0, c - 1));
-                  return;
-                }
-
-                if (rowId) {
-                  try {
-                    const singleParams = new URLSearchParams({
-                      followUpId: rowId,
-                      limit: '1',
-                      page: '1',
-                    });
-                    const singleRes = await fetch(
-                      `/api/follow-ups/list-summary?${singleParams.toString()}`,
-                      { cache: 'no-store' }
-                    );
-                    if (singleRes.ok) {
-                      const singlePayload = await singleRes.json();
-                      const row = singlePayload.followUps?.[0];
-                      if (row) {
-                        const mapped = mapQuickSummaryItem(row);
-                        setFollowUps((prev) => {
-                          const idx = prev.findIndex((fu) => fu.id === rowId);
-                          if (idx >= 0) {
-                            const next = [...prev];
-                            next[idx] = mapped;
-                            return next;
-                          }
-                          return [mapped, ...prev].slice(0, 10);
-                        });
-                        return;
-                      }
-                    }
-                  } catch (patchErr) {
-                    console.warn('QuickMenu follow-up row patch failed:', patchErr);
-                  }
-                }
-
-                const refreshParams = buildQuickSummaryParams();
-                const refreshRes = await fetch(
-                  `/api/follow-ups/quick-summary?${refreshParams.toString()}`,
-                  { cache: 'no-store' }
-                );
-                if (refreshRes.ok) {
-                  const refreshPayload = await refreshRes.json();
-                  const refreshed = (refreshPayload.items || []).map(mapQuickSummaryItem);
-                  setFollowUps(refreshed);
-                  setFollowUpCount(refreshPayload.openCount ?? refreshed.length);
-                }
-              }, REALTIME_DEBOUNCE_MS);
-            }
-          );
-        realtimeChannel.subscribe();
       } catch (error) {
         if (!cancelled) {
           console.error('Error fetching follow-ups:', error);
@@ -1398,18 +1276,131 @@ const QuickMenu = ({ children }) => {
       }
     };
 
-    fetchFollowUps();
+    void fetchFollowUps();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workerId, filters]);
+
+  useEffect(() => {
+    if (!workerId) return;
+    if (router.pathname.startsWith('/dashboard/follow-ups')) return;
+
+    const supabase = getSupabaseClient();
+    if (!supabase) return;
+
+    let cancelled = false;
+
+    const buildQuickSummaryParams = () => {
+      const f = followUpFiltersRef.current;
+      const params = new URLSearchParams({ limit: '10' });
+      if (f.status !== 'all') params.set('status', f.status);
+      if (f.type !== 'all') params.set('type', f.type);
+      if (f.dateRange.start) params.set('dateFrom', f.dateRange.start);
+      if (f.dateRange.end) params.set('dateTo', f.dateRange.end);
+      return params;
+    };
+
+    const mapQuickSummaryItem = (item) => ({
+      id: item.id,
+      ...item,
+      jobID: item.jobNumber || item.jobID,
+      createdAt: item.createdAt,
+    });
+
+    const throttledFullRefresh = async () => {
+      const now = Date.now();
+      if (now - lastFollowUpFullRefetchRef.current < FOLLOW_UP_FULL_REFETCH_MIN_MS) {
+        return;
+      }
+      lastFollowUpFullRefetchRef.current = now;
+
+      const refreshParams = buildQuickSummaryParams();
+      const refreshRes = await fetch(
+        `/api/follow-ups/quick-summary?${refreshParams.toString()}`,
+        { cache: 'no-store' }
+      );
+      if (!refreshRes.ok || cancelled) return;
+      const refreshPayload = await refreshRes.json();
+      const refreshed = (refreshPayload.items || []).map(mapQuickSummaryItem);
+      setFollowUps(refreshed);
+      setFollowUpCount(refreshPayload.openCount ?? refreshed.length);
+    };
+
+    const realtimeChannel = supabase
+      .channel(`quickmenu-followups-${workerId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'followups',
+          filter: 'deleted_at=is.null',
+        },
+        (payload) => {
+          if (followUpDebounceRef.current) {
+            clearTimeout(followUpDebounceRef.current);
+          }
+          followUpDebounceRef.current = setTimeout(async () => {
+            if (cancelled) return;
+
+            const eventType = payload.eventType;
+            const rowId = payload.new?.id || payload.old?.id;
+
+            if (eventType === 'DELETE' || payload.new?.deleted_at) {
+              setFollowUps((prev) => prev.filter((fu) => fu.id !== rowId));
+              setFollowUpCount((c) => Math.max(0, c - 1));
+              return;
+            }
+
+            if (rowId) {
+              try {
+                const singleParams = new URLSearchParams({
+                  followUpId: rowId,
+                  limit: '1',
+                  page: '1',
+                });
+                const singleRes = await fetch(
+                  `/api/follow-ups/list-summary?${singleParams.toString()}`,
+                  { cache: 'no-store' }
+                );
+                if (singleRes.ok) {
+                  const singlePayload = await singleRes.json();
+                  const row = singlePayload.followUps?.[0];
+                  if (row) {
+                    const mapped = mapQuickSummaryItem(row);
+                    setFollowUps((prev) => {
+                      const idx = prev.findIndex((fu) => fu.id === rowId);
+                      if (idx >= 0) {
+                        const next = [...prev];
+                        next[idx] = mapped;
+                        return next;
+                      }
+                      return [mapped, ...prev].slice(0, 10);
+                    });
+                    return;
+                  }
+                }
+              } catch (patchErr) {
+                console.warn('QuickMenu follow-up row patch failed:', patchErr);
+              }
+            }
+
+            await throttledFullRefresh();
+          }, REALTIME_DEBOUNCE_MS);
+        }
+      )
+      .subscribe();
 
     return () => {
       cancelled = true;
       if (followUpDebounceRef.current) {
         clearTimeout(followUpDebounceRef.current);
       }
-      if (realtimeChannel) {
-        supabase.removeChannel(realtimeChannel);
-      }
+      supabase.removeChannel(realtimeChannel);
     };
-  }, [workerId, filters]);
+  }, [workerId, router.pathname]);
 
   // Update the filter change handler with logging
   const handleFilterChange = (type, value) => {

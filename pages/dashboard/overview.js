@@ -1,5 +1,5 @@
 // imports.js
-import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   Row,
   Col,
@@ -11,12 +11,14 @@ import {
 import { ApexCharts } from "widgets";
 import Swal from "sweetalert2";
 import Cookies from "js-cookie";
-import { userService, jobService } from "../../lib/supabase/database";
+import { jobService } from "../../lib/supabase/database";
+import { useCurrentUserProfile } from '@/hooks/useCurrentUser';
 import { useRouter } from "next/router";
 import Link from "next/link";
 import { FaBell, FaPlus } from "react-icons/fa";
 import { toast } from "react-hot-toast";
 import { memo } from "react";
+import { useQuery } from "react-query";
 import {
   findJobStatusEntry,
   getJobStatusLabelFromList,
@@ -218,30 +220,6 @@ const sanitizeNameValue = (value) => {
   return invalidTokens.includes(trimmed.toLowerCase()) ? null : trimmed;
 };
 
-const useFirebaseCache = () => {
-  const cache = useRef(new Map());
-  const lastFetch = useRef(null);
-  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-
-  const fetchWithCache = useCallback(async (key, fetchFn) => {
-    const now = Date.now();
-    const cached = cache.current.get(key);
-
-    if (cached && now - lastFetch.current < CACHE_DURATION) {
-    //  console.log('Using cached data for:', key);
-      return cached;
-    }
-
-    //console.log('Fetching fresh data for:', key);
-    const data = await fetchFn();
-    cache.current.set(key, data);
-    lastFetch.current = now;
-    return data;
-  }, [CACHE_DURATION]);
-
-  return { fetchWithCache };
-};
-
 // Main Component
 const Overview = () => {
   // Router
@@ -249,13 +227,18 @@ const Overview = () => {
 
   // State Management
   const [timeFilter, setTimeFilter] = useState("Today");
-  const [userDetails, setUserDetails] = useState(null);
+  const { profile: userDetails } = useCurrentUserProfile();
   const [isLoading, setIsLoading] = useState(false);
-  const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [overviewPeriods, setOverviewPeriods] = useState({});
   const [allFollowUps, setAllFollowUps] = useState([]);
   const [allCustomers, setAllCustomers] = useState([]);
   const [lastLoginTime, setLastLoginTime] = useState(null);
+
+  useEffect(() => {
+    if (userDetails?.updated_at) {
+      setLastLoginTime(new Date(userDetails.updated_at));
+    }
+  }, [userDetails?.updated_at]);
 
   // Dashboard Metrics
   const [newJobsCount, setNewJobsCount] = useState(0);
@@ -278,9 +261,27 @@ const Overview = () => {
   const [activeCustomers, setActiveCustomers] = useState(0);
   const [inactiveCustomers, setInactiveCustomers] = useState(0);
 
-    // Add cache hook
-    const { fetchWithCache } = useFirebaseCache();
-
+  const {
+    data: overviewPayload,
+    isLoading: isOverviewLoading,
+    isError: isOverviewError,
+  } = useQuery(
+    ['dashboard-overview-stats'],
+    async () => {
+      const response = await fetch('/api/dashboard/overview-stats');
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to load dashboard stats (${response.status})`);
+      }
+      return response.json();
+    },
+    {
+      staleTime: 5 * 60 * 1000,
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+    }
+  );
 
     // Add new state for filtered metrics
     const [filteredMetrics, setFilteredMetrics] = useState({
@@ -580,108 +581,40 @@ const applyPeriodPayload = useCallback((periodData) => {
   }
 }, [jobStatusesList]);
 
-// Optimize data fetching
-const fetchInitialData = useCallback(async () => {
-  try {
-    setIsInitialLoading(true);
-
-    // Cache user details fetch
-    const currentEmail = sanitizeNameValue(Cookies.get("email"));
-    if (currentEmail) {
-      try {
-        const userData = await fetchWithCache(`user-${currentEmail}`, async () => {
-          return await userService.findByEmail(currentEmail);
-        });
-
-        if (userData) {
-          const technician = userData.technicians?.[0] || userData.technicians;
-          const cookieFullName = sanitizeNameValue(
-            Cookies.get("fullName") ||
-            Cookies.get("full_name") ||
-            Cookies.get("fullname") ||
-            Cookies.get("FullName")
-          );
-          const resolvedFullName =
-            sanitizeNameValue(technician?.full_name) ||
-            cookieFullName ||
-            sanitizeNameValue(userData.username) ||
-            currentEmail;
-
-          if (resolvedFullName) {
-            Cookies.set("fullName", resolvedFullName, { expires: 7 });
-          }
-          if (userData.username) {
-            Cookies.set("username", userData.username, { expires: 7 });
-          }
-
-          setUserDetails({
-            ...userData,
-            fullName: resolvedFullName,
-            email: userData.username || currentEmail,
-            profilePicture: userData?.avatar_url || technician?.avatar_url
-          });
-          if (userData.updated_at) {
-            setLastLoginTime(new Date(userData.updated_at));
-          }
-        }
-      } catch (userError) {
-        console.error("Error fetching user data in dashboard:", {
-          message: userError.message,
-          code: userError.code,
-          details: userError.details,
-          hint: userError.hint
-        });
-        // Don't block dashboard loading if user fetch fails
-        toast.error("Failed to load user details");
-      }
-    }
-
-    // Dashboard stats via server API (slim job rows + follow-up counts)
-    const overviewPayload = await fetchWithCache('dashboard-overview-stats-v2', async () => {
-      const response = await fetch('/api/dashboard/overview-stats');
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || `Failed to load dashboard stats (${response.status})`);
-      }
-      return response.json();
-    });
-
-    const periods = overviewPayload.periods || {};
-    const followUpCounts = overviewPayload.followUpCounts || {};
-
-    setOverviewPeriods(periods);
-    setAllFollowUps([]);
-
-    setTotalFollowUps(followUpCounts.total ?? 0);
-    setLoggedFollowUps(followUpCounts.logged ?? 0);
-    setInProgressFollowUps(followUpCounts.inProgress ?? 0);
-    setClosedFollowUps(followUpCounts.closed ?? 0);
-    setCancelledFollowUps(followUpCounts.cancelled ?? 0);
-
-    applyPeriodPayload(periods.Today);
-
-  } catch (error) {
-    console.error("Error in fetchInitialData:", error);
-    toast.error("Error loading dashboard data");
-  } finally {
-    setIsInitialLoading(false);
-  }
-}, [fetchWithCache, applyPeriodPayload]);
-
-// Optimize useEffect
 useEffect(() => {
-  fetchInitialData();
-}, [fetchInitialData]);
+  if (!overviewPayload) return;
+
+  const periods = overviewPayload.periods || {};
+  const followUpCounts = overviewPayload.followUpCounts || {};
+
+  setOverviewPeriods(periods);
+  setAllFollowUps([]);
+
+  setTotalFollowUps(followUpCounts.total ?? 0);
+  setLoggedFollowUps(followUpCounts.logged ?? 0);
+  setInProgressFollowUps(followUpCounts.inProgress ?? 0);
+  setClosedFollowUps(followUpCounts.closed ?? 0);
+  setCancelledFollowUps(followUpCounts.cancelled ?? 0);
+
+  applyPeriodPayload(periods.Today);
+}, [overviewPayload, applyPeriodPayload]);
+
+useEffect(() => {
+  if (isOverviewError) {
+    toast.error("Error loading dashboard data");
+  }
+}, [isOverviewError]);
 
 // Re-apply chart labels/colors when job statuses load (SAP labels/colors) or period changes
 useEffect(() => {
-  if (isInitialLoading) return;
+  if (isOverviewLoading || !overviewPayload) return;
   applyPeriodPayload(overviewPeriods[timeFilter]);
 }, [
   jobStatusesList,
   overviewPeriods,
   timeFilter,
-  isInitialLoading,
+  isOverviewLoading,
+  overviewPayload,
   applyPeriodPayload,
 ]);
 
@@ -1332,7 +1265,7 @@ const handleWhatsNewClick = () => {
 
 return (
   <div className="dashboard-wrapper" style={{ width: "100%", maxWidth: "100%" }}>
-    <LoadingOverlay isLoading={isLoading || isInitialLoading} />
+    <LoadingOverlay isLoading={isLoading || isOverviewLoading} />
     {/* Full-viewport-width blue strip; inner px matches layouts/dashboard/DashboardIndexTop PAGE_GUTTER */}
     <div
       className="dashboard-header"

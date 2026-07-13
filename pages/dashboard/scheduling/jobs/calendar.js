@@ -1,9 +1,7 @@
-import React, { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
+import { useQueryClient } from "react-query";
 import { getSupabaseClient } from "../../../../lib/supabase/client";
-import {
-  computeSchedulerFetchRange,
-  schedulerFetchRangeKey,
-} from "../../../../lib/scheduler/schedulerFetchRange";
+import { computeSchedulerFetchRange } from "../../../../lib/scheduler/schedulerFetchRange";
 import {
   Row,
   Col,
@@ -43,7 +41,7 @@ import { Plus } from 'react-feather';
 import Link from 'next/link';
 import { Button } from 'react-bootstrap';
 import { FaPlus } from 'react-icons/fa';
-import Cookies from 'js-cookie';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 import { GeeksSEO } from "widgets";
 import { DashboardHeader } from "sub-components";
 import { BsBriefcaseFill, BsCheckCircleFill } from "react-icons/bs";
@@ -55,6 +53,8 @@ import {
   getDefaultRecurrenceRule,
 } from "../../../../lib/jobs/recurrence";
 import { createRepeatSiblingJobs } from "../../../../lib/jobs/repeatJobExtend";
+import { useJobsCalendarQuery } from "../../../../hooks/queries/useJobsCalendarQuery";
+import { queryKeys } from "../../../../lib/cache/queryKeys";
 
 const DEFAULT_LEGEND_ITEMS = [
   { id: 'created', status: "Created", color: "#9e9e9e" },
@@ -68,22 +68,13 @@ const DEFAULT_LEGEND_ITEMS = [
 
 const Calendar = () => {
   const router = useRouter();
-  const [events, setEvents] = useState([]); // Store events from Supabase
-  const [stats, setStats] = useState({
-    totalJobs: 0,
-    activeJobs: 0,
-  });
-  const [searchTerm, setSearchTerm] = useState(""); // Search term state
-  const [filteredEvents, setFilteredEvents] = useState([]); // Filtered events
-  const [loading, setLoading] = useState(true); // Loading state
+  const queryClient = useQueryClient();
+  const { user } = useCurrentUser();
+  const [searchTerm, setSearchTerm] = useState("");
   const [legendItems, setLegendItems] = useState(DEFAULT_LEGEND_ITEMS);
   const [editingLegendId, setEditingLegendId] = useState(null);
   const [defaultStatus, setDefaultStatus] = useState(legendItems[0]?.id);
   const [selectedDate, setSelectedDate] = useState(() => new Date());
-  const cacheRef = useRef(new Map());
-  const lastFetchTimeRef = useRef(null);
-  const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes in milliseconds
-  const userCache = useRef(new Map());
   const [selectedJobEvent, setSelectedJobEvent] = useState(null);
   const [showJobActionModal, setShowJobActionModal] = useState(false);
   const [showRepeatModal, setShowRepeatModal] = useState(false);
@@ -136,7 +127,17 @@ const Calendar = () => {
     () => computeSchedulerFetchRange("month", selectedDate),
     [selectedDate]
   );
-  const fetchRangeKey = useMemo(() => schedulerFetchRangeKey(fetchRange), [fetchRange]);
+  const calendarRange = useMemo(
+    () => ({ rangeStart: fetchRange.start, rangeEnd: fetchRange.end }),
+    [fetchRange.start, fetchRange.end]
+  );
+
+  const {
+    data: calendarPayload,
+    isLoading: calendarLoading,
+    isError: calendarIsError,
+    error: calendarError,
+  } = useJobsCalendarQuery(calendarRange);
 
   const hydrateCalendarEvents = useCallback(
     (apiEvents = []) =>
@@ -157,95 +158,51 @@ const Calendar = () => {
     [getStatusColor]
   );
 
-  const fetchJobs = useCallback(async () => {
-      setLoading(true);
-      try {
-        const now = Date.now();
-        const cachedEntry = cacheRef.current.get(fetchRangeKey);
-        if (
-          cachedEntry &&
-          lastFetchTimeRef.current &&
-          now - lastFetchTimeRef.current < CACHE_DURATION
-        ) {
-          setEvents(cachedEntry);
-          setFilteredEvents(cachedEntry);
-          setStats({
-            totalJobs: cachedEntry.length,
-            activeJobs: cachedEntry.filter((job) => {
-              const status = String(job.JobStatus || "").toLowerCase();
-              return (
-                status === "inprogress" ||
-                status === "in progress" ||
-                status === "started"
-              );
-            }).length,
-          });
-          setLoading(false);
-          return;
-        }
+  const events = useMemo(
+    () => hydrateCalendarEvents(calendarPayload?.events || []),
+    [calendarPayload?.events, hydrateCalendarEvents]
+  );
 
-        const params = new URLSearchParams({
-          rangeStart: fetchRange.start,
-          rangeEnd: fetchRange.end,
-        });
-        const response = await fetch(`/api/jobs/calendar-events?${params}`, {
-          credentials: "include",
-          cache: "no-store",
-        });
+  const stats = useMemo(() => {
+    const totalJobs = calendarPayload?.stats?.totalJobs ?? events.length;
+    const activeJobs =
+      calendarPayload?.stats?.activeJobs ??
+      events.filter((job) => {
+        const status = String(job.JobStatus || "").toLowerCase();
+        return (
+          status === "inprogress" ||
+          status === "in progress" ||
+          status === "started"
+        );
+      }).length;
+    return { totalJobs, activeJobs };
+  }, [calendarPayload, events]);
 
-        if (!response.ok) {
-          let message = "Failed to fetch jobs";
-          try {
-            const payload = await response.json();
-            if (payload?.error) message = payload.error;
-          } catch {
-            // ignore JSON parse errors
-          }
-          throw new Error(message);
-        }
-
-        const payload = await response.json();
-        const jobsData = hydrateCalendarEvents(payload.events || []);
-
-        const totalJobs = payload.stats?.totalJobs ?? jobsData.length;
-        const activeJobs =
-          payload.stats?.activeJobs ??
-          jobsData.filter((job) => {
-            const status = String(job.JobStatus || "").toLowerCase();
-            return (
-              status === "inprogress" ||
-              status === "in progress" ||
-              status === "started"
-            );
-          }).length;
-
-        setStats({ totalJobs, activeJobs });
-
-        cacheRef.current.set(fetchRangeKey, jobsData);
-        lastFetchTimeRef.current = now;
-
-        setEvents(jobsData);
-        setFilteredEvents(jobsData);
-      } catch (error) {
-        console.error("Error fetching job calendar events:", error);
-        showToast(`Failed to fetch jobs: ${error?.message || "Unknown error"}`, "error");
-        setEvents([]);
-        setFilteredEvents([]);
-        setStats({ totalJobs: 0, activeJobs: 0 });
-      } finally {
-        setLoading(false);
-      }
-  }, [fetchRange, fetchRangeKey, hydrateCalendarEvents, showToast]);
+  const filteredEvents = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return events;
+    return events.filter(
+      (event) =>
+        event.Subject.toLowerCase().includes(term) ||
+        event.JobNo.toLowerCase().includes(term) ||
+        event.Customer.toLowerCase().includes(term) ||
+        event.ServiceLocation.toLowerCase().includes(term)
+    );
+  }, [events, searchTerm]);
 
   useEffect(() => {
-    fetchJobs();
-  }, [fetchJobs]); // Re-fetch when callback dependencies change
+    if (calendarIsError && calendarError) {
+      console.error("Error fetching job calendar events:", calendarError);
+      showToast(
+        `Failed to fetch jobs: ${calendarError?.message || "Unknown error"}`,
+        "error"
+      );
+    }
+  }, [calendarIsError, calendarError, showToast]);
 
-  // Add a function to invalidate cache when needed
-  const invalidateCache = useCallback(() => {
-    cacheRef.current.delete(fetchRangeKey);
-    lastFetchTimeRef.current = null;
-  }, [fetchRangeKey]);
+  const invalidateCalendarQuery = useCallback(() => {
+    void queryClient.invalidateQueries(queryKeys.jobsCalendar(calendarRange));
+  }, [queryClient, calendarRange]);
 
   const createJobUpdateNotification = async (jobId, subject, updateType) => {
     // TODO: Implement notification creation in Supabase if needed
@@ -300,9 +257,8 @@ const Calendar = () => {
       // Create notification for job update
       await createJobUpdateNotification(updatedEvent.event_id, updatedEvent.title, "Drag");
 
-      // Invalidate cache after successful update
-      invalidateCache();
-      
+      invalidateCalendarQuery();
+
       return updatedEvent;
     } catch (error) {
       console.error("Error updating job:", error);
@@ -357,9 +313,8 @@ const Calendar = () => {
       await createJobUpdateNotification(event.event_id, event.title, "Resize");
       showToast(`Job ${event.title} resized successfully.`, 'success');
 
-      // Invalidate cache after successful update
-      invalidateCache();
-      
+      invalidateCalendarQuery();
+
       return event;
     } catch (error) {
       console.error("Error updating job:", error);
@@ -370,21 +325,7 @@ const Calendar = () => {
 
 
   const handleSearch = (e) => {
-    const term = e.target.value.toLowerCase();
-    setSearchTerm(term);
-    if (term !== "") {
-      const filtered = events.filter((event) => {
-        return (
-          event.Subject.toLowerCase().includes(term) ||
-          event.JobNo.toLowerCase().includes(term) ||
-          event.Customer.toLowerCase().includes(term) ||
-          event.ServiceLocation.toLowerCase().includes(term)
-        );
-      });
-      setFilteredEvents(filtered);
-    } else {
-      setFilteredEvents(events); // Reset to original events if search is cleared
-    }
+    setSearchTerm(e.target.value);
   };
 
   const handleEventClick = (event) => {
@@ -419,7 +360,7 @@ const Calendar = () => {
 
     try {
       const { Id } = repeatJobEvent;
-      const workerId = Cookies.get("workerId");
+      const workerId = user?.workerId || user?.id;
 
       if (!workerId) {
         throw new Error("Worker ID not found in cookies");
@@ -501,8 +442,7 @@ const Calendar = () => {
         "success"
       );
 
-      invalidateCache();
-      await fetchJobs();
+      invalidateCalendarQuery();
     } catch (error) {
       console.error("Error creating repeated jobs:", error);
       showToast(`Failed to create repeated jobs: ${error.message}`, "error");
@@ -909,7 +849,7 @@ const Calendar = () => {
           </Form.Group>
 
           {/* Display loading spinner when loading is true */}
-          {loading ? (
+          {calendarLoading ? (
             <div className="d-flex justify-content-center mt-4">
               <Spinner animation="border" role="status">
                 <span className="sr-only">Loading...</span>
@@ -986,7 +926,7 @@ const Calendar = () => {
             </Button>
             <Button
               variant="outline-primary"
-              onClick={() => router.push(`/jobs/view/${selectedJobEvent?.Id}`)}
+              onClick={() => router.push(`/dashboard/jobs/${selectedJobEvent?.Id}`)}
               disabled={!selectedJobEvent?.Id}
             >
               View Job

@@ -14,6 +14,9 @@ import {
   subscribeToSharedActivity,
   coordinatedSessionLogout,
   isLogoutInProgress,
+  resetSharedActivityOnLogin,
+  syncActivityWithLoginSession,
+  isWithinPostLoginGrace,
 } from '../lib/auth/sessionTabSync';
 
 const ACTIVITY_EVENTS = [
@@ -63,10 +66,24 @@ export function useIdleTimeout(options = {}) {
     }
   }, []);
 
+  const resolveLastActivity = useCallback(() => {
+    if (isWithinPostLoginGrace(Cookies.get)) {
+      const baseline = resetSharedActivityOnLogin(Cookies.get);
+      lastActivityRef.current = baseline;
+      return baseline;
+    }
+
+    const synced = syncActivityWithLoginSession(Cookies.get);
+    const lastActivity = Math.max(lastActivityRef.current, synced);
+    lastActivityRef.current = lastActivity;
+    return lastActivity;
+  }, []);
+
   const performLogout = useCallback(async () => {
     if (isLoggingOutRef.current || isLogoutInProgress()) return;
+    if (isWithinPostLoginGrace(Cookies.get)) return;
 
-    const lastActivity = getSharedLastActivityAt();
+    const lastActivity = resolveLastActivity();
     const elapsed = Date.now() - lastActivity;
     if (elapsed < timeoutMs) {
       lastActivityRef.current = lastActivity;
@@ -89,7 +106,7 @@ export function useIdleTimeout(options = {}) {
             );
           },
     });
-  }, [clearTimers, onIdle, timeoutMs]);
+  }, [clearTimers, onIdle, resolveLastActivity, timeoutMs]);
 
   const scheduleTimers = useCallback(() => {
     clearTimers();
@@ -98,8 +115,7 @@ export function useIdleTimeout(options = {}) {
       return;
     }
 
-    const lastActivity = Math.max(lastActivityRef.current, getSharedLastActivityAt());
-    lastActivityRef.current = lastActivity;
+    const lastActivity = resolveLastActivity();
 
     const elapsed = Date.now() - lastActivity;
     const remaining = timeoutMs - elapsed;
@@ -125,7 +141,7 @@ export function useIdleTimeout(options = {}) {
     }
 
     idleTimerRef.current = setTimeout(performLogout, remaining);
-  }, [clearTimers, enabled, performLogout, router.pathname, timeoutMs, warningMs]);
+  }, [clearTimers, enabled, performLogout, resolveLastActivity, router.pathname, timeoutMs, warningMs]);
 
   const resetActivity = useCallback(() => {
     if (!enabled || !isUserAuthenticated() || isAuthRoute(router.pathname)) {
@@ -151,9 +167,13 @@ export function useIdleTimeout(options = {}) {
 
     const handleVisibilityChange = () => {
       if (document.visibilityState !== 'visible') return;
+      if (isWithinPostLoginGrace(Cookies.get)) {
+        resolveLastActivity();
+        scheduleTimers();
+        return;
+      }
 
-      const lastActivity = getSharedLastActivityAt();
-      lastActivityRef.current = lastActivity;
+      const lastActivity = resolveLastActivity();
       const elapsed = Date.now() - lastActivity;
       if (elapsed >= timeoutMs) {
         performLogout();
@@ -172,7 +192,7 @@ export function useIdleTimeout(options = {}) {
     });
 
     if (isUserAuthenticated() && !isAuthRoute(router.pathname)) {
-      lastActivityRef.current = getSharedLastActivityAt();
+      resolveLastActivity();
       scheduleTimers();
     }
 
@@ -195,6 +215,7 @@ export function useIdleTimeout(options = {}) {
     performLogout,
     resetActivity,
     router.pathname,
+    resolveLastActivity,
     scheduleTimers,
     timeoutMs,
   ]);

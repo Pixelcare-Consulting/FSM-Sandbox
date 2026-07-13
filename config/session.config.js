@@ -18,7 +18,7 @@ const SESSION_CONFIG = {
   AUTO_RENEW_THRESHOLD_MS: 5 * 60 * 1000, // 5 minutes
   
   // Renewal check interval (how often to check if renewal is needed)
-  RENEWAL_CHECK_INTERVAL_MS: 30 * 1000, // 30 seconds
+  RENEWAL_CHECK_INTERVAL_MS: 60 * 1000, // 60 seconds (staggered vs 30s getUserInfo poll)
   
   // Minimum time between renewal attempts (prevents renewal spam)
   MIN_RENEWAL_INTERVAL_MS: 2 * 60 * 1000, // 2 minutes

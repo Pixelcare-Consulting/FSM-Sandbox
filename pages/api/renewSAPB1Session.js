@@ -5,6 +5,13 @@ import { serviceLayerLoginRequest } from '../../lib/services/sapService';
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
+const sapSessionDebug =
+  process.env.NODE_ENV !== 'production' || process.env.DEBUG_SAP_SESSION === '1';
+
+function debugLog(...args) {
+  if (sapSessionDebug) console.log(...args);
+}
+
 export default async function handler(req, res) {
   // Only allow POST requests
   if (req.method !== 'POST') {
@@ -27,7 +34,7 @@ export default async function handler(req, res) {
   const isAdmin = req.cookies.isAdmin;
 
   // Log all cookies for debugging
-  console.log('🔍 [renewSAPB1Session] Cookie check:', {
+  debugLog('🔍 [renewSAPB1Session] Cookie check:', {
     hasUid: !!uid,
     hasWorkerId: !!workerId,
     hasEmail: !!email,
@@ -45,7 +52,7 @@ export default async function handler(req, res) {
   
   // If session cookie is missing, always proceed with renewal (to create it)
   if (!hasB1Session) {
-    console.log('🔄 B1SESSION cookie missing - proceeding with session creation');
+    debugLog('🔄 B1SESSION cookie missing - proceeding with session creation');
   } else if (currentExpiry) {
     try {
       const expiryTime = new Date(currentExpiry).getTime();
@@ -53,7 +60,7 @@ export default async function handler(req, res) {
       
       // Only skip renewal if session has more than 5 minutes remaining
       if (timeUntilExpiry > 5 * 60 * 1000) {
-        console.log('⏳ Session still valid, skipping renewal');
+        debugLog('⏳ Session still valid, skipping renewal');
         return res.status(200).json({
           success: true,
           message: 'Session still valid',
@@ -66,11 +73,11 @@ export default async function handler(req, res) {
     }
   }
 
-  console.log('🔄 Starting SAP B1 session renewal');
+  debugLog('🔄 Starting SAP B1 session renewal');
 
   try {
     // SAP B1 Login
-    console.log('🌐 Attempting SAP B1 login...');
+    debugLog('🌐 Attempting SAP B1 login...');
     
     // Debug: Log credentials (masked) and URL
     const companyDB = (process.env.SAP_B1_COMPANY_DB || '').trim();
@@ -78,7 +85,7 @@ export default async function handler(req, res) {
     const password = (process.env.SAP_B1_PASSWORD || '').trim();
     const baseUrl = (process.env.SAP_SERVICE_LAYER_BASE_URL || '').trim();
     
-    console.log('🔐 Login Credentials Check:', {
+    debugLog('🔐 Login Credentials Check:', {
       baseUrl: baseUrl,
       companyDB: companyDB,
       username: username,
@@ -93,7 +100,7 @@ export default async function handler(req, res) {
       password
     });
 
-    console.log('🔍 Server: SAP B1 response status:', sapLoginResponse.status);
+    debugLog('🔍 Server: SAP B1 response status:', sapLoginResponse.status);
 
     if (!sapLoginResponse.ok) {
       // Get the error response body for detailed error information
@@ -126,7 +133,7 @@ export default async function handler(req, res) {
     // This prevents cookie issues when running production build on HTTP
     const isSecure = isHttps || false;
     
-    console.log('🔐 Server: Setting renewed session cookies', {
+    debugLog('🔐 Server: Setting renewed session cookies', {
       sessionId: sessionId.substring(0, 8) + '...',
       expiryTime: sessionExpiryTime.toISOString(),
       maxAge: maxAge + ' seconds',
@@ -156,27 +163,27 @@ export default async function handler(req, res) {
     // This prevents the catch-22 where all cookies expire and renewal can't happen
     if (customToken) {
       cookies.push(`customToken=${customToken}; Path=/; HttpOnly; ${secureFlag}SameSite=Lax; Max-Age=${identityMaxAge}`);
-      console.log('✅ Including customToken in renewal (7 days expiration)');
+      debugLog('✅ Including customToken in renewal (7 days expiration)');
     }
     if (uid) {
       cookies.push(`uid=${uid}; Path=/; ${secureFlag}SameSite=Lax; Max-Age=${identityMaxAge}`);
-      console.log('✅ Including uid in renewal (7 days expiration)');
+      debugLog('✅ Including uid in renewal (7 days expiration)');
     }
     if (email) {
       cookies.push(`email=${email}; Path=/; ${secureFlag}SameSite=Lax; Max-Age=${identityMaxAge}`);
-      console.log('✅ Including email in renewal (7 days expiration)');
+      debugLog('✅ Including email in renewal (7 days expiration)');
     }
     if (workerId) {
       cookies.push(`workerId=${workerId}; Path=/; ${secureFlag}SameSite=Lax; Max-Age=${identityMaxAge}`);
-      console.log('✅ Including workerId in renewal (7 days expiration)');
+      debugLog('✅ Including workerId in renewal (7 days expiration)');
     }
     if (portalSessionId) {
       cookies.push(`sessionId=${portalSessionId}; Path=/; ${secureFlag}SameSite=Lax; Max-Age=${identityMaxAge}`);
-      console.log('✅ Including sessionId in renewal (7 days expiration)');
+      debugLog('✅ Including sessionId in renewal (7 days expiration)');
     }
     if (isAdmin !== undefined) {
       cookies.push(`isAdmin=${isAdmin}; Path=/; ${secureFlag}SameSite=Lax; Max-Age=${identityMaxAge}`);
-      console.log('✅ Including isAdmin in renewal (7 days expiration)');
+      debugLog('✅ Including isAdmin in renewal (7 days expiration)');
     }
 
     // Set cookies in response header
@@ -187,7 +194,7 @@ export default async function handler(req, res) {
     res.setHeader('X-Session-Expiry', sessionExpiryTime.toISOString());
     res.setHeader('X-Session-Max-Age', maxAge.toString());
 
-    console.log('✅ Server: Session renewal complete!', {
+    debugLog('✅ Server: Session renewal complete!', {
       sessionId: sessionId.substring(0, 8) + '...',
       expiryTime: sessionExpiryTime.toISOString(),
       cookiesSet: cookies.length,
@@ -240,7 +247,7 @@ export default async function handler(req, res) {
     res.setHeader('X-Session-Renewed', 'false');
     res.setHeader('X-Session-Error', error.message);
 
-    console.log('🧹 Server: Cleared session cookies after renewal failure:', {
+    debugLog('🧹 Server: Cleared session cookies after renewal failure:', {
       clearedCookies: ['B1SESSION', 'B1SESSION_EXPIRY', 'ROUTEID', 'sapConnectionStatus'],
       preservedCookies: ['uid', 'email', 'workerId', 'customToken', 'isAdmin']
     });

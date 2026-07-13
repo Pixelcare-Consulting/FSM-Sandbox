@@ -1,3 +1,4 @@
+import { withSession } from '../../../lib/api/withSession';
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 import { getListCache, logResponseSize, paginatedSelect, setListCache } from '../../../lib/supabase/listQueryHelpers';
 
@@ -14,7 +15,7 @@ const EQUIPMENT_LIST_SELECT = `
   deleted_at
 `;
 
-export default async function handler(req, res) {
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -71,4 +72,4 @@ export default async function handler(req, res) {
       error: error.message || 'Unable to load products/services catalog.',
     });
   }
-}
+});

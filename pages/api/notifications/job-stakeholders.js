@@ -70,6 +70,57 @@ function buildRowsNewOrReassign({ recipients, assigneeSet, jobId, jobNumber, job
   });
 }
 
+const COALESCE_UPDATED_WINDOW_MS = 15 * 60 * 1000;
+
+async function coalesceAndInsertUpdatedNotifications(supabase, rows) {
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - COALESCE_UPDATED_WINDOW_MS).toISOString();
+  let inserted = 0;
+  let updated = 0;
+
+  for (const row of rows) {
+    const { data: existing, error: findErr } = await supabase
+      .from('notifications')
+      .select('id')
+      .eq('worker_id', row.worker_id)
+      .eq('type', 'job_updated')
+      .eq('action_href', row.action_href)
+      .eq('read', false)
+      .eq('hidden', false)
+      .gte('created_at', cutoff)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (findErr) {
+      console.warn('job-stakeholders: coalesce lookup', findErr.message);
+    }
+
+    if (existing?.id) {
+      const { error: updErr } = await supabase
+        .from('notifications')
+        .update({
+          title: row.title,
+          message: row.message,
+          created_at: now.toISOString(),
+        })
+        .eq('id', existing.id);
+      if (updErr) {
+        return { error: updErr };
+      }
+      updated += 1;
+    } else {
+      const { error: insErr } = await supabase.from('notifications').insert(row);
+      if (insErr) {
+        return { error: insErr };
+      }
+      inserted += 1;
+    }
+  }
+
+  return { inserted, updated };
+}
+
 function buildRowsUpdated({ recipients, jobId, jobNumber, jobTitle, updateSummary }) {
   const label = jobNumber || String(jobId).slice(0, 8);
   const summary = (updateSummary || 'Job details were updated').trim();
@@ -166,6 +217,22 @@ export default async function handler(req, res) {
       jobNumber,
       jobTitle,
       kind: normalizedKind,
+    });
+  }
+
+  if (normalizedKind === 'updated') {
+    const result = await coalesceAndInsertUpdatedNotifications(supabase, rows);
+    if (result.error) {
+      console.error('job-stakeholders: coalesce/insert', result.error);
+      return res.status(500).json({ error: result.error.message });
+    }
+
+    invalidateListCache(notificationsCachePrefix());
+
+    return res.status(200).json({
+      inserted: result.inserted,
+      updated: result.updated,
+      coalesced: result.updated > 0,
     });
   }
 

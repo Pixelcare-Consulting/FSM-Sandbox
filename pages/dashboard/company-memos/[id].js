@@ -4,13 +4,18 @@ import { useRouter } from 'next/router';
 import { Container, Row, Col, Button, Form, Alert } from 'react-bootstrap';
 import { useQuery, useQueryClient } from 'react-query';
 import Swal from 'sweetalert2';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 import Cookies from 'js-cookie';
 import toast from 'react-hot-toast';
 import { GeeksSEO } from 'widgets';
 import { DashboardHeader } from 'sub-components';
 import DefaultDashboardLayout from 'layouts/dashboard/DashboardIndexTop';
-import { getSupabaseClient } from '../../../lib/supabase/client';
-import { companyMemoService } from '../../../lib/supabase/database';
+import {
+  COMPANY_MEMOS_DETAIL_STALE_MS,
+  COMPANY_MEMOS_QUERY_OPTIONS,
+  companyMemoDetailQueryKey,
+  fetchCompanyMemoById,
+} from '../../../lib/companyMemos/companyMemosQueryKeys';
 import CompanyMemoForm, {
   defaultCompanyMemoValues,
 } from './_components/CompanyMemoForm';
@@ -48,23 +53,27 @@ const CompanyMemoEdit = () => {
   const [values, setValues] = useState(defaultCompanyMemoValues);
   const [saving, setSaving] = useState(false);
 
+  const { user } = useCurrentUser();
+  const viewerUid = user?.id || user?.uid;
+  const viewerEmail = user?.email || Cookies.get('email') || '';
+
   useEffect(() => {
-    if (Cookies.get('isAdmin') !== 'true') {
+    if (user?.role !== 'ADMIN') {
       router.replace('/dashboard');
       setAllowed(false);
       return;
     }
     setAllowed(true);
-  }, [router]);
+  }, [router, user?.role]);
 
   const { data: row, isLoading } = useQuery(
-    ['company-memos', 'admin', id],
-    async () => {
-      const client = getSupabaseClient();
-      if (!client || !id) return null;
-      return companyMemoService.getById(id, client);
-    },
-    { enabled: allowed === true && router.isReady && !!id, staleTime: 15 * 1000 }
+    companyMemoDetailQueryKey(id),
+    () => (id ? fetchCompanyMemoById(id) : null),
+    {
+      enabled: allowed === true && router.isReady && !!id,
+      staleTime: COMPANY_MEMOS_DETAIL_STALE_MS,
+      ...COMPANY_MEMOS_QUERY_OPTIONS,
+    }
   );
 
   useEffect(() => {
@@ -76,8 +85,6 @@ const CompanyMemoEdit = () => {
 
   const onSubmit = async (e) => {
     e.preventDefault();
-    const viewerUid = Cookies.get('uid');
-    const viewerEmail = Cookies.get('email') || '';
     if (!row || !canMutateCompanyMemoWithFolder(row, viewerUid, viewerEmail)) {
       toast.error(
         row?.folder === 'Update Logs' && !canManageUpdateLogsFolder(viewerEmail)
@@ -141,11 +148,9 @@ const CompanyMemoEdit = () => {
   const headerBreadcrumbLabel =
     row && !isLoading ? truncateSubject(row.subject) : 'Edit';
 
-  const viewerUidForHeader = Cookies.get('uid');
-  const viewerEmailForHeader = Cookies.get('email') || '';
   const headerTitle =
     row && !isLoading
-      ? canMutateCompanyMemoWithFolder(row, viewerUidForHeader, viewerEmailForHeader)
+      ? canMutateCompanyMemoWithFolder(row, viewerUid, viewerEmail)
         ? 'Edit memo'
         : 'View memo'
       : 'Edit memo';
@@ -181,8 +186,6 @@ const CompanyMemoEdit = () => {
         </div>
       );
     }
-    const viewerUid = Cookies.get('uid');
-    const viewerEmail = Cookies.get('email') || '';
     const canMutate = canMutateCompanyMemoWithFolder(row, viewerUid, viewerEmail);
     return (
       <div className="card shadow-sm">

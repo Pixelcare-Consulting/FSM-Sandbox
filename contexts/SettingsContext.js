@@ -2,7 +2,10 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 import {
   fetchSettingsBundleFromApi,
   invalidateSettingsBundleCache,
+  invalidateSettingsServerCache,
+  readCachedSettingsBundle,
 } from '../utils/settingsBundleCache';
+import { readCachedDashboardBootstrap, invalidateDashboardBootstrapCache } from '../utils/dashboardBootstrapCache';
 import {
   parseFollowUpStatuses,
   parseFollowUpTypes,
@@ -36,6 +39,24 @@ export function SettingsProvider({ children }) {
   const loadSettings = useCallback(async ({ force = false } = {}) => {
     try {
       setSettings((prev) => ({ ...prev, isLoading: prev.companyInfo == null && prev.followUp == null, error: null }));
+
+      if (!force) {
+        const bootstrap = readCachedDashboardBootstrap();
+        const bundle = readCachedSettingsBundle();
+        const merged = {
+          companyInfo: bundle?.companyInfo ?? bootstrap?.companyInfo ?? null,
+          followUp: bundle?.followUp ?? null,
+          jobStatuses: bundle?.jobStatuses ?? bootstrap?.jobStatuses ?? null,
+        };
+
+        if (merged.companyInfo || merged.jobStatuses || merged.followUp) {
+          applyBundle(merged);
+          if (merged.followUp != null) {
+            return;
+          }
+        }
+      }
+
       const bundle = await fetchSettingsBundleFromApi({ force });
       applyBundle(bundle);
     } catch (error) {
@@ -50,6 +71,8 @@ export function SettingsProvider({ children }) {
 
   const refreshSettings = useCallback(async () => {
     invalidateSettingsBundleCache();
+    invalidateDashboardBootstrapCache();
+    invalidateSettingsServerCache();
     await loadSettings({ force: true });
   }, [loadSettings]);
 

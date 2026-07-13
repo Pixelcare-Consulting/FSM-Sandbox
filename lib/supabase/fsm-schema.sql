@@ -8,80 +8,6 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- =============================================
--- DROP EXISTING OBJECTS (idempotent re-run)
--- =============================================
-
-DROP TABLE IF EXISTS
-    user_migration_upload,
-    calendar_events,
-    technician_other_details,
-    technician_documents,
-    technician_schedules,
-    payroll_disbursements,
-    payroll_entries,
-    payroll_periods,
-    technician_payroll_profiles,
-    technician_access_settings,
-    technician_employment_details,
-    email_template_versions,
-    email_template_overrides,
-    email_trigger_bindings,
-    email_templates,
-    email_triggers,
-    job_incentive_detail_results,
-    job_incentive_results,
-    job_migration_upload,
-    job_technician_admin_messages,
-    job_email_log,
-    job_sync_logs,
-    google_forms,
-    company_memos,
-    company_details,
-    settings,
-    scheduling_windows,
-    followups,
-    technicians_schedule,
-    attendance,
-    job_signatures,
-    job_media,
-    task_completions,
-    job_tasks,
-    technician_hours,
-    technician_jobs,
-    job_equipments,
-    job_schedule,
-    job_status,
-    job_subject_options,
-    job_contact_type_options,
-    job_category,
-    job_contact_type,
-    job_payments,
-    jobs,
-    payment_profiles,
-    location_technicians,
-    sap_lead_contact,
-    sap_lead_location,
-    sap_lead,
-    leads,
-    service_call,
-    sales_order,
-    sales_quotation,
-    equipments,
-    contacts,
-    customer_creation_drafts,
-    customer_notes,
-    customer_address_details,
-    customer_location,
-    locations,
-    customer,
-    technicians,
-    notifications,
-    recent_activities,
-    audit_logs,
-    users
-CASCADE;
-
--- =============================================
 -- TABLES
 -- =============================================
 
@@ -407,7 +333,6 @@ CREATE TABLE leads (
 );
 
 -- Circular FK: customer.lead_id → leads (leads table now exists)
-ALTER TABLE customer DROP CONSTRAINT IF EXISTS customer_lead_id_fkey;
 ALTER TABLE customer
     ADD CONSTRAINT customer_lead_id_fkey FOREIGN KEY (lead_id) REFERENCES leads(id);
 
@@ -637,7 +562,7 @@ CREATE TABLE technician_hours (
 CREATE TABLE job_tasks (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    task_name VARCHAR(255) NOT NULL,
+    task_name TEXT NOT NULL,
     task_description TEXT,
     task_order INTEGER DEFAULT 0,
     is_required BOOLEAN DEFAULT true,
@@ -668,6 +593,7 @@ CREATE TABLE job_media (
     media_type VARCHAR(50) DEFAULT 'image' CHECK (media_type IN ('image', 'pdf', 'video', 'document')),
     filename VARCHAR(255),
     description TEXT,
+    created_by UUID NOT NULL REFERENCES users(id),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     deleted_at TIMESTAMP WITH TIME ZONE
@@ -1164,6 +1090,9 @@ CREATE INDEX idx_notifications_worker_id ON notifications(worker_id);
 CREATE INDEX idx_notifications_read ON notifications(read);
 CREATE INDEX idx_notifications_hidden ON notifications(hidden);
 CREATE INDEX idx_notifications_created_at ON notifications(created_at DESC);
+CREATE INDEX idx_notifications_worker_hidden_created_at ON notifications(worker_id, hidden, created_at DESC);
+CREATE INDEX idx_notifications_broadcast_hidden_created_at ON notifications(created_at DESC) WHERE hidden = false AND worker_id IS NULL;
+CREATE INDEX idx_notifications_worker_hidden_read ON notifications(worker_id, hidden, read) WHERE hidden = false;
 
 -- Technicians
 CREATE INDEX idx_technicians_user_id ON technicians(user_id) WHERE deleted_at IS NULL;
@@ -1212,6 +1141,7 @@ CREATE INDEX idx_contacts_customer_location_id ON contacts(customer_location_id)
 
 -- Customer Location
 CREATE INDEX idx_customer_location_customer_id ON customer_location(customer_id);
+CREATE INDEX idx_customer_location_customer_id_id ON customer_location(customer_id, id);
 CREATE INDEX idx_customer_location_site_id ON customer_location(site_id);
 CREATE INDEX idx_customer_location_location_id ON customer_location(location_id) WHERE location_id IS NOT NULL;
 
@@ -1274,6 +1204,9 @@ CREATE INDEX idx_jobs_priority ON jobs(priority) WHERE deleted_at IS NULL;
 CREATE INDEX idx_jobs_scheduled_start ON jobs(scheduled_start) WHERE deleted_at IS NULL;
 CREATE INDEX idx_jobs_sap_activity_id ON jobs(sap_activity_id) WHERE sap_activity_id IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX idx_jobs_created_at ON jobs(created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX idx_jobs_active_sched_start_created_at ON jobs(scheduled_start, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX idx_jobs_active_sched_end_start ON jobs(scheduled_end, scheduled_start) WHERE deleted_at IS NULL AND scheduled_start IS NOT NULL;
+CREATE INDEX idx_jobs_active_undated_created_at ON jobs(created_at DESC) WHERE deleted_at IS NULL AND scheduled_start IS NULL;
 
 -- Job Contact Type
 CREATE INDEX idx_job_contact_type_job_id ON job_contact_type(job_id);
@@ -1289,6 +1222,7 @@ CREATE INDEX idx_job_status_status_date ON job_status(status_date);
 CREATE INDEX idx_job_schedule_job_id ON job_schedule(job_id);
 CREATE INDEX idx_job_schedule_job_status_id ON job_schedule(job_status_id);
 CREATE INDEX idx_job_schedule_jsdate ON job_schedule(jsdate);
+CREATE INDEX idx_job_schedule_job_id_jsdate ON job_schedule(job_id, jsdate);
 
 -- Job Equipments
 CREATE INDEX idx_job_equipments_job_id ON job_equipments(job_id);
@@ -1297,6 +1231,7 @@ CREATE INDEX idx_job_equipments_equipment_id ON job_equipments(equipment_id);
 -- Technician Jobs
 CREATE INDEX idx_technician_jobs_technician_id ON technician_jobs(technician_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_technician_jobs_job_id ON technician_jobs(job_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_technician_jobs_job_id_active ON technician_jobs(job_id) WHERE deleted_at IS NULL;
 CREATE INDEX idx_technician_jobs_status ON technician_jobs(assignment_status) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX idx_technician_jobs_unique_active ON technician_jobs (technician_id, job_id) WHERE deleted_at IS NULL;
 
@@ -1761,6 +1696,379 @@ AS $$
     AND created_at < p_end;
 $$;
 
+CREATE OR REPLACE FUNCTION public.overview_job_status_display(p_status TEXT)
+RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT CASE UPPER(COALESCE(p_status, 'PENDING'))
+    WHEN 'COMPLETED' THEN 'Completed'
+    WHEN 'IN_PROGRESS' THEN 'In Progress'
+    WHEN 'INPROGRESS' THEN 'In Progress'
+    WHEN 'PENDING' THEN 'Created'
+    WHEN 'CREATED' THEN 'Created'
+    ELSE COALESCE(p_status, 'PENDING')
+  END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.overview_classify_bucket(p_status TEXT)
+RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT CASE
+    WHEN UPPER(COALESCE(p_status, '')) LIKE '%COMPLET%'
+      OR LOWER(public.overview_job_status_display(p_status)) LIKE '%complete%'
+      THEN 'completed'
+    WHEN UPPER(COALESCE(p_status, '')) IN ('CREATED', 'PENDING')
+      OR LOWER(public.overview_job_status_display(p_status)) LIKE '%created%'
+      THEN 'pending'
+    WHEN UPPER(COALESCE(p_status, '')) LIKE '%PROGRESS%'
+      OR LOWER(public.overview_job_status_display(p_status)) LIKE '%progress%'
+      THEN 'inProgress'
+    ELSE 'other'
+  END;
+$$;
+
+CREATE OR REPLACE FUNCTION public._dashboard_overview_previous_count(
+  p_start TIMESTAMPTZ,
+  p_end TIMESTAMPTZ
+)
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $$
+  SELECT COUNT(*)::BIGINT
+  FROM jobs
+  WHERE deleted_at IS NULL
+    AND created_at >= (p_start - (p_end - p_start))
+    AND created_at < p_start;
+$$;
+
+CREATE OR REPLACE FUNCTION public._dashboard_overview_period_slice(
+  p_period TEXT,
+  p_start TIMESTAMPTZ,
+  p_end TIMESTAMPTZ,
+  p_previous_count BIGINT,
+  p_now TIMESTAMPTZ,
+  p_twenty_four_hours_ago TIMESTAMPTZ
+)
+RETURNS JSON
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $slice$
+DECLARE
+  labels TEXT[];
+  n_buckets INT;
+  completed_arr BIGINT[];
+  pending_arr BIGINT[];
+  in_progress_arr BIGINT[];
+  rec RECORD;
+  idx INT;
+  bucket_idx INT;
+  total_tasks BIGINT := 0;
+  active_workers BIGINT := 0;
+  pending_tasks BIGINT := 0;
+  completed_tasks BIGINT := 0;
+  active_jobs_count BIGINT := 0;
+  new_jobs_count BIGINT := 0;
+  unassigned_count BIGINT := 0;
+  high_priority_count BIGINT := 0;
+  overdue_scheduled_count BIGINT := 0;
+  unique_customers BIGINT := 0;
+  task_growth INT;
+  distribution JSON;
+  top_status_raw TEXT;
+  top_status_count BIGINT := 0;
+  top_status_pct TEXT;
+  completion_rate_pct TEXT;
+  status_upper TEXT;
+  is_done BOOLEAN;
+BEGIN
+  IF p_period = 'Today' THEN
+    labels := ARRAY(
+      SELECT (g::TEXT || ':00')
+      FROM generate_series(0, 23) AS g
+    );
+    n_buckets := 24;
+  ELSIF p_period = 'This Week' THEN
+    labels := ARRAY['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    n_buckets := 7;
+  ELSIF p_period = 'This Month' THEN
+    labels := ARRAY['Week 1', 'Week 2', 'Week 3', 'Week 4', 'Week 5'];
+    n_buckets := 5;
+  ELSE
+    labels := ARRAY['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    n_buckets := 12;
+  END IF;
+
+  completed_arr := array_fill(0::BIGINT, ARRAY[n_buckets]);
+  pending_arr := array_fill(0::BIGINT, ARRAY[n_buckets]);
+  in_progress_arr := array_fill(0::BIGINT, ARRAY[n_buckets]);
+
+  FOR rec IN
+    SELECT *
+    FROM _overview_jobs_enriched
+    WHERE created_at >= p_start
+      AND created_at <= p_end
+  LOOP
+    total_tasks := total_tasks + 1;
+
+    status_upper := UPPER(COALESCE(rec.status, ''));
+
+    IF status_upper IN ('CREATED', 'PENDING', 'IN_PROGRESS')
+      OR rec.job_status_display IN ('Created', 'In Progress') THEN
+      pending_tasks := pending_tasks + 1;
+    END IF;
+
+    IF status_upper LIKE '%COMPLET%'
+      OR rec.job_status_display IN ('Completed', 'Job Complete') THEN
+      completed_tasks := completed_tasks + 1;
+    END IF;
+
+    IF status_upper LIKE '%PROGRESS%' OR rec.job_status_display = 'In Progress' THEN
+      active_jobs_count := active_jobs_count + 1;
+    END IF;
+
+    IF (status_upper IN ('CREATED', 'PENDING') OR rec.job_status_display = 'Created')
+      AND rec.created_at >= p_twenty_four_hours_ago THEN
+      new_jobs_count := new_jobs_count + 1;
+    END IF;
+
+    IF rec.technician_ids IS NULL OR cardinality(rec.technician_ids) = 0 THEN
+      unassigned_count := unassigned_count + 1;
+    END IF;
+
+    IF UPPER(COALESCE(rec.priority, '')) LIKE '%HIGH%'
+      OR UPPER(COALESCE(rec.priority, '')) LIKE '%URGENT%'
+      OR rec.priority IN ('4', 'H') THEN
+      high_priority_count := high_priority_count + 1;
+    END IF;
+
+    is_done :=
+      status_upper LIKE '%COMPLET%'
+      OR rec.job_status_display IN ('Completed', 'Job Complete')
+      OR status_upper = 'CANCELLED'
+      OR rec.job_status_display = 'Cancelled';
+
+    IF NOT is_done
+      AND rec.scheduled_end IS NOT NULL
+      AND rec.scheduled_end < p_now THEN
+      overdue_scheduled_count := overdue_scheduled_count + 1;
+    END IF;
+
+  END LOOP;
+
+  FOR rec IN
+    SELECT *
+    FROM _overview_jobs_enriched
+    WHERE created_at >= p_start
+      AND created_at <= p_end
+  LOOP
+    IF p_period = 'Today' THEN
+      bucket_idx := EXTRACT(HOUR FROM rec.created_at)::INT;
+    ELSIF p_period = 'This Week' THEN
+      idx := EXTRACT(DOW FROM rec.created_at)::INT;
+      bucket_idx := CASE WHEN idx = 0 THEN 6 ELSE idx - 1 END;
+    ELSIF p_period = 'This Month' THEN
+      bucket_idx := LEAST(FLOOR((EXTRACT(DAY FROM rec.created_at) - 1) / 7)::INT, 4);
+    ELSE
+      bucket_idx := EXTRACT(MONTH FROM rec.created_at)::INT - 1;
+    END IF;
+
+    IF bucket_idx < 0 OR bucket_idx >= n_buckets THEN
+      CONTINUE;
+    END IF;
+
+    idx := bucket_idx + 1;
+    IF rec.chart_bucket = 'completed' THEN
+      completed_arr[idx] := completed_arr[idx] + 1;
+    ELSIF rec.chart_bucket = 'pending' THEN
+      pending_arr[idx] := pending_arr[idx] + 1;
+    ELSIF rec.chart_bucket = 'inProgress' THEN
+      in_progress_arr[idx] := in_progress_arr[idx] + 1;
+    END IF;
+  END LOOP;
+
+  SELECT COUNT(DISTINCT customer_id)::BIGINT
+  INTO unique_customers
+  FROM _overview_jobs_enriched
+  WHERE created_at >= p_start
+    AND created_at <= p_end
+    AND customer_id IS NOT NULL;
+
+  SELECT COALESCE(
+    (
+      SELECT json_object_agg(status_raw, cnt)
+      FROM (
+        SELECT status_raw, COUNT(*)::BIGINT AS cnt
+        FROM _overview_jobs_enriched
+        WHERE created_at >= p_start
+          AND created_at <= p_end
+        GROUP BY status_raw
+      ) d
+    ),
+    '{}'::JSON
+  )
+  INTO distribution;
+
+  SELECT status_raw, cnt
+  INTO top_status_raw, top_status_count
+  FROM (
+    SELECT status_raw, COUNT(*)::BIGINT AS cnt
+    FROM _overview_jobs_enriched
+    WHERE created_at >= p_start
+      AND created_at <= p_end
+    GROUP BY status_raw
+    ORDER BY cnt DESC, status_raw ASC
+    LIMIT 1
+  ) t;
+
+  IF p_previous_count = 0 THEN
+    task_growth := CASE WHEN total_tasks > 0 THEN 100 ELSE 0 END;
+  ELSE
+    task_growth := ROUND(((total_tasks - p_previous_count)::NUMERIC / p_previous_count) * 100)::INT;
+  END IF;
+
+  IF total_tasks > 0 AND top_status_count > 0 THEN
+    top_status_pct := ROUND((top_status_count::NUMERIC / total_tasks) * 100, 1)::TEXT;
+  ELSE
+    top_status_pct := NULL;
+  END IF;
+
+  IF total_tasks > 0 THEN
+    completion_rate_pct := ROUND((completed_tasks::NUMERIC / total_tasks) * 100, 1)::TEXT;
+  ELSE
+    completion_rate_pct := '0';
+  END IF;
+
+  SELECT COUNT(DISTINCT tech_id)::BIGINT
+  INTO active_workers
+  FROM _overview_jobs_enriched je
+  CROSS JOIN LATERAL unnest(
+    CASE
+      WHEN je.technician_ids IS NULL THEN ARRAY[]::UUID[]
+      ELSE je.technician_ids
+    END
+  ) AS tech_id
+  WHERE je.created_at >= p_start
+    AND je.created_at <= p_end
+    AND (
+      UPPER(COALESCE(je.status, '')) LIKE '%PROGRESS%'
+      OR je.job_status_display = 'In Progress'
+    );
+
+  RETURN json_build_object(
+    'labels', labels,
+    'completed', completed_arr,
+    'pending', pending_arr,
+    'inProgress', in_progress_arr,
+    'distribution', distribution,
+    'stats', json_build_object(
+      'totalTasks', total_tasks,
+      'activeWorkers', COALESCE(active_workers, 0),
+      'pendingTasks', pending_tasks,
+      'completedTasks', completed_tasks,
+      'activeJobsCount', active_jobs_count,
+      'newJobsCount', new_jobs_count,
+      'taskGrowth', task_growth
+    ),
+    'insights', json_build_object(
+      'periodTotal', total_tasks,
+      'topStatusRaw', top_status_raw,
+      'topStatusCount', COALESCE(top_status_count, 0),
+      'topStatusPct', top_status_pct,
+      'completedCount', completed_tasks,
+      'completionRatePct', completion_rate_pct,
+      'unassignedCount', unassigned_count,
+      'inProgressInPeriod', active_jobs_count,
+      'highPriorityCount', high_priority_count,
+      'overdueScheduledCount', overdue_scheduled_count,
+      'uniqueCustomers', COALESCE(unique_customers, 0)
+    )
+  );
+END;
+$slice$;
+
+CREATE OR REPLACE FUNCTION public.dashboard_overview_periods_json()
+RETURNS JSON
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $func$
+DECLARE
+  v_today_start TIMESTAMPTZ;
+  v_today_end TIMESTAMPTZ;
+  v_week_start TIMESTAMPTZ;
+  v_month_start TIMESTAMPTZ;
+  v_year_start TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
+  v_24h_ago TIMESTAMPTZ;
+  v_prev_today BIGINT;
+  v_prev_week BIGINT;
+  v_prev_month BIGINT;
+  v_prev_year BIGINT;
+BEGIN
+  v_now := NOW();
+  v_today_start := date_trunc('day', v_now);
+  v_today_end := v_today_start + INTERVAL '1 day' - INTERVAL '1 millisecond';
+  v_week_start := date_trunc('week', v_now);
+  v_month_start := date_trunc('month', v_now);
+  v_year_start := date_trunc('year', v_now);
+  v_24h_ago := v_now - INTERVAL '24 hours';
+
+  CREATE TEMP TABLE _overview_jobs_enriched ON COMMIT DROP AS
+  SELECT
+    j.id,
+    j.status,
+    j.created_at,
+    j.scheduled_end,
+    j.priority,
+    j.customer_id,
+    public.overview_job_status_display(j.status) AS job_status_display,
+    public.overview_classify_bucket(j.status) AS chart_bucket,
+    COALESCE(NULLIF(TRIM(j.status::TEXT), ''), 'UNKNOWN') AS status_raw,
+    COALESCE(tj.tech_ids, ARRAY[]::UUID[]) AS technician_ids
+  FROM jobs j
+  LEFT JOIN LATERAL (
+    SELECT ARRAY_AGG(DISTINCT tj.technician_id) AS tech_ids
+    FROM technician_jobs tj
+    WHERE tj.job_id = j.id
+      AND tj.deleted_at IS NULL
+  ) tj ON true
+  WHERE j.deleted_at IS NULL
+    AND j.created_at >= v_year_start
+    AND j.created_at <= v_today_end;
+
+  v_prev_today := public._dashboard_overview_previous_count(v_today_start, v_today_end);
+  v_prev_week := public._dashboard_overview_previous_count(v_week_start, v_today_end);
+  v_prev_month := public._dashboard_overview_previous_count(v_month_start, v_today_end);
+  v_prev_year := public._dashboard_overview_previous_count(v_year_start, v_today_end);
+
+  RETURN json_build_object(
+    'Today', public._dashboard_overview_period_slice(
+      'Today', v_today_start, v_today_end, v_prev_today, v_now, v_24h_ago
+    ),
+    'This Week', public._dashboard_overview_period_slice(
+      'This Week', v_week_start, v_today_end, v_prev_week, v_now, v_24h_ago
+    ),
+    'This Month', public._dashboard_overview_period_slice(
+      'This Month', v_month_start, v_today_end, v_prev_month, v_now, v_24h_ago
+    ),
+    'This Year', public._dashboard_overview_period_slice(
+      'This Year', v_year_start, v_today_end, v_prev_year, v_now, v_24h_ago
+    )
+  );
+END;
+$func$;
+
 CREATE OR REPLACE FUNCTION public.customer_location_country_stats()
 RETURNS TABLE (address_count BIGINT, top_country TEXT, top_country_count BIGINT)
 LANGUAGE sql
@@ -1794,208 +2102,159 @@ $$;
 -- =============================================
 
 -- updated_at triggers (existing tables)
-DROP TRIGGER IF EXISTS update_users_updated_at ON users;
 CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technicians_updated_at ON technicians;
 CREATE TRIGGER update_technicians_updated_at BEFORE UPDATE ON technicians
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_customer_updated_at ON customer;
 CREATE TRIGGER update_customer_updated_at BEFORE UPDATE ON customer
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_locations_updated_at ON locations;
 CREATE TRIGGER update_locations_updated_at BEFORE UPDATE ON locations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_equipments_updated_at ON equipments;
 CREATE TRIGGER update_equipments_updated_at BEFORE UPDATE ON equipments
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_sales_quotation_updated_at ON sales_quotation;
 CREATE TRIGGER update_sales_quotation_updated_at BEFORE UPDATE ON sales_quotation
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_sales_order_updated_at ON sales_order;
 CREATE TRIGGER update_sales_order_updated_at BEFORE UPDATE ON sales_order
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_service_call_updated_at ON service_call;
 CREATE TRIGGER update_service_call_updated_at BEFORE UPDATE ON service_call
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_leads_updated_at ON leads;
 CREATE TRIGGER update_leads_updated_at BEFORE UPDATE ON leads
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_jobs_updated_at ON jobs;
 CREATE TRIGGER update_jobs_updated_at BEFORE UPDATE ON jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_job_schedule_updated_at ON job_schedule;
 CREATE TRIGGER update_job_schedule_updated_at BEFORE UPDATE ON job_schedule
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_jobs_updated_at ON technician_jobs;
 CREATE TRIGGER update_technician_jobs_updated_at BEFORE UPDATE ON technician_jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_task_completions_updated_at ON task_completions;
 CREATE TRIGGER update_task_completions_updated_at BEFORE UPDATE ON task_completions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_attendance_updated_at ON attendance;
 CREATE TRIGGER update_attendance_updated_at BEFORE UPDATE ON attendance
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_followups_updated_at ON followups;
 CREATE TRIGGER update_followups_updated_at BEFORE UPDATE ON followups
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_scheduling_windows_updated_at ON scheduling_windows;
 CREATE TRIGGER update_scheduling_windows_updated_at BEFORE UPDATE ON scheduling_windows
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_settings_updated_at ON settings;
 CREATE TRIGGER update_settings_updated_at BEFORE UPDATE ON settings
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_company_details_updated_at ON company_details;
 CREATE TRIGGER update_company_details_updated_at BEFORE UPDATE ON company_details
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_company_memos_updated_at ON company_memos;
 CREATE TRIGGER update_company_memos_updated_at BEFORE UPDATE ON company_memos
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_google_forms_updated_at ON google_forms;
 CREATE TRIGGER update_google_forms_updated_at BEFORE UPDATE ON google_forms
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_job_media_updated_at ON job_media;
 CREATE TRIGGER update_job_media_updated_at BEFORE UPDATE ON job_media
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- updated_at triggers (new tables)
-DROP TRIGGER IF EXISTS update_notifications_updated_at ON notifications;
 CREATE TRIGGER update_notifications_updated_at BEFORE UPDATE ON notifications
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_customer_address_details_updated_at ON customer_address_details;
 CREATE TRIGGER update_customer_address_details_updated_at BEFORE UPDATE ON customer_address_details
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_customer_notes_updated_at ON customer_notes;
 CREATE TRIGGER update_customer_notes_updated_at BEFORE UPDATE ON customer_notes
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_customer_creation_drafts_updated_at ON customer_creation_drafts;
 CREATE TRIGGER update_customer_creation_drafts_updated_at BEFORE UPDATE ON customer_creation_drafts
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_payment_profiles_updated_at ON payment_profiles;
 CREATE TRIGGER update_payment_profiles_updated_at BEFORE UPDATE ON payment_profiles
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_sap_lead_updated_at ON sap_lead;
 CREATE TRIGGER update_sap_lead_updated_at BEFORE UPDATE ON sap_lead
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_job_migration_upload_updated_at ON job_migration_upload;
 CREATE TRIGGER update_job_migration_upload_updated_at BEFORE UPDATE ON job_migration_upload
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_job_incentive_results_updated_at ON job_incentive_results;
 CREATE TRIGGER update_job_incentive_results_updated_at BEFORE UPDATE ON job_incentive_results
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_email_triggers_updated_at ON email_triggers;
 CREATE TRIGGER update_email_triggers_updated_at BEFORE UPDATE ON email_triggers
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_email_templates_updated_at ON email_templates;
 CREATE TRIGGER update_email_templates_updated_at BEFORE UPDATE ON email_templates
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_email_trigger_bindings_updated_at ON email_trigger_bindings;
 CREATE TRIGGER update_email_trigger_bindings_updated_at BEFORE UPDATE ON email_trigger_bindings
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_email_template_overrides_updated_at ON email_template_overrides;
 CREATE TRIGGER update_email_template_overrides_updated_at BEFORE UPDATE ON email_template_overrides
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_employment_details_updated_at ON technician_employment_details;
 CREATE TRIGGER update_technician_employment_details_updated_at BEFORE UPDATE ON technician_employment_details
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_access_settings_updated_at ON technician_access_settings;
 CREATE TRIGGER update_technician_access_settings_updated_at BEFORE UPDATE ON technician_access_settings
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_payroll_profiles_updated_at ON technician_payroll_profiles;
 CREATE TRIGGER update_technician_payroll_profiles_updated_at BEFORE UPDATE ON technician_payroll_profiles
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_job_payments_updated_at ON job_payments;
 CREATE TRIGGER update_job_payments_updated_at BEFORE UPDATE ON job_payments
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_payroll_periods_updated_at ON payroll_periods;
 CREATE TRIGGER update_payroll_periods_updated_at BEFORE UPDATE ON payroll_periods
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_payroll_entries_updated_at ON payroll_entries;
 CREATE TRIGGER update_payroll_entries_updated_at BEFORE UPDATE ON payroll_entries
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_payroll_disbursements_updated_at ON payroll_disbursements;
 CREATE TRIGGER update_payroll_disbursements_updated_at BEFORE UPDATE ON payroll_disbursements
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_schedules_updated_at ON technician_schedules;
 CREATE TRIGGER update_technician_schedules_updated_at BEFORE UPDATE ON technician_schedules
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_documents_updated_at ON technician_documents;
 CREATE TRIGGER update_technician_documents_updated_at BEFORE UPDATE ON technician_documents
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_technician_other_details_updated_at ON technician_other_details;
 CREATE TRIGGER update_technician_other_details_updated_at BEFORE UPDATE ON technician_other_details
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_calendar_events_updated_at ON calendar_events;
 CREATE TRIGGER update_calendar_events_updated_at BEFORE UPDATE ON calendar_events
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_user_migration_upload_updated_at ON user_migration_upload;
 CREATE TRIGGER update_user_migration_upload_updated_at BEFORE UPDATE ON user_migration_upload
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Attendance duration
-DROP TRIGGER IF EXISTS calculate_duration_before_update ON attendance;
 CREATE TRIGGER calculate_duration_before_update BEFORE UPDATE ON attendance
     FOR EACH ROW EXECUTE FUNCTION calculate_attendance_duration();
 
 -- Technician hours on job completion
-DROP TRIGGER IF EXISTS trg_technician_hours_on_job_completion ON technician_jobs;
 CREATE TRIGGER trg_technician_hours_on_job_completion
   AFTER UPDATE ON technician_jobs
   FOR EACH ROW
   EXECUTE FUNCTION fn_create_technician_hours_on_completion();
 
 -- Leads full_name / address auto-population
-DROP TRIGGER IF EXISTS trigger_update_full_name_from_parts ON leads;
 CREATE TRIGGER trigger_update_full_name_from_parts
     BEFORE INSERT OR UPDATE ON leads
     FOR EACH ROW
     EXECUTE FUNCTION update_full_name_from_parts();
 
 -- Job technician admin messages updated_at
-DROP TRIGGER IF EXISTS trigger_update_job_technician_admin_messages_updated_at ON job_technician_admin_messages;
 CREATE TRIGGER trigger_update_job_technician_admin_messages_updated_at
     BEFORE UPDATE ON job_technician_admin_messages
     FOR EACH ROW

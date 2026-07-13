@@ -2,7 +2,7 @@
  * POST /api/leads/[leadId]/convert-preview — dry-run preview before Convert to SAP
  */
 
-import { leadService, customerService } from '../../../../lib/supabase/database';
+import { customerService } from '../../../../lib/supabase/database';
 import { getSupabaseAdmin } from '../../../../lib/supabase/server';
 import sapService from '../../../../lib/services/sapService';
 import { getCustomerAddressFromLead } from '../../../../lib/utils/leadLocationName';
@@ -17,6 +17,10 @@ import {
 import { verifyCustomerSapStatus } from '../../../../lib/customers/verifySapCustomerSync';
 import { getCurrentSapSyncEnvironment } from '../../../../lib/customers/sapSyncEnvironment';
 import { getEffectiveLeadName } from '../../../../lib/leads/getEffectiveLeadName';
+import {
+  findSiblingPortalCustomers,
+} from '../../../../lib/customers/portalDuplicateCheck';
+import { resolveLeadOrPortalCustomer } from '../../../../lib/leads/resolveLeadOrPortalCustomer';
 
 function collectServiceDates(lead) {
   return [
@@ -51,10 +55,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    const lead = await leadService.findById(leadId);
-    if (!lead) {
+    const resolved = await resolveLeadOrPortalCustomer(leadId);
+    if (!resolved) {
       return res.status(404).json({ error: 'Lead not found' });
     }
+
+    const { lead, customer: resolvedCustomer } = resolved;
 
     const sessionCookies = sapService.getSessionCookies(req);
     if (!sessionCookies) {
@@ -66,9 +72,9 @@ export default async function handler(req, res) {
     }
 
     const supabase = getSupabaseAdmin();
-    let customer = null;
+    let customer = resolvedCustomer;
 
-    if (lead.customer_id) {
+    if (!customer && lead.customer_id) {
       const { data } = await supabase
         .from('customer')
         .select(
@@ -177,6 +183,19 @@ export default async function handler(req, res) {
       }
     }
 
+    const siblingPortalCustomers = await findSiblingPortalCustomers(supabase, {
+      email: lead.email,
+      phone: lead.handphone,
+      excludeCustomerId: customer?.id,
+      excludeCustomerCode: portalCode,
+    });
+    if (siblingPortalCustomers.length > 0) {
+      const codes = siblingPortalCustomers.map((s) => s.customer_code).join(', ');
+      warnings.push(
+        `Another portal record (${codes}) exists for this email/phone — review or merge before converting`
+      );
+    }
+
     return res.status(200).json({
       preview: true,
       leadId,
@@ -210,6 +229,7 @@ export default async function handler(req, res) {
         verificationReason,
       },
       warnings,
+      siblingPortalCustomers,
       serviceDates: collectServiceDates(lead),
       jobsNote: 'No jobs will be created on convert. Use Create Jobs from Lead after sync.',
       validation: {

@@ -1,4 +1,4 @@
-import React, { Fragment, useMemo, useState, useEffect, useCallback, useRef } from 'react';
+import React, { Fragment, useMemo, useState, useEffect } from 'react';
 import { Col, Row, Card, Button, OverlayTrigger, Tooltip, Badge, Spinner, Form, Modal } from 'react-bootstrap';
 import { useRouter } from 'next/router';
 import { 
@@ -14,6 +14,9 @@ import {
   ChatLeftTextFill
 } from 'react-bootstrap-icons';
 import { GeeksSEO } from 'widgets'
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_PURPLE,
+} from 'sub-components/dashboard/DashboardListStickySearch';
 import { 
   Search, 
   X as FeatherX,
@@ -38,6 +41,8 @@ import TablePagination from '../../../components/common/TablePagination';
 import { ExtensionFriendlyPhone } from '../../../components/common/ExtensionFriendlyPhone';
 import SapDeltaSyncPreviewModal from '../../../components/customers/SapDeltaSyncPreviewModal';
 import { useSapDeltaSync } from '../../../hooks/useSapDeltaSync';
+import { useEnterToSearch } from '../../../hooks/useEnterToSearch';
+import { useLeadsListQuery } from '../../../hooks/queries/useLeadsListQuery';
 
 
 const TOAST_STYLES = {
@@ -108,42 +113,71 @@ const formatLeadAddress = (lead) => {
 };
 
 const ViewLeads = () => {
-  const [rawData, setRawData] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [totalRows, setTotalRows] = useState(0);
   const [error, setError] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
   const router = useRouter();
   const [perPage, setPerPage] = useState(TABLE_CONFIG.PAGE_SIZES.DEFAULT);
   const [initialLoad, setInitialLoad] = useState(true);
   
-  const [filters, setFilters] = useState({
-    globalSearch: ''
-  });
+  const {
+    draft: globalSearchDraft,
+    setDraft: setGlobalSearchDraft,
+    applied: globalSearchApplied,
+    clear: clearGlobalSearch,
+    applyValue: applyGlobalSearchValue,
+    onKeyDown: onGlobalSearchKeyDown,
+  } = useEnterToSearch();
 
+  const leadsQueryParams = useMemo(
+    () => ({
+      page: currentPage,
+      limit: perPage,
+      search: globalSearchApplied || '',
+    }),
+    [currentPage, perPage, globalSearchApplied]
+  );
+
+  const {
+    data: leadsData,
+    isLoading: leadsLoading,
+    isFetching: leadsFetching,
+    error: leadsQueryError,
+    refetch: refetchLeads,
+  } = useLeadsListQuery(leadsQueryParams);
+
+  const rawData = leadsData?.leads || [];
   const data = rawData;
+  const totalRows = leadsData?.totalCount ?? rawData.length;
 
   useEffect(() => {
-    if (filters.globalSearch && data.length > 0) {
+    setLoading(leadsLoading || leadsFetching);
+    if (leadsQueryError) {
+      setError(leadsQueryError.message || 'Failed to load leads. Please try again.');
+    } else if (leadsData) {
+      setError(null);
+    }
+  }, [leadsLoading, leadsFetching, leadsQueryError, leadsData]);
+
+  useEffect(() => {
+    if (leadsData && !leadsFetching) {
+      setInitialLoad(false);
+    }
+  }, [leadsData, leadsFetching]);
+
+  useEffect(() => {
+    if (globalSearchApplied && data.length > 0) {
       const filteredPages = Math.ceil(data.length / perPage);
       if (currentPage > filteredPages && filteredPages > 0) {
         setCurrentPage(1);
       }
-    } else if (!filters.globalSearch) {
+    } else if (!globalSearchApplied) {
       const totalPages = Math.ceil(totalRows / perPage);
       if (currentPage > totalPages && totalPages > 0) {
         setCurrentPage(1);
       }
     }
-  }, [filters.globalSearch, data.length, perPage, currentPage, totalRows]);
-
-  const isMountedRef = useRef(true);
-
-  useEffect(() => {
-    return () => {
-      isMountedRef.current = false;
-    };
-  }, []);
+  }, [globalSearchApplied, data.length, perPage, currentPage, totalRows]);
 
   const columnHelper = createColumnHelper();
 
@@ -332,45 +366,6 @@ const ViewLeads = () => {
     },
   });
 
-  const loadData = useCallback(async (page = 1) => {
-    if (!isMountedRef.current) return;
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const params = new URLSearchParams({
-        page: String(page),
-        limit: String(perPage),
-        search: filters.globalSearch || '',
-      });
-      const response = await fetch(`/api/leads/masterlist-summary?${params.toString()}`);
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || `Failed to load leads (${response.status})`);
-      }
-      const payload = await response.json();
-      const leads = payload.leads || [];
-
-      if (isMountedRef.current) {
-        setRawData(leads);
-        setTotalRows(payload.totalCount ?? leads.length);
-      }
-    } catch (err) {
-      console.error('Error loading leads:', err);
-      if (isMountedRef.current) {
-        setError(err.message || 'Failed to load leads. Please try again.');
-        setRawData([]);
-        setTotalRows(0);
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setLoading(false);
-        setInitialLoad(false);
-      }
-    }
-  }, [perPage, filters.globalSearch]);
-
   const {
     syncCode: syncLeadCode,
     setSyncCode: setSyncLeadCode,
@@ -411,20 +406,16 @@ const ViewLeads = () => {
       }
 
       setCurrentPage(1);
-      await loadData();
+      await refetchLeads();
       if (normalizedCode) {
-        setFilters((prev) => ({ ...prev, globalSearch: normalizedCode }));
+        applyGlobalSearchValue(normalizedCode);
       }
     },
   });
 
   useEffect(() => {
-    loadData(currentPage).catch((err) => console.error('Error loading leads:', err));
-  }, [currentPage, perPage, filters.globalSearch, loadData]);
-
-  useEffect(() => {
     setCurrentPage(1);
-  }, [filters.globalSearch, perPage]);
+  }, [globalSearchApplied, perPage]);
 
   const handlePageChange = (page) => {
     setCurrentPage(page);
@@ -496,26 +487,7 @@ const ViewLeads = () => {
                   >
                     Leads tagged <strong>SAP Lead</strong> in the Excel masterlist, loaded from Supabase (no SAP session required for this list).
                   </p>
-                  <div 
-                    className="d-flex align-items-center gap-2 flex-wrap"
-                    style={{
-                      fontSize: '14px',
-                      color: 'rgba(255, 255, 255, 0.9)',
-                      background: 'rgba(255, 255, 255, 0.1)',
-                      padding: '8px 12px',
-                      borderRadius: '6px',
-                      marginTop: '8px'
-                    }}
-                  >
-                    <i className="fe fe-info" style={{ fontSize: '16px' }}></i>
-                    <span>
-                      View-only. Need the legacy live SAP Service Layer list?{' '}
-                      <Link href="/leads/sap-api" className="text-white text-decoration-underline fw-semibold">
-                        Open SAP API leads
-                      </Link>
-                      .
-                    </span>
-                  </div>
+                 
                 </div>
 
                 <div className="d-flex align-items-center gap-2 mb-4">
@@ -640,8 +612,7 @@ const ViewLeads = () => {
       <Row>
         <Col md={12} xs={12} className="mb-5">
           {/* Global Search */}
-          <Card className="border-0 shadow-sm mb-3" style={{ background: 'linear-gradient(90deg, #7C3AED 0%, #A78BFA 100%)' }}>
-            <Card.Body className="p-3">
+          <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_PURPLE}>
               <Row className="align-items-center">
                 <Col md={12}>
                   <div className="d-flex align-items-center gap-3">
@@ -651,14 +622,15 @@ const ViewLeads = () => {
                         Global Search
                       </h6>
                       <small className="text-white" style={{ opacity: 0.9, fontSize: '0.75rem' }}>
-                        Live &bull; All Fields
+                        Press Enter to search
                       </small>
                     </div>
                     <div className="flex-grow-1">
                       <Form.Control
                         type="text"
-                        value={filters.globalSearch}
-                        onChange={(e) => setFilters(prev => ({ ...prev, globalSearch: e.target.value }))}
+                        value={globalSearchDraft}
+                        onChange={(e) => setGlobalSearchDraft(e.target.value)}
+                        onKeyDown={onGlobalSearchKeyDown}
                         placeholder="Search anything... Lead Code, Name, Email, Phone, Address, Contact Person, etc."
                         style={{ 
                           fontSize: '0.95rem', 
@@ -671,11 +643,14 @@ const ViewLeads = () => {
                         autoComplete="off"
                       />
                     </div>
-                    {filters.globalSearch && (
+                    {(globalSearchDraft || globalSearchApplied) && (
                       <Button
                         variant="light"
                         size="sm"
-                        onClick={() => setFilters(prev => ({ ...prev, globalSearch: '' }))}
+                        onClick={() => {
+                          clearGlobalSearch();
+                          setCurrentPage(1);
+                        }}
                         className="d-flex align-items-center gap-1"
                         style={{ minWidth: '90px', fontWeight: '500', borderRadius: '6px' }}
                       >
@@ -684,7 +659,7 @@ const ViewLeads = () => {
                       </Button>
                     )}
                   </div>
-                  {filters.globalSearch ? (
+                  {globalSearchApplied ? (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.95 }}>
                       <FilterCircle size={14} />
                       <small style={{ fontSize: '0.85rem' }}>
@@ -694,14 +669,13 @@ const ViewLeads = () => {
                   ) : (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.85 }}>
                       <small style={{ fontSize: '0.8rem' }}>
-                        <strong>Tip:</strong> Search across ALL fields instantly - Lead Code, Name, Email, Phone, Address, Contact Person, Notes, and more!
+                        <strong>Tip:</strong> Press Enter to search across Lead Code, Name, Email, Phone, Address, Contact Person, Notes, and more!
                       </small>
                     </div>
                   )}
                 </Col>
               </Row>
-            </Card.Body>
-          </Card>
+          </DashboardListStickySearch>
 
           <Card className="border-0 shadow-sm">
             <Card.Body className="p-4">
@@ -729,7 +703,7 @@ const ViewLeads = () => {
                   <ListUl size={14} className="me-2" />
                   {loading ? (
                     <small>Loading...</small>
-                  ) : filters.globalSearch ? (
+                  ) : globalSearchApplied ? (
                     `Showing ${data.length} of ${totalRows} leads (filtered)`
                   ) : (
                     `Showing ${Math.min(((currentPage - 1) * perPage) + 1, totalRows)}-${Math.min(currentPage * perPage, totalRows)} of ${totalRows}`
@@ -804,10 +778,10 @@ const ViewLeads = () => {
               <div className="border-top">
                 <TablePagination
                   currentPage={currentPage}
-                  totalPages={filters.globalSearch 
+                  totalPages={globalSearchApplied
                     ? Math.ceil(data.length / perPage) 
                     : Math.ceil(totalRows / perPage)}
-                  totalItems={filters.globalSearch ? data.length : totalRows}
+                  totalItems={globalSearchApplied ? data.length : totalRows}
                   onPageChange={(newPage) => {
                     handlePageChange(newPage);
                     table.setPageIndex(newPage - 1);

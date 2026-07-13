@@ -43,6 +43,15 @@ export function invalidateSettingsBundleCache() {
   }
 }
 
+/** Bust server-side settings + dashboard bootstrap list caches. */
+export function invalidateSettingsServerCache() {
+  if (typeof window === 'undefined') return;
+  void fetch('/api/settings/invalidate-cache', {
+    method: 'POST',
+    credentials: 'same-origin',
+  }).catch(() => {});
+}
+
 export async function fetchSettingsBundleFromApi({ force = false } = {}) {
   if (!force) {
     const cached = readCachedSettingsBundle();

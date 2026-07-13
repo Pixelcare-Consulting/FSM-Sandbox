@@ -14,6 +14,9 @@ import {
   ChatLeftTextFill
 } from 'react-bootstrap-icons';
 import { GeeksSEO } from 'widgets'
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_PURPLE,
+} from 'sub-components/dashboard/DashboardListStickySearch';
 import { 
   Search, 
   X as FeatherX
@@ -32,6 +35,7 @@ import Link from 'next/link';
 import { textMatchesAllSearchTokens } from '../../../lib/utils/multiTokenSearch';
 import TablePagination from '../../../components/common/TablePagination';
 import { ExtensionFriendlyPhone } from '../../../components/common/ExtensionFriendlyPhone';
+import { useEnterToSearch } from '../../../hooks/useEnterToSearch';
 
 
 const TOAST_STYLES = {
@@ -108,16 +112,20 @@ const ViewLeads = () => {
   const [perPage, setPerPage] = useState(TABLE_CONFIG.PAGE_SIZES.DEFAULT);
   const [initialLoad, setInitialLoad] = useState(true);
   
-  const [filters, setFilters] = useState({
-    globalSearch: ''
-  });
+  const {
+    draft: globalSearchDraft,
+    setDraft: setGlobalSearchDraft,
+    applied: globalSearchApplied,
+    clear: clearGlobalSearch,
+    onKeyDown: onGlobalSearchKeyDown,
+  } = useEnterToSearch();
 
   const data = useMemo(() => {
-    if (!filters.globalSearch || filters.globalSearch.trim() === '') {
+    if (!globalSearchApplied) {
       return rawData;
     }
 
-    const searchTerm = filters.globalSearch.toLowerCase().trim();
+    const searchTerm = globalSearchApplied.toLowerCase();
 
     return rawData.filter(lead => {
       const searchableFields = [
@@ -142,21 +150,21 @@ const ViewLeads = () => {
       
       return textMatchesAllSearchTokens(searchableFields, searchTerm);
     });
-  }, [rawData, filters.globalSearch]);
+  }, [rawData, globalSearchApplied]);
 
   useEffect(() => {
-    if (filters.globalSearch && data.length > 0) {
+    if (globalSearchApplied && data.length > 0) {
       const filteredPages = Math.ceil(data.length / perPage);
       if (currentPage > filteredPages && filteredPages > 0) {
         setCurrentPage(1);
       }
-    } else if (!filters.globalSearch) {
+    } else if (!globalSearchApplied) {
       const totalPages = Math.ceil(totalRows / perPage);
       if (currentPage > totalPages && totalPages > 0) {
         setCurrentPage(1);
       }
     }
-  }, [filters.globalSearch, data.length, perPage, currentPage, totalRows]);
+  }, [globalSearchApplied, data.length, perPage, currentPage, totalRows]);
 
   const isMountedRef = useRef(true);
 
@@ -553,8 +561,7 @@ const ViewLeads = () => {
       <Row>
         <Col md={12} xs={12} className="mb-5">
           {/* Global Search */}
-          <Card className="border-0 shadow-sm mb-3" style={{ background: 'linear-gradient(90deg, #7C3AED 0%, #A78BFA 100%)' }}>
-            <Card.Body className="p-3">
+          <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_PURPLE}>
               <Row className="align-items-center">
                 <Col md={12}>
                   <div className="d-flex align-items-center gap-3">
@@ -564,14 +571,15 @@ const ViewLeads = () => {
                         Global Search
                       </h6>
                       <small className="text-white" style={{ opacity: 0.9, fontSize: '0.75rem' }}>
-                        Live &bull; All Fields
+                        Press Enter to search
                       </small>
                     </div>
                     <div className="flex-grow-1">
                       <Form.Control
                         type="text"
-                        value={filters.globalSearch}
-                        onChange={(e) => setFilters(prev => ({ ...prev, globalSearch: e.target.value }))}
+                        value={globalSearchDraft}
+                        onChange={(e) => setGlobalSearchDraft(e.target.value)}
+                        onKeyDown={onGlobalSearchKeyDown}
                         placeholder="Search anything... Lead Code, Name, Email, Phone, Address, Contact Person, etc."
                         style={{ 
                           fontSize: '0.95rem', 
@@ -584,11 +592,14 @@ const ViewLeads = () => {
                         autoComplete="off"
                       />
                     </div>
-                    {filters.globalSearch && (
+                    {(globalSearchDraft || globalSearchApplied) && (
                       <Button
                         variant="light"
                         size="sm"
-                        onClick={() => setFilters(prev => ({ ...prev, globalSearch: '' }))}
+                        onClick={() => {
+                          clearGlobalSearch();
+                          setCurrentPage(1);
+                        }}
                         className="d-flex align-items-center gap-1"
                         style={{ minWidth: '90px', fontWeight: '500', borderRadius: '6px' }}
                       >
@@ -597,7 +608,7 @@ const ViewLeads = () => {
                       </Button>
                     )}
                   </div>
-                  {filters.globalSearch ? (
+                  {globalSearchApplied ? (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.95 }}>
                       <FilterCircle size={14} />
                       <small style={{ fontSize: '0.85rem' }}>
@@ -607,14 +618,13 @@ const ViewLeads = () => {
                   ) : (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.85 }}>
                       <small style={{ fontSize: '0.8rem' }}>
-                        <strong>Tip:</strong> Search across ALL fields instantly - Lead Code, Name, Email, Phone, Address, Contact Person, Notes, and more!
+                        <strong>Tip:</strong> Press Enter to search across Lead Code, Name, Email, Phone, Address, Contact Person, Notes, and more!
                       </small>
                     </div>
                   )}
                 </Col>
               </Row>
-            </Card.Body>
-          </Card>
+          </DashboardListStickySearch>
 
           <Card className="border-0 shadow-sm">
             <Card.Body className="p-4">
@@ -642,7 +652,7 @@ const ViewLeads = () => {
                   <ListUl size={14} className="me-2" />
                   {loading ? (
                     <small>Loading...</small>
-                  ) : filters.globalSearch ? (
+                  ) : globalSearchApplied ? (
                     `Showing ${data.length} of ${totalRows} leads (filtered)`
                   ) : (
                     `Showing ${Math.min(((currentPage - 1) * perPage) + 1, totalRows)}-${Math.min(currentPage * perPage, totalRows)} of ${totalRows}`
@@ -717,10 +727,10 @@ const ViewLeads = () => {
               <div className="border-top">
                 <TablePagination
                   currentPage={currentPage}
-                  totalPages={filters.globalSearch 
+                  totalPages={globalSearchApplied
                     ? Math.ceil(data.length / perPage) 
                     : Math.ceil(totalRows / perPage)}
-                  totalItems={filters.globalSearch ? data.length : totalRows}
+                  totalItems={globalSearchApplied ? data.length : totalRows}
                   onPageChange={(newPage) => {
                     handlePageChange(newPage);
                     table.setPageIndex(newPage - 1);

@@ -24,7 +24,8 @@ import {
 } from "react-bootstrap-icons";
 import { Button, Form, Modal } from "react-bootstrap";
 import toast from "react-hot-toast";
-import { fetchLiveTrackingSnapshot } from "../../../../lib/liveTracking/fetchLiveTrackingSnapshot";
+import { useLiveTrackingQuery } from "../../../../hooks/queries/useLiveTrackingQuery";
+import { useJobStatusesQuery } from "../../../../hooks/queries/useJobStatusesQuery";
 import {
   getTechnicianStatusColor,
   getTechnicianStatusLabel,
@@ -36,7 +37,6 @@ import {
   getJobStatusColorFromList,
   getJobStatusLabelFromList,
 } from "../../../../utils/jobStatusDefaults";
-import { fetchJobStatuses } from "../../../../utils/jobStatusSettings";
 import LiveTrackingAdvancedMarkers, {
   LIVE_TRACKING_STOP_PIN_SIZE_PX,
   LiveTrackingVehicleLegendIcon,
@@ -419,8 +419,13 @@ export default function LiveTrackingDashboard() {
   const [teamFilter, setTeamFilter] = useState("all");
   const [mapDate, setMapDate] = useState(() => new Date());
   const [driverTrackProgress, setDriverTrackProgress] = useState({});
-  /** Merged list: SAP/API job statuses + Dashboard → Settings → Job Statuses (name + color). */
-  const [jobStatuses, setJobStatuses] = useState(() => getDefaultJobStatuses());
+  const { data: jobStatusesData = getDefaultJobStatuses() } = useJobStatusesQuery();
+  const {
+    data: trackingSnapshot,
+    isLoading: trackingQueryLoading,
+    isFetching: trackingQueryFetching,
+    isPreviousData: trackingPreviousData,
+  } = useLiveTrackingQuery(mapDate);
   const [showBetaWelcomeModal, setShowBetaWelcomeModal] = useState(false);
   const [betaModalDontShowAgain, setBetaModalDontShowAgain] = useState(false);
 
@@ -428,6 +433,8 @@ export default function LiveTrackingDashboard() {
   /** InfoWindow fires `close` (not `closeclick`) when dismissed by map click; keep selection in sync. */
   const liveStopInfoCloseListenerRef = useRef(null);
   const liveTrackingMapRef = useRef(null);
+
+  const jobStatuses = jobStatusesData;
 
   useEffect(() => {
     try {
@@ -441,23 +448,6 @@ export default function LiveTrackingDashboard() {
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const list = await fetchJobStatuses();
-        if (!cancelled && Array.isArray(list) && list.length > 0) {
-          setJobStatuses(list);
-        }
-      } catch {
-        /* keep defaults */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
     if (statusFilter === "all") return;
     const ok = jobStatuses.some(
       (s) => String(s.value ?? "").trim() === String(statusFilter).trim()
@@ -466,63 +456,72 @@ export default function LiveTrackingDashboard() {
   }, [jobStatuses, statusFilter]);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
+    if (
+      trackingQueryLoading ||
+      (trackingQueryFetching && trackingPreviousData)
+    ) {
       setLoadState("loading");
       setLoadNotice(null);
-      setSkippedNoCoords(0);
-      const snap = await fetchLiveTrackingSnapshot(mapDate);
-      if (cancelled) return;
+      return;
+    }
 
-      if (!snap.ok && snap.error === "NO_CLIENT") {
-        const demo = buildDemoDataset();
-        setDrivers(demo.drivers);
-        setStops(demo.stops);
-        setSelectedStopId(null);
-        setSelectedVehicleDriverId(null);
-        setLoadState("demo");
-        setLoadNotice(
-          "Supabase is not configured in the browser (NEXT_PUBLIC_SUPABASE_*). Showing demo data."
-        );
-        return;
-      }
+    if (!trackingSnapshot || trackingPreviousData) {
+      return;
+    }
 
-      if (!snap.ok) {
-        toast.error(snap.message || snap.error || "Failed to load jobs");
-        const demo = buildDemoDataset();
-        setDrivers(demo.drivers);
-        setStops(demo.stops);
-        setSelectedStopId(null);
-        setSelectedVehicleDriverId(null);
-        setLoadState("demo");
-        setLoadNotice("Could not load live jobs; showing demo data.");
-        return;
-      }
+    const snap = trackingSnapshot;
+    setSkippedNoCoords(0);
 
-      setDrivers(snap.drivers);
-      setStops(snap.stops);
+    if (!snap.ok && snap.error === "NO_CLIENT") {
+      const demo = buildDemoDataset();
+      setDrivers(demo.drivers);
+      setStops(demo.stops);
       setSelectedStopId(null);
       setSelectedVehicleDriverId(null);
-      setLoadState("ok");
-      setLoadNotice(null);
-      setSkippedNoCoords(snap.skippedNoCoords || 0);
+      setLoadState("demo");
+      setLoadNotice(
+        "Supabase is not configured in the browser (NEXT_PUBLIC_SUPABASE_*). Showing demo data."
+      );
+      return;
+    }
 
-      if (snap.skippedNoCoords > 0) {
-        toast(
-          `${snap.skippedNoCoords} job(s) skipped — add coordinates on the linked location.`,
-          { duration: 5500 }
-        );
-      }
-      if (snap.stops.length === 0) {
-        toast("No assigned jobs with a time window on this day.", {
-          duration: 4500,
-        });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [mapDate]);
+    if (!snap.ok) {
+      toast.error(snap.message || snap.error || "Failed to load jobs");
+      const demo = buildDemoDataset();
+      setDrivers(demo.drivers);
+      setStops(demo.stops);
+      setSelectedStopId(null);
+      setSelectedVehicleDriverId(null);
+      setLoadState("demo");
+      setLoadNotice("Could not load live jobs; showing demo data.");
+      return;
+    }
+
+    setDrivers(snap.drivers);
+    setStops(snap.stops);
+    setSelectedStopId(null);
+    setSelectedVehicleDriverId(null);
+    setLoadState("ok");
+    setLoadNotice(null);
+    setSkippedNoCoords(snap.skippedNoCoords || 0);
+
+    if (snap.skippedNoCoords > 0) {
+      toast(
+        `${snap.skippedNoCoords} job(s) skipped — add coordinates on the linked location.`,
+        { duration: 5500 }
+      );
+    }
+    if (snap.stops.length === 0) {
+      toast("No assigned jobs with a time window on this day.", {
+        duration: 4500,
+      });
+    }
+  }, [
+    trackingSnapshot,
+    trackingQueryLoading,
+    trackingQueryFetching,
+    trackingPreviousData,
+  ]);
 
   useEffect(() => {
     setDriverTrackProgress((prev) => {

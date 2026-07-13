@@ -16,8 +16,12 @@ import { userService } from "../../../lib/supabase/database";
 import { useReactTable, createColumnHelper, getCoreRowModel, getSortedRowModel, flexRender } from '@tanstack/react-table';
 import Swal from "sweetalert2";
 import { Search } from 'react-feather';
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from '../DashboardListStickySearch';
 import { format, parseISO } from 'date-fns'; // Add this import for date formatting
 import { useWorkers } from '../../../hooks/useWorkers';
+import { useEnterToSearch } from '../../../hooks/useEnterToSearch';
 import { MailIcon, PhoneIcon, CheckIcon, XIcon, Eye, Trash } from 'lucide-react';
 import { Users, Clock, CheckCircle, Activity } from 'lucide-react';
 import Link from "next/link";
@@ -94,8 +98,13 @@ const WorkersListItems = () => {
   const router = useRouter();
   const [rowSelection, setRowSelection] = useState({});
   const [users, setUsers] = useState([]);
-  const searchDebounceRef = useRef(null);
-  const [searchInput, setSearchInput] = useState('');
+  const {
+    draft: searchDraft,
+    setDraft: setSearchDraft,
+    applied: searchApplied,
+    clear: clearSearch,
+    onKeyDown: onSearchKeyDown,
+  } = useEnterToSearch();
 
   // Modify handleRefresh to force a fresh fetch
   const handleRefresh = useCallback(async () => {
@@ -715,23 +724,9 @@ const WorkersListItems = () => {
   }, [workers, loading, error, page, totalCount]);
 
 
-  const handleSearchChange = useCallback((value) => {
-    setSearchInput(value);
-    if (searchDebounceRef.current) {
-      clearTimeout(searchDebounceRef.current);
-    }
-    searchDebounceRef.current = setTimeout(() => {
-      updateSearch(value);
-    }, 350);
-  }, [updateSearch]);
-
   useEffect(() => {
-    return () => {
-      if (searchDebounceRef.current) {
-        clearTimeout(searchDebounceRef.current);
-      }
-    };
-  }, []);
+    updateSearch(searchApplied);
+  }, [searchApplied, updateSearch]);
 
   const statCards = [
     {
@@ -990,8 +985,7 @@ const WorkersListItems = () => {
       <Row>
         <Col md={12} xs={12}>
           {/* Global Search Filter - Searches ALL fields in loaded workers in real-time */}
-          <Card className="border-0 shadow-sm mb-3" style={{ background: 'linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)' }}>
-            <Card.Body className="p-3">
+          <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_BLUE}>
               <Row className="align-items-center">
                 <Col md={12}>
                   <div className="d-flex align-items-center gap-3">
@@ -1001,14 +995,15 @@ const WorkersListItems = () => {
                         🌐 Global Search
                       </h6>
                       <small className="text-white" style={{ opacity: 0.9, fontSize: '0.75rem' }}>
-                        ⚡ Live • All Fields
+                        Press Enter to search
                       </small>
                     </div>
                     <div className="flex-grow-1">
                       <Form.Control
                         type="text"
-                        value={searchInput}
-                        onChange={(e) => handleSearchChange(e.target.value)}
+                        value={searchDraft}
+                        onChange={(e) => setSearchDraft(e.target.value)}
+                        onKeyDown={onSearchKeyDown}
                         placeholder="🔍 Search anything... Worker ID, Name, Email, Phone, Role, Status, Skills, Address, etc."
                         style={{ 
                           fontSize: '0.95rem', 
@@ -1021,11 +1016,11 @@ const WorkersListItems = () => {
                         autoComplete="off"
                       />
                     </div>
-                    {searchInput ? (
+                    {(searchDraft || searchApplied) ? (
                       <Button
                         variant="light"
                         size="sm"
-                        onClick={() => handleSearchChange('')}
+                        onClick={clearSearch}
                         className="d-flex align-items-center gap-1"
                         style={{ 
                           minWidth: '90px',
@@ -1038,7 +1033,7 @@ const WorkersListItems = () => {
                       </Button>
                     ) : null}
                   </div>
-                  {searchInput ? (
+                  {searchApplied ? (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.95 }}>
                       <small style={{ fontSize: '0.85rem' }}>
                         ✓ Showing <strong>{workers.length}</strong> of <strong>{totalCount}</strong> workers
@@ -1053,14 +1048,13 @@ const WorkersListItems = () => {
                   ) : (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.85 }}>
                       <small style={{ fontSize: '0.8rem' }}>
-                        💡 <strong>Tip:</strong> Search across ALL fields instantly - Worker ID, Name, Email, Phone, Role, Status, Skills, Address, and more!
+                        💡 <strong>Tip:</strong> Press Enter to search across Worker ID, Name, Email, Phone, Role, Status, Skills, Address, and more!
                       </small>
                     </div>
                   )}
                 </Col>
               </Row>
-            </Card.Body>
-          </Card>
+          </DashboardListStickySearch>
 
           <Card className="border-0 shadow-sm">
             <Card.Body className="p-4">

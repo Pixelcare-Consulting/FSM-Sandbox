@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Table, Button, Form, InputGroup, Container, Row, Col } from 'react-bootstrap';
 import TablePagination from 'components/common/TablePagination';
 import { formatDistanceToNow } from 'date-fns';
 import { Trash, PencilSquare, Search, ArrowLeft, Check, X, CaretUpFill, CaretDownFill } from 'react-bootstrap-icons';
 import { getSupabaseClient } from '../../lib/supabase/client';
+import { formatSingaporeDateWithTime } from '../../lib/utils/singaporeDateTime';
 import toast from 'react-hot-toast';
 
 const headerStyle = {
@@ -14,7 +15,10 @@ const headerStyle = {
   padding: '12px 8px',
 };
 
-export const AllNotesTable = ({ notes, onClose, customerId }) => {
+export const AllNotesTable = ({ notes: initialNotes = [], onClose, customerId, customerUuid = null }) => {
+  const [notes, setNotes] = useState(initialNotes);
+  const [totalCount, setTotalCount] = useState(initialNotes.length);
+  const [loading, setLoading] = useState(Boolean(customerUuid));
   const [searchTerm, setSearchTerm] = useState('');
   const [editingNoteId, setEditingNoteId] = useState(null);
   const [editedContent, setEditedContent] = useState('');
@@ -22,6 +26,47 @@ export const AllNotesTable = ({ notes, onClose, customerId }) => {
   const [notesPerPage] = useState(10);
   const [sortField, setSortField] = useState('createdAt');
   const [sortDirection, setSortDirection] = useState('desc');
+
+  const fetchNotesPage = useCallback(async (page = currentPage) => {
+    if (!customerUuid) return;
+
+    setLoading(true);
+    try {
+      const searchParams = new URLSearchParams({
+        page: String(page),
+        limit: String(notesPerPage),
+      });
+      const response = await fetch(
+        `/api/customers/notes/${encodeURIComponent(customerUuid)}?${searchParams.toString()}`,
+        { credentials: 'same-origin', cache: 'no-store' }
+      );
+      if (!response.ok) return;
+      const payload = await response.json();
+      const rows = (payload.notes || []).map((note) => ({
+        ...note,
+        createdAt: note.createdAt
+          ? (typeof note.createdAt === 'string'
+            ? { toDate: () => new Date(note.createdAt) }
+            : note.createdAt)
+          : null,
+      }));
+      setNotes(rows);
+      setTotalCount(payload.totalCount ?? rows.length);
+    } catch (err) {
+      console.error('AllNotesTable fetch:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, [customerUuid, currentPage, notesPerPage]);
+
+  useEffect(() => {
+    if (customerUuid) {
+      fetchNotesPage(currentPage);
+      return;
+    }
+    setNotes(initialNotes);
+    setTotalCount(initialNotes.length);
+  }, [customerUuid, currentPage, notesPerPage, fetchNotesPage, initialNotes]);
 
   const filteredNotes = notes.filter(note =>
     note.content.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -48,8 +93,12 @@ export const AllNotesTable = ({ notes, onClose, customerId }) => {
 
   const indexOfLastNote = currentPage * notesPerPage;
   const indexOfFirstNote = indexOfLastNote - notesPerPage;
-  const currentNotes = sortNotes(filteredNotes).slice(indexOfFirstNote, indexOfLastNote);
-  const totalPages = Math.ceil(filteredNotes.length / notesPerPage);
+  const currentNotes = customerUuid
+    ? sortNotes(filteredNotes)
+    : sortNotes(filteredNotes).slice(indexOfFirstNote, indexOfLastNote);
+  const totalPages = customerUuid
+    ? Math.max(1, Math.ceil(totalCount / notesPerPage))
+    : Math.ceil(filteredNotes.length / notesPerPage);
 
   const startEditing = (note) => {
     setEditingNoteId(note.id);
@@ -159,6 +208,9 @@ export const AllNotesTable = ({ notes, onClose, customerId }) => {
 
       <Row>
         <Col>
+          {loading ? (
+            <p className="text-muted text-center py-4">Loading notes...</p>
+          ) : (
           <div className="table-responsive">
             <Table striped bordered hover>
               <thead className="bg-light">
@@ -195,7 +247,7 @@ export const AllNotesTable = ({ notes, onClose, customerId }) => {
                     </td>
                     <td>{note.userEmail}</td>
                     <td>
-                      {note.createdAt?.toDate ? note.createdAt.toDate().toLocaleString() : (note.createdAt ? new Date(note.createdAt).toLocaleString() : 'Date not available')}
+                      {formatSingaporeDateWithTime(note.createdAt?.toDate?.() ?? note.createdAt) || 'Date not available'}
                       <br />
                       <small>
                         ({formatDistanceToNow(note.createdAt?.toDate ? note.createdAt.toDate() : (note.createdAt ? new Date(note.createdAt) : new Date()), { addSuffix: true })})
@@ -250,13 +302,14 @@ export const AllNotesTable = ({ notes, onClose, customerId }) => {
               </tbody>
             </Table>
           </div>
+          )}
         </Col>
       </Row>
 
       <TablePagination
         currentPage={currentPage}
         totalPages={totalPages}
-        totalItems={filteredNotes.length}
+        totalItems={customerUuid ? totalCount : filteredNotes.length}
         onPageChange={(newPage) => setCurrentPage(newPage)}
       />
     </Container>

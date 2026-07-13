@@ -921,7 +921,7 @@ const TechnicianDetails = () => {
           <Button
             variant="light"
             size="sm"
-            href={`/jobs/view/${row.original.jobNo}`}
+            href={`/dashboard/jobs/${row.original.jobNo}`}
             target="_blank"
             rel="noopener noreferrer"
             className="d-inline-flex align-items-center justify-content-center gap-2"

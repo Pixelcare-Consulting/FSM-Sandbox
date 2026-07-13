@@ -2,6 +2,10 @@ import jsPDF from 'jspdf';
 import 'jspdf-autotable';
 import { formatSingaporeDate, formatSingaporeTime } from '../lib/utils/singaporeDateTime';
 import { htmlToPlainText } from '../lib/utils/htmlToPlainText';
+import {
+  formatLocationRecordAsSingleLine,
+  resolveJobDisplayAddress,
+} from '../lib/jobs/resolveJobDisplayAddress.js';
 
 /**
  * Helper function to extract storage path from Supabase storage URL
@@ -304,14 +308,11 @@ export async function generateJobPDF(jobData, options = {}) {
   doc.text(customerName, margin + 2, yPos);
   
   yPos += 6;
-  const addressParts = [
-    location.street || location.address || location.location_name || '',
-    location.building || '',
-    location.city || '',
-    location.zip_code || '',
-    location.country_name || location.country || ''
-  ].filter(Boolean);
-  const fullAddress = addressParts.join(', ') || 'N/A';
+  // Shared formatter — nested address objects never become "[object Object]"
+  const fullAddress =
+    formatLocationRecordAsSingleLine(location) ||
+    resolveJobDisplayAddress(jobData) ||
+    'N/A';
   
   // Split long address into multiple lines
   const addressLines = doc.splitTextToSize(fullAddress, contentWidth - 4);

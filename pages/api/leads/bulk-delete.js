@@ -4,6 +4,8 @@
  */
 
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import { invalidateListCache } from '../../../lib/supabase/listQueryHelpers';
+import { PORTAL_LIST_CACHE_PREFIX } from '../../../lib/leads/portalListCache';
 import {
   writeAuditLogFromRequest,
   AUDIT_ACTIONS,
@@ -59,6 +61,8 @@ export default async function handler(req, res) {
       });
       throw error;
     }
+
+    invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
 
     await writeAuditLogFromRequest(req, {
       action: AUDIT_ACTIONS.LEAD_DELETE,

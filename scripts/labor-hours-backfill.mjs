@@ -10,7 +10,6 @@
  * Apply fix_technician_hours_trigger.sql in Supabase first (optional but recommended for future completions).
  */
 
-/** **/
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { fileURLToPath } from "url";

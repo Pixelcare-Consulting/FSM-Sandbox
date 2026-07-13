@@ -1,6 +1,7 @@
 import { getSupabaseClient } from '../../lib/supabase/client';
 import { getSupabaseAdmin } from '../../lib/supabase/server';
 import { userService } from '../../lib/supabase/database';
+import { invalidateSessionCache } from '../../lib/auth/requireSession';
 import { serverLogActivity } from '../../utils/serverLogActivity';
 import {
   writeAuditLogFromRequest,
@@ -59,6 +60,7 @@ export default async function handler(req, res) {
     }
 
     if (uid) {
+      invalidateSessionCache(uid);
       try {
         const supabaseAdmin = getSupabaseAdmin();
         await userService.update(

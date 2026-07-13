@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import customerCache from '../../../lib/utils/customerCache';
 import {
   addressDetailsStorageName,
   siteAddressLookupKeys,
@@ -257,6 +258,8 @@ export default async function handler(req, res) {
       changes,
       status: AUDIT_STATUS.SUCCESS,
     });
+
+    customerCache.invalidateCustomer(customerCode);
 
     return res.status(200).json({
       success: true,

@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import dynamic from 'next/dynamic';
 import {
   Form,
   Row,
@@ -6,7 +7,21 @@ import {
   InputGroup,
 } from 'react-bootstrap';
 import { memoFoldersForEmail } from '../../../../lib/utils/companyMemoDevAccess';
-import CompanyMemoBodyEditor from './CompanyMemoBodyEditor';
+
+const CompanyMemoBodyEditor = dynamic(
+  () => import('sub-components/dashboard/company-memos/CompanyMemoBodyEditor'),
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        className="border rounded bg-light text-muted small p-3"
+        style={{ minHeight: 180 }}
+      >
+        Loading editor…
+      </div>
+    ),
+  }
+);
 
 const PRIORITIES = [
   { value: 'low', label: 'Low' },
@@ -174,6 +189,7 @@ export default function CompanyMemoForm({
           disabled={disabled}
           label="This is a group memo"
         />
+        {/* DO NOT REMOVE THIS COMMENTED OUT CODE 
         <Form.Check
           type="switch"
           id="memo-sign-in"
@@ -197,7 +213,7 @@ export default function CompanyMemoForm({
           onChange={(e) => setField('show_on_dispatch_screen', e.target.checked)}
           disabled={disabled}
           label="Display on dispatch screen (reserved for future use)"
-        />
+        /> */}
         <Form.Check
           type="switch"
           id="memo-header"

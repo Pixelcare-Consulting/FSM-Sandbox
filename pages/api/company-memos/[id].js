@@ -1,5 +1,6 @@
 import { normalizeMemoFolder } from '../../../lib/constants/companyMemoFolders';
 import { invalidateHeaderTickerMemoCache } from '../../../lib/redis/companyMemoCache';
+import { invalidateListCache } from '../../../lib/supabase/listQueryHelpers';
 import {
   AUDIT_ACTIONS,
   AUDIT_CATEGORIES,
@@ -17,10 +18,13 @@ import { requireAdminUser } from './_auth';
 const MEMO_AUDIT_SELECT =
   'id, subject, body, priority, expires_at, folder, is_group_memo, target_group, show_on_sign_in, show_on_job_screen, show_on_dispatch_screen, show_in_header, only_creator_can_edit, created_by';
 
-async function selectMemoRow(adminClient, id) {
+const MEMO_DETAIL_SELECT =
+  '*, creator:users!company_memos_created_by_fkey ( id, username )';
+
+async function selectMemoRow(adminClient, id, select = MEMO_AUDIT_SELECT) {
   const { data, error } = await adminClient
     .from('company_memos')
-    .select(MEMO_AUDIT_SELECT)
+    .select(select)
     .eq('id', id)
     .is('deleted_at', null)
     .maybeSingle();
@@ -73,6 +77,19 @@ export default async function handler(req, res) {
 
   const auth = await requireAdminUser(req, res);
   if (!auth) return;
+
+  if (req.method === 'GET') {
+    const { memo, error } = await selectMemoRow(auth.admin, id, MEMO_DETAIL_SELECT);
+    if (error) {
+      console.error('[company-memos] GET:', error);
+      return res.status(500).json({ message: 'Failed to load memo' });
+    }
+    if (!memo) {
+      return res.status(404).json({ message: 'Memo not found' });
+    }
+    res.setHeader('Cache-Control', 'private, max-age=15');
+    return res.status(200).json(memo);
+  }
 
   if (req.method === 'PATCH') {
     const parsed = normalizeUpdateBody(req.body);
@@ -165,6 +182,7 @@ export default async function handler(req, res) {
     });
 
     await invalidateHeaderTickerMemoCache();
+    invalidateListCache('dashboard-bootstrap:');
 
     return res.status(200).json(data);
   }
@@ -250,6 +268,7 @@ export default async function handler(req, res) {
     });
 
     await invalidateHeaderTickerMemoCache();
+    invalidateListCache('dashboard-bootstrap:');
 
     return res.status(200).json(data);
   }

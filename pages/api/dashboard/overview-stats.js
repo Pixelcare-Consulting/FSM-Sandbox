@@ -1,6 +1,8 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import { withSession } from '../../../lib/api/withSession';
 import {
   buildOverviewAggregates,
+  buildOverviewAggregatesFromRpc,
   fetchFollowUpStatusCounts,
   fetchJobStatusCountsGrouped,
   fetchSlimJobsForOverview,
@@ -9,7 +11,37 @@ import { getListCache, logResponseSize, setListCache } from '../../../lib/supaba
 
 const CACHE_TTL_MS = 180000;
 
-export default async function handler(req, res) {
+/** Per-instance in-flight dedupe to avoid cache stampede on concurrent misses. */
+const inFlightQueries = new Map();
+
+async function loadOverviewStatsPayload(supabase) {
+  const [followUpCounts, statusGrouped] = await Promise.all([
+    fetchFollowUpStatusCounts(supabase),
+    fetchJobStatusCountsGrouped(supabase),
+  ]);
+
+  let aggregates;
+  try {
+    aggregates = await buildOverviewAggregatesFromRpc(supabase, statusGrouped);
+  } catch (rpcError) {
+    console.warn(
+      '[overview-stats] RPC path failed, falling back to slim jobs scan:',
+      rpcError?.message || rpcError
+    );
+    const slimJobs = await fetchSlimJobsForOverview(supabase);
+    aggregates = await buildOverviewAggregates(supabase, slimJobs, statusGrouped);
+  }
+
+  return {
+    jobCount: aggregates.jobCount,
+    statusCounts: aggregates.statusCounts,
+    periods: aggregates.periods,
+    followUpCounts,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -23,31 +55,31 @@ export default async function handler(req, res) {
     return res.status(200).json(cached);
   }
 
+  const supabase = getSupabaseAdmin();
+  if (!supabase) {
+    return res.status(503).json({ error: 'Database unavailable' });
+  }
+
+  let inFlight = inFlightQueries.get(cacheKey);
+  const joinedInFlight = Boolean(inFlight);
+  if (!inFlight) {
+    inFlight = loadOverviewStatsPayload(supabase).finally(() => {
+      if (inFlightQueries.get(cacheKey) === inFlight) {
+        inFlightQueries.delete(cacheKey);
+      }
+    });
+    inFlightQueries.set(cacheKey, inFlight);
+  }
+
   try {
-    const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      return res.status(503).json({ error: 'Database unavailable' });
+    const payload = await inFlight;
+    if (!joinedInFlight) {
+      setListCache(cacheKey, payload, CACHE_TTL_MS);
     }
-
-    const [slimJobs, followUpCounts, statusGrouped] = await Promise.all([
-      fetchSlimJobsForOverview(supabase),
-      fetchFollowUpStatusCounts(supabase),
-      fetchJobStatusCountsGrouped(supabase),
-    ]);
-
-    const aggregates = await buildOverviewAggregates(supabase, slimJobs, statusGrouped);
-
-    const payload = {
-      jobCount: aggregates.jobCount,
-      statusCounts: aggregates.statusCounts,
-      periods: aggregates.periods,
-      followUpCounts,
-      fetchedAt: new Date().toISOString(),
-    };
-
-    setListCache(cacheKey, payload, CACHE_TTL_MS);
-    logResponseSize('dashboard/overview-stats', payload);
-
+    logResponseSize(
+      joinedInFlight ? 'dashboard/overview-stats (singleflight)' : 'dashboard/overview-stats',
+      payload
+    );
     return res.status(200).json(payload);
   } catch (error) {
     console.error('Dashboard overview-stats API error:', error);
@@ -55,4 +87,4 @@ export default async function handler(req, res) {
       error: error.message || 'Unable to load dashboard stats.',
     });
   }
-}
+});

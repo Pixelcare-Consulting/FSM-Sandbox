@@ -15,6 +15,13 @@ import {
   isRequestSecure,
   buildClearSessionCookies,
 } from '../../lib/auth/cookieSecurity';
+import {
+  assertLoginAllowed,
+  recordLoginFailure,
+  clearLoginAttempts,
+  LOGIN_EMAIL_REGEX,
+  normalizeLoginEmail,
+} from '../../lib/auth/loginRateLimit';
 
 const COOKIE_OPTIONS = {
   secure: true,
@@ -52,17 +59,30 @@ export default async function handler(req, res) {
     return res.status(405).json({ message: 'Method not allowed' });
   }
 
-  try {
-    const { email, password } = req.body;
-    
-    // Add request validation
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required' });
-    }
+  const { email: rawEmail, password } = req.body || {};
+  const email = normalizeLoginEmail(rawEmail);
 
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required' });
+  }
+
+  if (!LOGIN_EMAIL_REGEX.test(email)) {
+    return res.status(400).json({ message: 'Please enter a valid email address' });
+  }
+
+  const rateLimit = assertLoginAllowed(req, email);
+  if (!rateLimit.allowed) {
+    res.setHeader('Retry-After', String(rateLimit.retryAfterSeconds));
+    return res.status(429).json({
+      message: rateLimit.message,
+      retryAfterSeconds: rateLimit.retryAfterSeconds,
+    });
+  }
+
+  try {
     console.log('🔐 Server: Login request received', {
       method: req.method,
-      body: { email: req.body.email, passwordLength: req.body?.password?.length }
+      body: { email, passwordLength: password?.length }
     });
 
     console.log('🔍 Server: Attempting Supabase authentication...');
@@ -93,6 +113,7 @@ export default async function handler(req, res) {
           details: { email, reason: authError.message || 'invalid_credentials' },
           status: AUDIT_STATUS.FAILURE,
         });
+        recordLoginFailure(req, email);
         return res.status(401).json({ 
           message: authError.message || 'Invalid email or password' 
         });
@@ -107,6 +128,7 @@ export default async function handler(req, res) {
           details: { email, reason: 'no_auth_user' },
           status: AUDIT_STATUS.FAILURE,
         });
+        recordLoginFailure(req, email);
         return res.status(401).json({ message: 'Authentication failed' });
       }
 
@@ -124,6 +146,7 @@ export default async function handler(req, res) {
         code: authErr.code,
         stack: authErr.stack
       });
+      recordLoginFailure(req, email);
       return res.status(500).json({ 
         message: 'Authentication service error. Please try again.' 
       });
@@ -150,6 +173,7 @@ export default async function handler(req, res) {
           email: email
         });
         // User authenticated but no custom record - this is a configuration issue
+        recordLoginFailure(req, email);
         return res.status(500).json({ 
           message: 'User account configuration error. Please contact administrator.' 
         });
@@ -171,6 +195,7 @@ export default async function handler(req, res) {
         hint: dbError.hint,
         stack: dbError.stack
       });
+      recordLoginFailure(req, email);
       return res.status(500).json({ 
         message: 'Error retrieving user information. Please try again.' 
       });
@@ -348,6 +373,8 @@ export default async function handler(req, res) {
     }
 
 
+    clearLoginAttempts(req, email);
+
     // Return success response with connection status
     await writeAuditLogFromRequest(req, {
       userId: uid,
@@ -408,6 +435,10 @@ export default async function handler(req, res) {
       details: { reason: error.message || 'authentication_failed' },
       status: AUDIT_STATUS.FAILURE,
     });
+
+    if (email) {
+      recordLoginFailure(req, email);
+    }
 
     return res.status(401).json({
       message: 'Authentication failed',

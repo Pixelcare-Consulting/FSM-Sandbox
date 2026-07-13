@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '../../../../lib/supabase/server';
+import customerCache from '../../../../lib/utils/customerCache';
 import { siteAddressLookupKeys } from '../../../../lib/utils/siteAddressKeyAliases';
 import { updatePortalServiceLocation } from '../../../../lib/customers/updatePortalServiceLocation';
 import {
@@ -59,6 +60,8 @@ async function handlePatch(req, res) {
       fullAddress,
     });
 
+    customerCache.invalidateCustomer(customerCode);
+
     return res.status(200).json({
       success: true,
       message: 'Service location updated',
@@ -82,6 +85,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  // SAP READ-ONLY: portal service-location DELETE removes FSM `customer_location`
+  // (and related portal rows) only. Do not PATCH/DELETE SAP BPAddresses.
   try {
     const locationId = req.query.locationId ? String(req.query.locationId).trim() : '';
     if (!locationId) {
@@ -113,7 +118,7 @@ export default async function handler(req, res) {
 
     const { data: locationRow, error: locErr } = await supabase
       .from('customer_location')
-      .select('id, site_id, address_type, location_id, status, building, block')
+      .select('id, site_id, address_type, location_id, building, block')
       .eq('id', locationId)
       .eq('customer_id', customer.id)
       .maybeSingle();
@@ -227,6 +232,8 @@ export default async function handler(req, res) {
       changes: diffSnapshots(beforeSnapshot, buildLocationDeleteSnapshot(null, null)),
       status: AUDIT_STATUS.SUCCESS,
     });
+
+    customerCache.invalidateCustomer(customerCode);
 
     return res.status(200).json({
       success: true,

@@ -139,39 +139,12 @@ export const formatTimeRemaining = (timeRemaining) => {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 };
 
-export function initializeSessionTimer(setTimeRemaining) {
-  console.log('🎬 Initializing session timer...');
-  
-  const updateTimer = () => {
-    // Get expiry from cookie instead of localStorage
-    const expiryTime = Cookies.get('B1SESSION_EXPIRY');
-    
-    if (!expiryTime) {
-      console.warn('⚠️ No session expiry cookie found');
-      return;
-    }
-
-    const remaining = new Date(expiryTime).getTime() - Date.now();
-    const formattedTime = formatTimeRemaining(remaining);
-    
-    console.log(`⏱️ Timer update: ${formattedTime} (${remaining}ms remaining)`);
-    setTimeRemaining(formattedTime);
-    
-    // Update DOM attribute for global access
-    document.body.setAttribute('data-session-time', formattedTime);
-  };
-
-  // Run initial update
-  updateTimer();
-
-  // Set up interval for updates
-  const timerInterval = setInterval(updateTimer, 1000);
-
-  // Cleanup
-  return () => {
-    console.log('🧹 Timer cleanup completed');
-    clearInterval(timerInterval);
-  };
+/**
+ * @deprecated Session renewal is owned by ActivityTracker in pages/_app.js.
+ * Do not import in new code.
+ */
+export function initializeSessionTimer(_setTimeRemaining) {
+  return () => {};
 }
 
 export async function logActivity(activity, details = {}) {
@@ -198,134 +171,12 @@ export async function logActivity(activity, details = {}) {
 }
 
 // Initialize session renewal check
-export const initializeSessionRenewalCheck = (router) => {
-  console.log('🚀 Initializing session renewal check');
-  let isRenewing = false;
-  
-  const updateTimerDisplay = () => {
-    const expiryTime = Cookies.get('B1SESSION_EXPIRY');
-    
-    // Silently return if no expiry found - prevents console spam during page transitions
-    if (!expiryTime) {
-      return;
-    }
-
-    const timeUntilExpiry = new Date(expiryTime).getTime() - Date.now();
-    const formattedTime = formatTimeRemaining(timeUntilExpiry);
-    document.body.setAttribute('data-session-time', formattedTime);
-  };
-
-  const checkSession = async () => {
-    const expiryTime = Cookies.get('B1SESSION_EXPIRY');
-    
-    // Silently return if no expiry found - prevents console spam
-    if (!expiryTime) {
-      return;
-    }
-
-    const timeUntilExpiry = new Date(expiryTime).getTime() - Date.now();
-
-    // Check if renewal is needed and not already renewing
-    if (timeUntilExpiry < 5 * 60 * 1000 && !isRenewing) {
-      try {
-        isRenewing = true;
-        const toastId = toast.loading('Renewing session...', {
-          position: 'bottom-right'
-        });
-        
-        const response = await fetch('/api/renewSAPB1Session', {
-          method: 'POST',
-          credentials: 'include'
-        });
-
-        if (!response.ok) {
-          throw new Error('Session renewal failed');
-        }
-
-        const data = await response.json();
-        if (data.success) {
-          // Immediately update the cookie value using response data to avoid race conditions
-          // Match server's security settings (only Secure if HTTPS)
-          if (data.expiryTime) {
-            const expiryDate = new Date(data.expiryTime);
-            const isSecure = window.location.protocol === 'https:';
-            Cookies.set('B1SESSION_EXPIRY', expiryDate.toISOString(), {
-              expires: expiryDate,
-              secure: isSecure, // Only set Secure flag if actually over HTTPS
-              sameSite: 'lax',
-              path: '/'
-            });
-            console.log('🔄 Updated client-side expiry cookie:', expiryDate.toISOString());
-            
-            // Immediately update timer display with new expiry
-            updateTimerDisplay();
-          }
-          
-          toast.success('Session renewed successfully', {
-            id: toastId,
-            position: 'bottom-right',
-            duration: 3000,
-            icon: '✅',
-            style: {
-              borderRadius: '10px',
-              background: '#333',
-              color: '#fff',
-            },
-          });
-          
-          // Add delay before allowing re-check to ensure browser processes cookies
-          setTimeout(() => {
-            isRenewing = false;
-          }, 500); // 500ms delay for cookie propagation
-        } else {
-          // Reset flag even if renewal didn't succeed (but wasn't an error)
-          isRenewing = false;
-        }
-      } catch (error) {
-        console.error('❌ Session renewal error:', error);
-        
-        // Only trigger logout on actual errors, not on network issues during renewal
-        // Check if session cookie still exists before logging out
-        const expiryTime = Cookies.get('B1SESSION_EXPIRY');
-        if (!expiryTime) {
-          // Only logout if cookie is completely missing
-          toast.error('Failed to renew session', {
-            position: 'bottom-right',
-            duration: 3000,
-            icon: '❌',
-            style: {
-              borderRadius: '10px',
-              background: '#333',
-              color: '#fff',
-            },
-          });
-          isRenewing = false;
-          handleSessionError(router);
-        } else {
-          // Session still exists, just renewal failed - allow retry
-          console.log('⚠️ Renewal failed but session still valid, will retry');
-          isRenewing = false;
-        }
-      }
-    }
-  };
-
-  // Update display every second
-  const displayInterval = setInterval(updateTimerDisplay, 1000);
-  
-  // Check session every 30 seconds
-  const checkInterval = setInterval(checkSession, 30 * 1000);
-  
-  // Initial calls
-  updateTimerDisplay();
-  checkSession();
-
-  // Return cleanup function
-  return () => {
-    console.log('🧹 Cleaning up intervals');
-    clearInterval(displayInterval);
-    clearInterval(checkInterval);
-  };
+/**
+ * @deprecated Session renewal is owned by ActivityTracker in pages/_app.js.
+ * Do not import in new code.
+ */
+export const initializeSessionRenewalCheck = (_router) => {
+  return () => {};
 };
 
 /**

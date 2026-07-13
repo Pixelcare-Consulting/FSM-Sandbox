@@ -2,8 +2,10 @@
 .schedulerPageRoot {
   --daily-slot-width: 100px;
   --daily-timeline-width: calc(48 * var(--daily-slot-width)); /* 4800px */
-  --scheduler-sticky-toolbar-h: 56px;
-  --scheduler-sticky-offset: var(--scheduler-sticky-toolbar-h);
+  --scheduler-sticky-toolbar-h: 80px;
+  --scheduler-sticky-offset: calc(
+    var(--dashboard-sticky-header-height, 0px) + var(--scheduler-sticky-toolbar-h)
+  );
   display: flex;
   flex-direction: column;
   width: 100%;
@@ -21,11 +23,15 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
-/* Day/Week: content flows at natural height; page scroll drives vertical movement */
+/* Day/Week: content flows at natural height; page scroll drives vertical movement.
+   min-width:0 constrains the flex chain so wide grids scroll inside their wrappers;
+   do NOT set overflow-x:hidden here — it breaks position:sticky on timeline headers. */
 .schedulerBodyFlow {
   flex: 1 1 auto;
+  min-width: 0;
   overflow: visible;
 }
 
@@ -35,18 +41,26 @@
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
-  padding-bottom: 12px;
+  padding-top: 14px;
+  padding-bottom: 16px;
   border-bottom: 1px solid #e2e8f0;
   flex-wrap: wrap;
   position: sticky;
-  top: 0;
+  top: var(--dashboard-sticky-header-height, 0px);
   z-index: 30;
-  background: #fff;
-  box-shadow: 0 1px 0 0 #e2e8f0;
+  background-color: #fff;
+  isolation: isolate;
+  box-shadow:
+    0 -10px 0 0 #fff,
+    0 4px 8px -2px rgba(15, 23, 42, 0.1),
+    0 1px 0 0 #e2e8f0;
 }
 
+/* Day/Week: extend opaque backdrop into schedulerContainer padding; extra vertical buffer for scroll bleed */
 .schedulerBodyFlow .toolbar {
-  margin-bottom: 0;
+  margin: -14px -10px 0;
+  padding: 30px 10px 24px;
+  border-bottom: 1px solid #e2e8f0;
 }
 
 .toolbarLeft {
@@ -68,7 +82,7 @@
   width: max-content;
   min-width: 100%;
   position: sticky;
-  top: 56px;
+  top: var(--scheduler-sticky-offset);
   z-index: 14;
   background: #f8fafc;
   border-bottom: 1px solid #e2e8f0;
@@ -167,13 +181,16 @@
   position: sticky;
   top: var(--scheduler-sticky-offset);
   z-index: 25;
-  background: #f9fafb;
+  background-color: #f9fafb;
   border: 1px solid #e5e7eb;
   border-bottom: none;
   border-radius: 8px 8px 0 0;
   margin-top: -1px;
   margin-bottom: 0;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.06), 0 1px 0 0 #f9fafb;
+  padding-bottom: 2px;
+  box-shadow:
+    0 4px 8px -2px rgba(15, 23, 42, 0.1),
+    0 1px 0 0 #f9fafb;
   isolation: isolate;
 }
 
@@ -264,6 +281,47 @@
   outline: none;
   border-color: #93c5fd;
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.datePickerGroup {
+  position: relative;
+  display: inline-flex;
+}
+
+.dateDisplayBtn {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  color: #1e293b;
+  background: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+  min-width: 10.5rem;
+  text-align: center;
+}
+
+.dateDisplayBtn:hover {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+}
+
+.dateDisplayBtn:focus {
+  outline: none;
+  border-color: #93c5fd;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.hiddenDateInput {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .btn {
@@ -880,35 +938,102 @@
   margin-bottom: 4px;
 }
 
-/* Job detail modal — two-column layout */
+/* Job detail modal — capped height, flex scroll body */
+.jobDetailPortalModal :global(.modal-dialog) {
+  max-width: min(1140px, calc(100vw - 2rem));
+  max-height: 88vh;
+  margin-left: auto;
+  margin-right: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.jobDetailModalContent {
+  display: flex;
+  flex-direction: column;
+  max-height: 88vh;
+  min-height: 0;
+  overflow: hidden;
+  overflow-x: hidden;
+}
+
+.jobDetailPortalModal :global(.portal-modal-header) {
+  flex-shrink: 0;
+  position: relative;
+  align-items: flex-start !important;
+  flex-wrap: nowrap !important;
+  padding: 0.75rem 2.75rem 0.75rem 1rem !important;
+}
+
+.jobDetailPortalModal :global(.portal-modal-header) :global(.btn-close) {
+  position: absolute !important;
+  top: 0.75rem !important;
+  right: 0.75rem !important;
+  margin: 0 !important;
+  z-index: 1;
+}
+
+.jobDetailPortalModal :global(.portal-modal-title-row) {
+  width: 100%;
+  min-width: 0;
+}
+
+.jobDetailPortalModal :global(.portal-modal-footer) {
+  flex-shrink: 0;
+  padding: 0.6rem 1rem !important;
+}
+
+.jobDetailModalHeader {
+  gap: 0.35rem;
+}
+
 .jobDetailModalBody {
-  padding-top: 0.75rem !important;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0.5rem 1rem 0.75rem !important;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .jobDetailModalLayout {
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 0.875rem;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .jobDetailColumns {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 1.25rem;
-  align-items: start;
+  gap: 0.875rem;
+  align-items: stretch;
 }
 
 .jobDetailColLeft,
 .jobDetailColRight {
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 0.75rem;
   min-width: 0;
 }
 
 .jobDetailColRight {
-  padding-left: 1.25rem;
+  padding-left: 1rem;
   border-left: 1px solid #e2e8f0;
+}
+
+.jobDetailColRight .jobDetailBlock {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.jobDetailColRight .jobDetailLocationPanel {
+  flex: 1;
+  min-height: 0;
 }
 
 .jobDetailDescSection {
@@ -1061,11 +1186,12 @@
 .jobDetailLocationPanel {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  padding: 0.875rem;
+  gap: 0.5rem;
+  padding: 0.65rem;
   border-radius: 12px;
   border: 1px solid #e2e8f0;
   background: #fff;
+  min-height: 0;
 }
 
 .jobDetailLocationEmpty {
@@ -1082,7 +1208,15 @@
   border: 1px solid #e2e8f0;
   background: #f1f5f9;
   aspect-ratio: 4 / 3;
-  min-height: 200px;
+  min-height: 240px;
+  max-height: min(360px, 42vh);
+}
+
+.jobDetailColRight .jobDetailMapWrap {
+  flex: 1 1 auto;
+  min-height: 240px;
+  max-height: none;
+  aspect-ratio: auto;
 }
 
 .jobDetailMapFrame {
@@ -1099,26 +1233,9 @@
   opacity: 1;
 }
 
-.jobDetailMapPlaceholder,
 .jobDetailMapSkeleton {
   position: absolute;
   inset: 0;
-}
-
-.jobDetailMapPlaceholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #f1f5f9;
-}
-
-.jobDetailMapPlaceholderText {
-  font-size: 0.8125rem;
-  font-weight: 600;
-  color: #94a3b8;
-}
-
-.jobDetailMapSkeleton {
   background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
   background-size: 200% 100%;
   animation: jobDetailMapShimmer 1.2s ease-in-out infinite;
@@ -1156,10 +1273,12 @@
 }
 
 .jobDetailHeaderMeta {
-  display: inline-flex;
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem 0.75rem;
+  width: 100%;
+  min-width: 0;
 }
 
 .jobDetailHeaderTime {
@@ -1175,6 +1294,105 @@
   opacity: 0.85;
 }
 
+.jobDetailHeaderMetaGroup {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
+}
+
+.jobDetailHeaderEditAction {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #475569;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.jobDetailHeaderEditAction:hover:not(:disabled) {
+  border-color: #93c5fd;
+  background: #f8fafc;
+  color: #2563eb;
+}
+
+.jobDetailHeaderEditAction:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.jobDetailHeaderDuration {
+  font-size: 0.8125rem;
+  color: #64748b;
+}
+
+.schedulerEditModalBody {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.schedulerStatusOption {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.schedulerStatusOptionDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.schedulerScheduleSection {
+  margin: 0;
+}
+
+.schedulerScheduleSectionTitle {
+  margin: 0 0 0.25rem;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.schedulerScheduleSectionHint {
+  margin: 0 0 0.75rem;
+  font-size: 0.8125rem;
+  color: #64748b;
+  line-height: 1.4;
+}
+
+.schedulerScheduleTimeRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.schedulerScheduleDivider {
+  height: 1px;
+  margin: 0.75rem 0 1rem;
+  background: #e2e8f0;
+}
+
+.schedulerEditValidation {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.8125rem;
+  color: #b91c1c;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+
 .jobDetailHero {
   padding-bottom: 0;
 }
@@ -1182,21 +1400,21 @@
 .jobDetailHeroTitle {
   flex: 1;
   min-width: 0;
-  margin: 0 0 0.35rem;
-  font-size: 1.125rem;
+  margin: 0 0 0.2rem;
+  font-size: 1.0625rem;
   font-weight: 600;
-  line-height: 1.35;
+  line-height: 1.3;
   color: #0f172a;
 }
 
 .jobDetailHeroIdentifiers {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem 1.25rem;
+  gap: 0.25rem 1rem;
   width: 100%;
-  margin: 0 0 0.35rem;
+  margin: 0 0 0.2rem;
   font-size: 0.8125rem;
-  line-height: 1.4;
+  line-height: 1.35;
   color: #475569;
 }
 
@@ -1212,12 +1430,12 @@
 }
 
 .jobDetailHeroAssignedCard {
-  margin-top: 0.65rem;
+  margin-top: 0.4rem;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.6rem 0.75rem;
-  border-radius: 12px;
+  gap: 0.3rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 10px;
   border: 1px solid #e2e8f0;
   background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
@@ -1298,6 +1516,7 @@
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  min-width: 0;
 }
 
 .jobDetailBlockTitle {
@@ -1312,8 +1531,8 @@
 .jobDetailContactCard {
   display: flex;
   flex-direction: column;
-  gap: 0.875rem;
-  padding: 1rem;
+  gap: 0.65rem;
+  padding: 0.75rem;
   border-radius: 12px;
   border: 1px solid #e2e8f0;
   background: #fff;
@@ -1474,6 +1693,8 @@
   font-size: 0.8125rem;
   margin-top: 0.25rem;
   line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .jobStatusPill {
@@ -1513,14 +1734,14 @@
 }
 
 .jobDetailDescription {
-  padding: 0.875rem 1rem;
+  padding: 0.65rem 0.75rem;
   border-radius: 10px;
   border: 1px solid #e2e8f0;
   background: #fafafa;
   font-size: 0.875rem;
   color: #475569;
-  line-height: 1.55;
-  max-height: min(220px, 32vh);
+  line-height: 1.5;
+  max-height: min(140px, 18vh);
   overflow-y: auto;
 }
 
@@ -1630,26 +1851,77 @@
   border-color: #2563eb !important;
 }
 
-@media (max-width: 767px) {
+@media (max-width: 991px) {
   .jobDetailColumns {
     grid-template-columns: 1fr;
-    gap: 1rem;
+    gap: 0.75rem;
   }
 
   .jobDetailColRight {
     padding-left: 0;
     border-left: none;
-    padding-top: 0;
-    border-top: none;
+    padding-top: 0.65rem;
+    border-top: 1px solid #e2e8f0;
+  }
+
+  .jobDetailColRight .jobDetailBlock,
+  .jobDetailColRight .jobDetailLocationPanel {
+    flex: 0 1 auto;
+  }
+
+  .jobDetailColRight .jobDetailMapWrap {
+    flex: 0 0 auto;
+    aspect-ratio: 16 / 10;
+    max-height: min(300px, 36vh);
+  }
+}
+
+@media (max-width: 767px) {
+  .jobDetailPortalModal :global(.modal-dialog) {
+    max-width: calc(100vw - 1rem);
+    max-height: 90vh;
+    margin: 0.5rem auto;
+  }
+
+  .jobDetailModalContent {
+    max-height: 90vh;
+  }
+
+  .jobDetailModalBody {
+    padding: 0.45rem 0.875rem 0.65rem !important;
+  }
+
+  .jobDetailHeaderMeta {
+    gap: 0.35rem;
+  }
+
+  .jobDetailHeaderMetaGroup {
+    flex: 1 1 auto;
+    min-width: min(100%, 12rem);
+  }
+
+  .jobDetailHeaderDuration {
+    flex: 1 1 100%;
   }
 
   .jobDetailDescSection {
     border-top: 1px solid #e2e8f0;
-    padding-top: 1rem;
+    padding-top: 0.65rem;
+  }
+
+  .jobDetailDescription {
+    max-height: min(120px, 16vh);
   }
 
   .jobDetailMapWrap {
-    min-height: 180px;
+    aspect-ratio: 16 / 10;
+    max-height: min(280px, 34vh);
+    min-height: 200px;
+  }
+
+  .jobDetailColRight .jobDetailMapWrap {
+    max-height: min(300px, 36vh);
+    min-height: 200px;
   }
 
   .jobDetailContactRow {
@@ -1661,8 +1933,69 @@
     padding-left: 2.75rem;
   }
 
+  .jobDetailHeroTop {
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
   .jobDetailHeroTitle {
     font-size: 1rem;
+    flex: 1 1 100%;
+  }
+
+  .jobDetailHeroReassign {
+    margin-top: 0;
+  }
+
+  .jobDetailLocationPanel {
+    padding: 0.55rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .jobDetailPortalModal :global(.modal-dialog) {
+    max-width: calc(100vw - 0.5rem);
+    max-height: 92vh;
+    margin: 0.25rem auto;
+  }
+
+  .jobDetailModalContent {
+    max-height: 92vh;
+  }
+
+  .jobDetailPortalModal :global(.portal-modal-header) {
+    padding: 0.6rem 2.5rem 0.6rem 0.75rem !important;
+  }
+
+  .jobDetailPortalModal :global(.portal-modal-header) :global(.btn-close) {
+    top: 0.6rem !important;
+    right: 0.6rem !important;
+  }
+
+  .jobDetailPortalModal :global(.portal-modal-footer) {
+    padding: 0.5rem 0.75rem !important;
+  }
+
+  .jobDetailHeaderMetaGroup {
+    min-width: 100%;
+  }
+
+  .jobDetailHeaderEditAction {
+    flex: 0 0 auto;
+  }
+
+  .jobDetailMapWrap {
+    max-height: min(240px, 30vh);
+    min-height: 180px;
+  }
+
+  .jobDetailColRight .jobDetailMapWrap {
+    max-height: min(260px, 32vh);
+    min-height: 180px;
+  }
+
+  .jobDetailDescription {
+    max-height: min(100px, 14vh);
   }
 }
 
@@ -1844,25 +2177,37 @@
   top: var(--scheduler-sticky-offset);
   /* Above .dailyJobCard stack (was 15; cards used inline z-index 10–2000 and painted over the header on scroll) */
   z-index: 25;
-  background: #f9fafb;
+  background-color: #f9fafb;
   border-bottom: none;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08), 0 1px 0 0 #f9fafb;
+  box-shadow:
+    0 4px 8px -2px rgba(15, 23, 42, 0.1),
+    0 1px 0 0 #f9fafb;
   margin-top: -1px;
   margin-bottom: 0;
+  padding-bottom: 2px;
   isolation: isolate;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .dailyViewHeaderScroll {
-  /* JS keeps scrollLeft in sync with .dailyViewGridWrapper — both areas show a scrollbar */
+  /* JS syncs scrollLeft with .dailyViewGridWrapper — scrollbar here stays visible below time slots (sticky header) */
   overflow-x: auto;
   overflow-y: hidden;
   border: 1px solid #e5e7eb;
   border-bottom: none;
   border-radius: 8px 8px 0 0;
-  display: flex;
+  display: grid;
+  grid-template-columns: 200px max-content;
+  grid-template-rows: auto auto;
+  align-items: stretch;
   width: 100%;
+  min-width: 0;
   min-height: 0;
   background: #f9fafb;
+  -webkit-overflow-scrolling: touch;
+  scroll-behavior: auto;
 }
 
 .dailyViewHeaderScroll::-webkit-scrollbar {
@@ -1880,39 +2225,75 @@
   background: #6b7280;
 }
 
-/* Horizontal scroll synced with header; scrollbar shown below so timeline is scrollable when header is out of view */
+/* Horizontal scroll synced with header; scrollbar hidden here (lives on sticky header above) */
 .dailyViewGridWrapper {
   position: relative;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
   overflow-y: visible;
+  -webkit-overflow-scrolling: touch;
   border: 1px solid #e5e7eb;
   border-top: none;
   border-radius: 0 0 8px 8px;
   margin-top: 0;
-  /* One clear scrollport for horizontal sticky (worker column) */
+  scrollbar-width: none;
   scroll-behavior: auto;
 }
 .dailyViewGridWrapper::-webkit-scrollbar {
-  height: 10px;
-}
-.dailyViewGridWrapper::-webkit-scrollbar-track {
-  background: #f3f4f6;
-  border-radius: 4px;
-}
-.dailyViewGridWrapper::-webkit-scrollbar-thumb {
-  background: #9ca3af;
-  border-radius: 4px;
-}
-.dailyViewGridWrapper::-webkit-scrollbar-thumb:hover {
-  background: #6b7280;
+  display: none;
+  height: 0;
 }
 
-.dailyViewWorkerLabel {
+.dailyViewDateCell {
+  grid-row: 1;
+  grid-column: 1;
   width: 200px;
   min-width: 200px;
   max-width: 200px;
   box-sizing: border-box;
-  padding: 8px;
+  padding: 6px 8px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 13px;
+  color: #374151;
+  background: #f9fafb;
+  border-right: 2px solid #e5e7eb;
+  border-bottom: 1px solid #e5e7eb;
+  position: sticky;
+  left: 0;
+  z-index: 19;
+  white-space: nowrap;
+  line-height: 1.2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 2px 0 4px rgba(0, 0, 0, 0.06);
+}
+
+.dailyViewDateCell.todayHeader {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.dailyViewDateSpacer {
+  grid-row: 1;
+  grid-column: 2;
+  width: var(--daily-timeline-width);
+  min-width: var(--daily-timeline-width);
+  background: #f9fafb;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.dailyViewWorkerLabel {
+  grid-row: 2;
+  grid-column: 1;
+  width: 200px;
+  min-width: 200px;
+  max-width: 200px;
+  box-sizing: border-box;
+  padding: 6px 8px;
   font-size: 12px;
   font-weight: 700;
   color: #374151;
@@ -1927,8 +2308,6 @@
   position: sticky;
   left: 0;
   z-index: 18;
-  flex-shrink: 0;
-  align-self: stretch;
   box-shadow: 2px 0 4px rgba(0, 0, 0, 0.06);
 }
 
@@ -1974,32 +2353,13 @@
   font-size: 9px;
 }
 
-.dailyViewDateAndTime {
-  display: flex;
-  flex-direction: column;
-  min-width: var(--daily-timeline-width);
-  flex-shrink: 0;
-}
-
-.dailyViewDateText {
-  padding: 8px 8px;
-  text-align: center;
-  font-weight: 700;
-  font-size: 14px;
-  color: #374151;
-  background: #f9fafb;
-  border-bottom: 1px solid #e5e7eb;
-}
-
-.dailyViewDateText.todayHeader {
-  background: #eff6ff;
-  color: #1d4ed8;
-}
-
 .dailyViewTimeSlots {
+  grid-row: 2;
+  grid-column: 2;
   display: grid;
   grid-template-columns: repeat(24, calc(2 * var(--daily-slot-width)));
   width: var(--daily-timeline-width);
+  min-width: var(--daily-timeline-width);
   background: #f9fafb;
   min-height: 40px;
 }
@@ -2019,8 +2379,11 @@
 
 /* Weekly View Styles - Like Month View but Weekly */
 .weeklyWrapper {
+  width: 100%;
+  max-width: 100%;
   overflow-x: auto; /* Scroll entire timeline together */
   overflow-y: visible;
+  -webkit-overflow-scrolling: touch;
   border: none;
   border-radius: 0;
   height: auto;
@@ -2051,7 +2414,7 @@
   border-bottom: 2px solid #e5e7eb;
   background: #f9fafb;
   position: sticky;
-  top: 56px; /* Below sticky toolbar */
+  top: var(--scheduler-sticky-offset);
   z-index: 14;
   min-width: var(--daily-timeline-width); /* Match timeline width */
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.06);
@@ -2377,7 +2740,7 @@
 
 .weeklyWorkerHeader {
   position: sticky;
-  top: 56px; /* Below sticky toolbar */
+  top: var(--scheduler-sticky-offset);
   left: 0;
   z-index: 15;
   background: #f9fafb;
@@ -2402,7 +2765,7 @@
   font-size: 13px;
   color: #374151;
   position: sticky;
-  top: 56px; /* Below sticky toolbar */
+  top: var(--scheduler-sticky-offset);
   z-index: 14;
 }
 

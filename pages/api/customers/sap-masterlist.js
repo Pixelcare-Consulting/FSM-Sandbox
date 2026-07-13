@@ -32,10 +32,16 @@ export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'private, max-age=300');
 
   const cacheKey = 'customers-sap-masterlist';
-  const cached = getListCache(cacheKey, CACHE_TTL_MS);
-  if (cached) {
-    logResponseSize('customers/sap-masterlist (cached)', cached);
-    return res.status(200).json(cached);
+  const skipCache =
+    req.query.refresh === '1' ||
+    req.query.refresh === 'true' ||
+    req.query.refresh === 'yes';
+  if (!skipCache) {
+    const cached = getListCache(cacheKey, CACHE_TTL_MS);
+    if (cached) {
+      logResponseSize('customers/sap-masterlist (cached)', cached);
+      return res.status(200).json(cached);
+    }
   }
 
   const supabase = getSupabaseAdmin();
@@ -61,6 +67,7 @@ export default async function handler(req, res) {
         email: r.email || '',
         phone_number: r.phone_number || '',
         customer_address: r.customer_address || '',
+        sap_card_code: r.sap_card_code || null,
       });
     }
 

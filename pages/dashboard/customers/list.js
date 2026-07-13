@@ -18,6 +18,9 @@ import {
 } from 'react-bootstrap-icons';
 import { GeeksSEO, PageHeading } from 'widgets'
 import moment from 'moment';
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from 'sub-components/dashboard/DashboardListStickySearch';
 import {
   Search, 
   Filter as FeatherFilter,
@@ -49,6 +52,7 @@ import SapDeltaSyncPreviewModal from '../../../components/customers/SapDeltaSync
 import { useSapDeltaSync } from '../../../hooks/useSapDeltaSync';
 import { useQueryClient } from 'react-query';
 import { useCustomersListQuery } from '../../../hooks/queries/useCustomersListQuery';
+import { useEnterToSearch } from '../../../hooks/useEnterToSearch';
 
 
 // Define flag components for each country
@@ -1142,16 +1146,24 @@ const ViewCustomers = () => {
     contractStatus: '',
     country: '',
     status: '',
-    globalSearch: '' // Global search across all fields
   });
+
+  const {
+    draft: globalSearchDraft,
+    setDraft: setGlobalSearchDraft,
+    applied: globalSearchApplied,
+    clear: clearGlobalSearch,
+    applyValue: applyGlobalSearchValue,
+    onKeyDown: onGlobalSearchKeyDown,
+  } = useEnterToSearch();
 
   const customersQueryParams = useMemo(
     () => ({
       page: currentPage,
       limit: perPage,
-      search: filters.globalSearch || '',
+      search: globalSearchApplied || '',
     }),
-    [currentPage, perPage, filters.globalSearch]
+    [currentPage, perPage, globalSearchApplied]
   );
 
   const {
@@ -1189,19 +1201,19 @@ const ViewCustomers = () => {
   // Reset to page 1 when search changes
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (filters.globalSearch && data.length > 0) {
+    if (globalSearchApplied && data.length > 0) {
       const filteredPages = Math.ceil(data.length / perPage);
       if (currentPage > filteredPages && filteredPages > 0) {
         setCurrentPage(1);
       }
-    } else if (!filters.globalSearch) {
+    } else if (!globalSearchApplied) {
       // Reset to page 1 when search is cleared
       const totalPages = Math.ceil(totalRows / perPage);
       if (currentPage > totalPages && totalPages > 0) {
         setCurrentPage(1);
       }
     }
-  }, [filters.globalSearch, data.length, perPage, currentPage, totalRows]);
+  }, [globalSearchApplied, data.length, perPage, currentPage, totalRows]);
 
   // Add ref to track component mount status
   const isMountedRef = useRef(true);
@@ -1711,6 +1723,8 @@ const ViewCustomers = () => {
   const {
     syncCode: syncCustomerCode,
     setSyncCode: setSyncCustomerCode,
+    portalCustomerCode: syncPortalCustomerCode,
+    setPortalCustomerCode: setSyncPortalCustomerCode,
     isSyncingDelta,
     syncDeltaError,
     syncDeltaSummary,
@@ -1735,17 +1749,31 @@ const ViewCustomers = () => {
       }
 
       const successDetail = wasPromotion
-        ? `Promoted ${summary.promotion?.from} → ${summary.promotion?.to}. Re-sync jobs to SAP if they were created under the old CP code.`
+        ? summary.promotion?.from && summary.promotion?.to
+          ? `Promoted ${summary.promotion.from} → ${summary.promotion.to}`
+          : 'Portal customer promoted to official SAP C code'
         : normalizedCode
           ? `SAP sync: ${normalizedCode} (${customersWritten} masterlist row${customersWritten === 1 ? '' : 's'})`
           : 'SAP delta sync completed';
-      toast.success(successDetail, {
-        id: loadingToastId,
-        style: {
-          ...TOAST_STYLES.BASE,
-          ...TOAST_STYLES.SUCCESS,
-        },
-      });
+      toast.success(
+        wasPromotion ? (
+          <div>
+            <div>{successDetail}</div>
+            <div style={{ fontSize: '0.9em', marginTop: '4px', opacity: 0.9 }}>
+              Jobs stay linked on the same customer record. Re-sync jobs to SAP if they were created under the old CP code.
+            </div>
+          </div>
+        ) : (
+          successDetail
+        ),
+        {
+          id: loadingToastId,
+          style: {
+            ...TOAST_STYLES.BASE,
+            ...TOAST_STYLES.SUCCESS,
+          },
+        }
+      );
       if (summaryErrors.length > 0) {
         toast.error(summaryErrors.slice(0, 2).join(' · '), { duration: 8000 });
       }
@@ -1756,14 +1784,14 @@ const ViewCustomers = () => {
         ? summary.promotion?.to || normalizedCode
         : normalizedCode;
       if (searchCode) {
-        setFilters((prev) => ({ ...prev, globalSearch: searchCode }));
+        applyGlobalSearchValue(searchCode);
       }
     },
   });
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [filters.globalSearch, perPage]);
+  }, [globalSearchApplied, perPage]);
 
   const handlePageChange = (page) => {
     setCurrentPage(page);
@@ -1787,7 +1815,7 @@ const ViewCustomers = () => {
         <div>
           <div className="fw-bold">View Updated Successfully</div>
           <small>Now showing {newPerPage} entries per page</small>
-          {filters.globalSearch && (
+          {globalSearchApplied && (
             <small className="d-block mt-1">
               <i className="fas fa-filter me-1"></i>
               Showing {data.length} filtered result{data.length !== 1 ? 's' : ''}
@@ -1828,7 +1856,6 @@ const ViewCustomers = () => {
   const handleClearFilters = async () => {
     try {
       // Keep global search as it has its own clear button
-      const currentGlobalSearch = filters.globalSearch;
       setFilters({
         customerCode: '',
         customerName: '',
@@ -1837,7 +1864,6 @@ const ViewCustomers = () => {
         contractStatus: '',
         country: '',
         status: '',
-        globalSearch: currentGlobalSearch // Preserve global search
       });
       setCurrentPage(1);
       setInitialLoad(true);
@@ -2098,26 +2124,7 @@ const ViewCustomers = () => {
                   >
                     Service locations and account fields loaded from the migrated Supabase masterlist (fast local query).
                   </p>
-                  <div 
-                    className="d-flex align-items-center gap-2 flex-wrap"
-                    style={{
-                      fontSize: '14px',
-                      color: 'rgba(255, 255, 255, 0.9)',
-                      background: 'rgba(255, 255, 255, 0.1)',
-                      padding: '8px 12px',
-                      borderRadius: '6px',
-                      marginTop: '8px'
-                    }}
-                  >
-                    <i className="fe fe-info" style={{ fontSize: '16px' }}></i>
-                    <span>
-                      View-only. Need the legacy live SAP merge (slow)?{' '}
-                      <Link href="/customers/sap-api" className="text-white text-decoration-underline fw-semibold">
-                        Open SAP API customer list
-                      </Link>
-                      .
-                    </span>
-                  </div>
+                  
                 </div>
 
                 {/* Badges */}
@@ -2196,32 +2203,41 @@ const ViewCustomers = () => {
                     </span>
                   )}
                 </div>
-                <div className="d-flex gap-2">
+                <div className="d-flex flex-column gap-2">
+                  <div className="d-flex gap-2">
+                    <Form.Control
+                      value={syncCustomerCode}
+                      onChange={(e) => setSyncCustomerCode(String(e.target.value || '').toUpperCase())}
+                      placeholder="SAP CardCode e.g. C004312"
+                      size="sm"
+                      disabled={isSyncingDelta}
+                    />
+                    <Button
+                      variant="light"
+                      size="sm"
+                      onClick={openSyncPreview}
+                      disabled={isSyncingDelta}
+                      className="d-flex align-items-center gap-1"
+                      style={{ whiteSpace: 'nowrap' }}
+                    >
+                      {isSyncingDelta ? (
+                        <Spinner animation="border" size="sm" />
+                      ) : (
+                        <RefreshCw size={14} />
+                      )}
+                      Sync
+                    </Button>
+                  </div>
                   <Form.Control
-                    value={syncCustomerCode}
-                    onChange={(e) => setSyncCustomerCode(String(e.target.value || '').toUpperCase())}
-                    placeholder="SAP CardCode e.g. C004312"
+                    value={syncPortalCustomerCode}
+                    onChange={(e) => setSyncPortalCustomerCode(String(e.target.value || '').toUpperCase())}
+                    placeholder="Portal CP code (optional) e.g. CP00125"
                     size="sm"
                     disabled={isSyncingDelta}
                   />
-                  <Button
-                    variant="light"
-                    size="sm"
-                    onClick={openSyncPreview}
-                    disabled={isSyncingDelta}
-                    className="d-flex align-items-center gap-1"
-                    style={{ whiteSpace: 'nowrap' }}
-                  >
-                    {isSyncingDelta ? (
-                      <Spinner animation="border" size="sm" />
-                    ) : (
-                      <RefreshCw size={14} />
-                    )}
-                    Sync
-                  </Button>
                 </div>
-                <small className="d-block mt-2" style={{ color: 'rgba(255, 255, 255, 0.88)', display: 'none' }}>
-                  Official SAP C codes auto-promote matching portal CP customers in place. Leave SAP blank to sync customers/leads changed in the last 14 days.
+                <small className="d-block mt-2" style={{ color: 'rgba(255, 255, 255, 0.88)' }}>
+                  Official SAP C codes auto-promote matching synced portal CP customers in place (same customer record; jobs stay linked). Use Portal CP code when auto-match fails. Leave SAP blank to sync customers/leads changed in the last 14 days.
                 </small>
                 {syncDeltaError && (
                   <small className="d-block mt-1" style={{ color: '#FCA5A5' }}>
@@ -2230,6 +2246,13 @@ const ViewCustomers = () => {
                 )}
                 {syncDeltaSummary && (
                   <small className="d-block mt-1" style={{ color: 'rgba(255, 255, 255, 0.92)' }}>
+                    {syncDeltaSummary.mode === 'promotion' &&
+                    syncDeltaSummary.promotion?.from &&
+                    syncDeltaSummary.promotion?.to ? (
+                      <span className="d-block mb-1" style={{ fontWeight: 600 }}>
+                        Promoted {syncDeltaSummary.promotion.from} → {syncDeltaSummary.promotion.to}
+                      </span>
+                    ) : null}
                     SAP hits: {syncDeltaSummary?.counts?.sapHits || 0}, DB written:{' '}
                     {(syncDeltaSummary?.counts?.masterlistCustomersInserted || 0) +
                       (syncDeltaSummary?.counts?.masterlistCustomersUpdated || 0) +
@@ -2252,8 +2275,7 @@ const ViewCustomers = () => {
         
         <Col md={12} xs={12} className="mb-5">
         {/* Global Search Filter - Searches ALL fields in loaded customers in real-time */}
-        <Card className="border-0 shadow-sm mb-3" style={{ background: 'linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)' }}>
-          <Card.Body className="p-3">
+        <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_BLUE}>
             <Row className="align-items-center">
               <Col md={12}>
                 <div className="d-flex align-items-center gap-3">
@@ -2263,14 +2285,15 @@ const ViewCustomers = () => {
                       🌐 Global Search
                     </h6>
                     <small className="text-white" style={{ opacity: 0.9, fontSize: '0.75rem' }}>
-                      ⚡ Live • All Fields
+                      Press Enter to search
                     </small>
                   </div>
                   <div className="flex-grow-1">
                     <Form.Control
                       type="text"
-                      value={filters.globalSearch}
-                      onChange={(e) => setFilters(prev => ({ ...prev, globalSearch: e.target.value }))}
+                      value={globalSearchDraft}
+                      onChange={(e) => setGlobalSearchDraft(e.target.value)}
+                      onKeyDown={onGlobalSearchKeyDown}
                       placeholder="🔍 Search anything... Customer Code, Name, Email, Phone, Address, Postal Code, etc. (e.g., C000002, John, #01-03 SOHO, 188 RACE COURSE ROAD, 93424144)"
                       style={{ 
                         fontSize: '0.95rem', 
@@ -2283,11 +2306,14 @@ const ViewCustomers = () => {
                       autoComplete="off"
                     />
                   </div>
-                  {filters.globalSearch && (
+                  {(globalSearchDraft || globalSearchApplied) && (
                     <Button
                       variant="light"
                       size="sm"
-                      onClick={() => setFilters(prev => ({ ...prev, globalSearch: '' }))}
+                      onClick={() => {
+                        clearGlobalSearch();
+                        setCurrentPage(1);
+                      }}
                       className="d-flex align-items-center gap-1"
                       style={{ 
                         minWidth: '90px',
@@ -2300,7 +2326,7 @@ const ViewCustomers = () => {
                     </Button>
                   )}
                 </div>
-                {filters.globalSearch ? (
+                {globalSearchApplied ? (
                   <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.95 }}>
                     <FilterCircle size={14} />
                     <small style={{ fontSize: '0.85rem' }}>
@@ -2315,14 +2341,13 @@ const ViewCustomers = () => {
                 ) : (
                   <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.85 }}>
                     <small style={{ fontSize: '0.8rem' }}>
-                      💡 <strong>Tip:</strong> Search across ALL fields instantly - Customer Code, Name, Email, Phone, Address, Postal Code, Contact Person, Notes, and more!
+                      💡 <strong>Tip:</strong> Press Enter to search across Customer Code, Name, Email, Phone, Address, Postal Code, Contact Person, Notes, and more!
                     </small>
                   </div>
                 )}
               </Col>
             </Row>
-          </Card.Body>
-        </Card>
+        </DashboardListStickySearch>
 
         {/* Main Filters - Requires Search Button */}
         {/* <FilterPanel 
@@ -2359,7 +2384,7 @@ const ViewCustomers = () => {
                   <ListUl size={14} className="me-2" />
                   {loading ? (
                     <small>Loading...</small>
-                  ) : filters.globalSearch ? (
+                  ) : globalSearchApplied ? (
                     `Showing ${data.length} of ${totalRows} customers (filtered)`
                   ) : (
                     `Showing ${((currentPage - 1) * perPage) + 1}-${Math.min(currentPage * perPage, totalRows)} of ${totalRows}`
@@ -2434,10 +2459,10 @@ const ViewCustomers = () => {
               <div className="border-top">
                 <TablePagination
                   currentPage={currentPage}
-                  totalPages={filters.globalSearch 
+                  totalPages={globalSearchApplied 
                     ? Math.ceil(data.length / perPage) 
                     : Math.ceil(totalRows / perPage)}
-                  totalItems={filters.globalSearch ? data.length : totalRows}
+                  totalItems={globalSearchApplied ? data.length : totalRows}
                   onPageChange={(newPage) => {
                     handlePageChange(newPage);
                     table.setPageIndex(newPage - 1);

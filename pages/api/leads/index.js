@@ -6,6 +6,15 @@
 
 import { leadService } from '../../../lib/supabase/database';
 import {
+  getListCache,
+  setListCache,
+  invalidateListCache,
+} from '../../../lib/supabase/listQueryHelpers';
+import {
+  PORTAL_LIST_CACHE_PREFIX,
+  PORTAL_LIST_CACHE_TTL_MS,
+} from '../../../lib/leads/portalListCache';
+import {
   writeAuditLogFromRequest,
   AUDIT_ACTIONS,
   AUDIT_CATEGORIES,
@@ -45,17 +54,33 @@ export default async function handler(req, res) {
       if (search) filters.search = search;
 
       // Add pagination to prevent huge responses
-      const limitNum = limit ? parseInt(limit, 10) : 1000; // Default 1000, max reasonable
+      const limitNum = limit ? parseInt(limit, 10) : 1000;
       const offsetNum = offset ? parseInt(offset, 10) : 0;
-      
+
+      const cacheKey = `${PORTAL_LIST_CACHE_PREFIX}leads:${JSON.stringify({
+        status: status || null,
+        source: source || null,
+        email: email || null,
+        search: search || null,
+        limitNum,
+        offsetNum,
+      })}`;
+      const cached = getListCache(cacheKey, PORTAL_LIST_CACHE_TTL_MS);
+      if (cached) {
+        return res.status(200).json(cached);
+      }
+
       const leads = await leadService.getAll(filters, null, limitNum, offsetNum);
-      
-      return res.status(200).json({
+
+      const payload = {
         leads,
         total: leads.length,
         limit: limitNum,
-        offset: offsetNum
-      });
+        offset: offsetNum,
+      };
+      setListCache(cacheKey, payload, PORTAL_LIST_CACHE_TTL_MS);
+
+      return res.status(200).json(payload);
     }
 
     if (req.method === 'POST') {
@@ -92,7 +117,8 @@ export default async function handler(req, res) {
       };
 
       const lead = await leadService.create(dbLeadData);
-      
+
+      invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
       await writeAuditLogFromRequest(req, {
         action: AUDIT_ACTIONS.LEAD_CREATE,
         category: AUDIT_CATEGORIES.LEAD,

@@ -1,4 +1,5 @@
 // pages/api/customers/test-fields.js
+import { blockIfProduction } from '../../../lib/api/blockInProduction';
 import sapService from '../../../lib/services/sapService.js';
 import { 
   getFieldsByStrategy, 
@@ -24,6 +25,8 @@ import {
  * - testCustomFields: Whether to test custom fields (true/false, default: false)
  */
 const handler = asyncHandler(async (req, res) => {
+  if (blockIfProduction(req, res)) return;
+
   if (req.method !== 'GET') {
     return sendMethodNotAllowed(res, ['GET']);
   }

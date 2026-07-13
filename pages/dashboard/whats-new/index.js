@@ -11,6 +11,7 @@ import DefaultDashboardLayout from 'layouts/dashboard/DashboardIndexTop';
 import { UPDATE_LOGS_FOLDER } from '../../../lib/constants/companyMemoFolders';
 import { memoCreatorDisplayName } from '../../../lib/utils/memoCreatorDisplayName';
 import { memoHtmlForDisplay } from '../../../lib/utils/memoHtml';
+import richTextStyles from '../../../styles/richTextContent.module.css';
 import styles from './WhatsNew.module.css';
 
 function priorityVariant(p) {
@@ -214,7 +215,7 @@ const WhatsNewPage = () => {
                       <div className={styles.cardBody}>
                         {entry.body ? (
                           <div
-                            className={styles.memoHtml}
+                            className={`${styles.memoHtml} ${richTextStyles.memoReadContent}`}
                             dangerouslySetInnerHTML={{
                               __html: memoHtmlForDisplay(entry.body),
                             }}

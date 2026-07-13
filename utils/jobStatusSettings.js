@@ -5,6 +5,7 @@
  */
 
 import { buildJobStatusesList } from "../lib/jobs/buildJobStatusesList";
+import { readCachedDashboardBootstrap } from "./dashboardBootstrapCache";
 import {
   formatJobStatusDisplayLabel,
   getDefaultJobStatuses,
@@ -62,17 +63,24 @@ export const fetchJobStatuses = async ({ force = false } = {}) => {
     let settingsTypes = null;
     let sapSnapshot = null;
     try {
-      const { getSupabaseClient } = await import("../lib/supabase/client");
-      const supabase = getSupabaseClient();
-      if (supabase) {
-        const { data: settings, error } = await supabase
-          .from("settings")
-          .select("value")
-          .eq("id", "jobStatuses")
-          .single();
-        if (!error && settings?.value) {
-          settingsTypes = settings.value.types || null;
-          sapSnapshot = Array.isArray(settings.value.sapSnapshot) ? settings.value.sapSnapshot : null;
+      const bootstrapCached = !force ? readCachedDashboardBootstrap() : null;
+      const bootstrapValue = bootstrapCached?.jobStatuses;
+      if (bootstrapValue) {
+        settingsTypes = bootstrapValue.types || null;
+        sapSnapshot = Array.isArray(bootstrapValue.sapSnapshot) ? bootstrapValue.sapSnapshot : null;
+      } else {
+        const { getSupabaseClient } = await import("../lib/supabase/client");
+        const supabase = getSupabaseClient();
+        if (supabase) {
+          const { data: settings, error } = await supabase
+            .from("settings")
+            .select("value")
+            .eq("id", "jobStatuses")
+            .single();
+          if (!error && settings?.value) {
+            settingsTypes = settings.value.types || null;
+            sapSnapshot = Array.isArray(settings.value.sapSnapshot) ? settings.value.sapSnapshot : null;
+          }
         }
       }
     } catch (e) {

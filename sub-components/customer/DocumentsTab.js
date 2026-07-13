@@ -3,6 +3,7 @@ import { Row, Col, Table, Button, Badge, Form, Modal, Spinner, ProgressBar, Cont
 import { FileText, Download, Upload, Search, XCircle } from 'lucide-react';
 import { getSupabaseClient } from '../../lib/supabase/client';
 import { uploadFile, getDownloadURL, deleteFile, listFiles, uploadFileWithProgress } from '../../lib/supabase/storage';
+import { formatSingaporeDate } from '../../lib/utils/singaporeDateTime';
 import toast from 'react-hot-toast';
 import * as XLSX from 'xlsx';
 import TablePagination from 'components/common/TablePagination';
@@ -326,7 +327,7 @@ export const DocumentsTab = ({ customerData }) => {
                     <td>
                       <Badge bg={getTypeColor(doc.type)}>{doc.type}</Badge>
                     </td>
-                    <td>{new Date(doc.uploadDate).toLocaleDateString()}</td>
+                    <td>{formatSingaporeDate(doc.uploadDate) || 'Date not available'}</td>
                     <td>{doc.size}</td>
                     <td>
                       <Button 

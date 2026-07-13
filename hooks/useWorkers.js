@@ -4,7 +4,8 @@ import { useQueryClient } from 'react-query';
 import { getSupabaseClient } from '../lib/supabase/client';
 import { useWorkersListQuery } from './queries/useWorkersListQuery';
 
-const REALTIME_DEBOUNCE_MS = 400;
+const REALTIME_DEBOUNCE_MS = 2500;
+const REALTIME_FULL_REFETCH_MIN_MS = 30_000;
 const DEFAULT_PAGE_SIZE = 25;
 
 function patchWorkerFromUserRow(worker, userRow) {
@@ -40,19 +41,10 @@ export const useWorkers = ({ pageSize = DEFAULT_PAGE_SIZE } = {}) => {
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState('');
   const [includeStats, setIncludeStats] = useState(true);
-  const channelRef = useRef(null);
   const debounceRef = useRef(null);
-  const searchRef = useRef(search);
-  const pageRef = useRef(page);
+  const pendingRealtimeEventsRef = useRef([]);
+  const lastFullRefetchAtRef = useRef(0);
   const isFirstLoadRef = useRef(true);
-
-  useEffect(() => {
-    searchRef.current = search;
-  }, [search]);
-
-  useEffect(() => {
-    pageRef.current = page;
-  }, [page]);
 
   const workersQueryParams = useMemo(
     () => ({
@@ -83,6 +75,15 @@ export const useWorkers = ({ pageSize = DEFAULT_PAGE_SIZE } = {}) => {
   };
   const error = workersQueryError ?? null;
 
+  const workersRef = useRef(workers);
+  const patchRowRef = useRef(patchRow);
+  const removeRowRef = useRef(removeRow);
+  const refetchRef = useRef(refetch);
+  workersRef.current = workers;
+  patchRowRef.current = patchRow;
+  removeRowRef.current = removeRow;
+  refetchRef.current = refetch;
+
   useEffect(() => {
     if (isFirstLoadRef.current && workersData) {
       isFirstLoadRef.current = false;
@@ -90,54 +91,59 @@ export const useWorkers = ({ pageSize = DEFAULT_PAGE_SIZE } = {}) => {
     }
   }, [workersData]);
 
-  const scheduleRealtimeRefresh = useCallback(() => {
-    if (debounceRef.current) {
-      clearTimeout(debounceRef.current);
-    }
-    debounceRef.current = setTimeout(() => {
-      refetch().catch((err) => {
-        console.error('Error updating workers from realtime:', err);
-      });
-    }, REALTIME_DEBOUNCE_MS);
-  }, [refetch]);
-
-  const handleRealtimePayload = useCallback(
-    (payload) => {
-      const eventType = payload?.eventType;
-      const newRow = payload?.new;
-      const oldRow = payload?.old;
-
-      if (eventType === 'DELETE' && oldRow?.id) {
-        removeRow(oldRow.id);
-        return;
-      }
-
-      if (eventType === 'INSERT') {
-        scheduleRealtimeRefresh();
-        return;
-      }
-
-      if (eventType === 'UPDATE' && newRow?.id) {
-        const existing = workers.find((w) => w.id === newRow.id);
-        if (!existing) {
-          scheduleRealtimeRefresh();
-          return;
-        }
-        patchRow(patchWorkerFromUserRow(existing, newRow), 'UPDATE');
-        return;
-      }
-
-      scheduleRealtimeRefresh();
-    },
-    [workers, patchRow, removeRow, scheduleRealtimeRefresh]
-  );
-
   useEffect(() => {
     try {
       const supabase = getSupabaseClient();
       if (!supabase) {
         throw new Error('Supabase client not available');
       }
+
+      const throttledRefetch = () => {
+        const now = Date.now();
+        if (now - lastFullRefetchAtRef.current < REALTIME_FULL_REFETCH_MIN_MS) return;
+        lastFullRefetchAtRef.current = now;
+        refetchRef.current().catch((err) => {
+          console.error('Error updating workers from realtime:', err);
+        });
+      };
+
+      const processBatchedEvents = (events) => {
+        if (!events.length) return;
+
+        let needsFullRefetch = false;
+
+        for (const payload of events) {
+          const eventType = payload?.eventType;
+          const newRow = payload?.new;
+          const oldRow = payload?.old;
+
+          if (eventType === 'DELETE' && oldRow?.id) {
+            removeRowRef.current(oldRow.id);
+            continue;
+          }
+
+          if (eventType === 'INSERT') {
+            needsFullRefetch = true;
+            continue;
+          }
+
+          if (eventType === 'UPDATE' && newRow?.id) {
+            const existing = workersRef.current.find((w) => w.id === newRow.id);
+            if (!existing) {
+              needsFullRefetch = true;
+              continue;
+            }
+            patchRowRef.current(patchWorkerFromUserRow(existing, newRow), 'UPDATE');
+            continue;
+          }
+
+          needsFullRefetch = true;
+        }
+
+        if (needsFullRefetch) {
+          throttledRefetch();
+        }
+      };
 
       const channel = supabase
         .channel('users-changes')
@@ -150,25 +156,30 @@ export const useWorkers = ({ pageSize = DEFAULT_PAGE_SIZE } = {}) => {
             filter: 'deleted_at=is.null',
           },
           (payload) => {
-            handleRealtimePayload(payload);
+            pendingRealtimeEventsRef.current.push(payload);
+            if (debounceRef.current) {
+              clearTimeout(debounceRef.current);
+            }
+            debounceRef.current = setTimeout(() => {
+              const batch = pendingRealtimeEventsRef.current;
+              pendingRealtimeEventsRef.current = [];
+              processBatchedEvents(batch);
+            }, REALTIME_DEBOUNCE_MS);
           }
         )
         .subscribe();
-
-      channelRef.current = channel;
 
       return () => {
         if (debounceRef.current) {
           clearTimeout(debounceRef.current);
         }
-        if (channelRef.current) {
-          supabase.removeChannel(channelRef.current);
-        }
+        pendingRealtimeEventsRef.current = [];
+        supabase.removeChannel(channel);
       };
     } catch (err) {
       console.error('Error in useWorkers setup:', err);
     }
-  }, [handleRealtimePayload]);
+  }, []);
 
   const fetchWorkers = useCallback(async () => {
     setIncludeStats(true);

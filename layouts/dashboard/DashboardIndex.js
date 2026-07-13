@@ -4,11 +4,9 @@ import React, { useState } from 'react';
 // import sub components
 import NavbarVertical from './navbars/NavbarVertical';
 import NavbarTop from './navbars/NavbarTop';
-import { useSessionCheck } from '../../hooks/useSessionCheck';
 
 const DashboardIndex = (props) => {
 	const [showMenu, setShowMenu] = useState(true);
-	useSessionCheck();
 	const ToggleMenu = () => {
 		return setShowMenu(!showMenu);
 	};	

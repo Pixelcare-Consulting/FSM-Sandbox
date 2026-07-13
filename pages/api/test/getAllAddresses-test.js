@@ -1,8 +1,12 @@
 // pages/api/test/getAllAddresses-test.js
 // Test file to check the structure and content of the getAllAddresses API (SQL Query 14)
+import { blockIfProduction } from '../../../lib/api/blockInProduction';
+
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 export default async function handler(req, res) {
+  if (blockIfProduction(req, res)) return;
+
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }

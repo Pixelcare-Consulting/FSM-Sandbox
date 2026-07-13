@@ -6,6 +6,7 @@ import { toast } from "react-toastify";
 import Swal from "sweetalert2";
 import { getSupabaseClient } from "../../../lib/supabase/client";
 import { jobService } from "../../../lib/supabase/database";
+import { sanitizeJobTaskFields } from "../../../lib/jobs/sanitizeJobTaskFields";
 import { useRouter } from "next/router";
 
 const mapTaskRowToListItem = (task, index = 0) => ({
@@ -145,12 +146,15 @@ const TaskList = ({ workers, jobNo }) => {
         : 0;
 
       // Insert task into job_tasks table
+      const sanitized = sanitizeJobTaskFields({
+        taskName: newTask.taskName,
+        taskDescription: newTask.taskDescription,
+      });
       const { data, error } = await supabase
         .from('job_tasks')
         .insert({
           job_id: jobNo,
-          task_name: newTask.taskName,
-          task_description: newTask.taskDescription,
+          ...sanitized,
           task_order: maxOrder + 1,
           is_required: newTask.isPriority
         })
@@ -196,11 +200,14 @@ const TaskList = ({ workers, jobNo }) => {
       }
 
       // Update task in job_tasks table
+      const sanitized = sanitizeJobTaskFields({
+        taskName: newTask.taskName,
+        taskDescription: newTask.taskDescription,
+      });
       const { error } = await supabase
         .from('job_tasks')
         .update({
-          task_name: newTask.taskName,
-          task_description: newTask.taskDescription,
+          ...sanitized,
           is_required: newTask.isPriority
         })
         .eq('id', editingTask.taskID);

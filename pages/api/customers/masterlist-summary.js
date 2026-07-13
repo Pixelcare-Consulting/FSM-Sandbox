@@ -1,10 +1,13 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import { withSession } from '../../../lib/api/withSession';
 import {
   SUPABASE_CUSTOMER_LIST_FLAT_SELECT,
   SUPABASE_CUSTOMER_LOCATION_LIST_SUMMARY_SELECT,
   listRowFromSupabaseCustomer,
 } from '../../../lib/customers/supabaseCustomerSapShim';
 import { customerMatchesListGlobalSearch } from '../../../lib/customers/customerListGlobalSearchFilter';
+import { isPortalCustomerCode } from '../../../lib/customers/promotePortalCustomerCodes';
+import { applySapCustomerMasterlistFilters } from '../../../lib/customers/sapMasterlistCustomerQuery';
 import {
   applyMultiTokenIlikeFilters,
   getListCache,
@@ -113,7 +116,7 @@ async function fetchLocationSummariesByCustomerIds(supabase, customerIds) {
   return byCustomerId;
 }
 
-export default async function handler(req, res) {
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -155,7 +158,7 @@ export default async function handler(req, res) {
         limit,
         order: { column: sort === 'customer_name' ? 'customer_name' : 'customer_code', ascending: sortAsc },
         filters: (query) => {
-          let q = query;
+          let q = applySapCustomerMasterlistFilters(query);
           if (tokens.length > 0) {
             q = applyMultiTokenIlikeFilters(q, tokens, CUSTOMER_SEARCH_FIELDS);
           }
@@ -180,6 +183,8 @@ export default async function handler(req, res) {
       });
     });
 
+    customers = customers.filter((c) => !isPortalCustomerCode(c.CardCode));
+
     if (search) {
       const qLower = search.toLowerCase();
       customers = customers.filter((c) => customerMatchesListGlobalSearch(c, qLower));
@@ -187,10 +192,12 @@ export default async function handler(req, res) {
 
     const stats = page === 1 && !search && !country ? await fetchCountryStats(supabase) : getListCache('customers-country-stats', COUNTRY_STATS_CACHE_TTL_MS) || { addressCount: 0, topCountry: '', topCountryCount: 0 };
 
-    const { count: customerCount } = await supabase
-      .from('customer')
-      .select('customer_code', { count: 'exact', head: true })
-      .is('deleted_at', null);
+    const { count: customerCount } = await applySapCustomerMasterlistFilters(
+      supabase
+        .from('customer')
+        .select('customer_code', { count: 'exact', head: true })
+        .is('deleted_at', null)
+    );
 
     const payload = {
       customers,
@@ -212,4 +219,4 @@ export default async function handler(req, res) {
       error: error.message || 'Unable to load customers summary.',
     });
   }
-}
+});

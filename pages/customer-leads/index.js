@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { Fragment, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
-  Container,
   Row,
   Col,
   Card,
@@ -34,16 +33,21 @@ import {
   Save,
   X,
   Trash2,
-  AlertCircle
+  AlertCircle,
+  Plus
 } from 'lucide-react';
 import { toast, ToastContainer } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 import DefaultDashboardLayout from '@/layouts/dashboard/DashboardIndexTop';
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from '@/sub-components/dashboard/DashboardListStickySearch';
 import SAPSyncButton from '@/components/SAPSyncButton';
 import ResponseDetailsModal from './_components/ResponseDetailsModal';
 import TablePagination from '@/components/common/TablePagination';
 import { ExtensionFriendlyPhone } from '@/components/common/ExtensionFriendlyPhone';
 import { Search as FeatherSearch, X as FeatherX } from 'react-feather';
+import { useEnterToSearch } from '@/hooks/useEnterToSearch';
 import { HouseFill, EnvelopeFill, ListUl } from 'react-bootstrap-icons';
 import {
   useReactTable,
@@ -53,7 +57,39 @@ import {
   createColumnHelper
 } from '@tanstack/react-table';
 import { TABLE_CONFIG } from 'constants/tableConfig';
-import { getEffectiveLeadName } from '@/lib/leads/getEffectiveLeadName';
+import { usePortalCustomersListQuery } from '@/hooks/queries/usePortalCustomersListQuery';
+import { useGoogleFormsListQuery } from '@/hooks/queries/useGoogleFormsListQuery';
+import { transformLeadToResponse } from '@/lib/leads/buildPortalCustomersList';
+
+function getPortalSourceBadgeProps(portalSource) {
+  switch (portalSource) {
+    case 'google_form':
+      return { bg: 'info', label: 'GOOGLE FORM' };
+    case 'internal':
+      return { bg: 'secondary', label: 'PORTAL' };
+    case 'manual_lead':
+      return { bg: 'dark', label: 'MANUAL LEAD' };
+    default:
+      return { bg: 'secondary', label: 'UNKNOWN' };
+  }
+}
+
+function getWorkflowStatusBadgeProps(status) {
+  const normalized = status || 'PENDING';
+  const bg =
+    normalized === 'CONVERTED' ? 'success' :
+    normalized === 'PENDING' ? 'warning' :
+    normalized === 'CONTACTED' ? 'info' :
+    normalized === 'REJECTED' ? 'danger' :
+    normalized === 'COMPLETED' ? 'primary' :
+    normalized === 'ACTIVE' ? 'light' :
+    'secondary';
+  return {
+    bg,
+    text: normalized === 'ACTIVE' ? 'dark' : undefined,
+    label: normalized,
+  };
+}
 
 const leadsColumnHelper = createColumnHelper();
 
@@ -92,28 +128,106 @@ function formatLinkMatchLabel(match) {
   }
 }
 
+const ACTION_BTN_STYLE = { fontSize: '11px', padding: '4px 8px' };
+
+function getRowWorkflowStatus(row) {
+  return row?.status || 'PENDING';
+}
+
+
+function PortalRowActions({ row, onView, onEdit, onDelete, isSyncedToSAP, mobile = false }) {
+  const canModify = !isSyncedToSAP(row);
+  const isPortal = row.rowType === 'customer';
+  const viewClass = mobile
+    ? 'flex-fill d-flex align-items-center justify-content-center gap-1'
+    : 'btn btn-primary btn-icon-text btn-sm';
+
+  return (
+    <div className={`d-flex gap-1 ${mobile ? '' : 'flex-wrap align-items-center'}`}>
+      <Button
+        variant="primary"
+        size="sm"
+        onClick={() => onView(row)}
+        className={viewClass}
+        style={{ ...ACTION_BTN_STYLE, textDecoration: 'none' }}
+      >
+        <Eye size={14} className={mobile ? '' : 'icon-left'} />
+        View
+      </Button>
+      {canModify && (
+        <Button
+          variant="outline-warning"
+          size="sm"
+          onClick={() => onEdit(row, isPortal ? { portal: true } : {})}
+          className="d-flex align-items-center justify-content-center"
+          style={ACTION_BTN_STYLE}
+          title={
+            isPortal
+              ? 'Edit limited portal lead details'
+              : 'Edit lead details'
+          }
+        >
+          <Edit size={12} />
+        </Button>
+      )}
+      {canModify && (
+        <Button
+          variant="outline-danger"
+          size="sm"
+          onClick={() => onDelete(row.id)}
+          className="d-flex align-items-center justify-content-center"
+          style={ACTION_BTN_STYLE}
+          title={isPortal ? 'Delete portal customer' : 'Delete lead'}
+        >
+          <X size={12} />
+        </Button>
+      )}
+    </div>
+  );
+}
+
 const CustomerLeadsPage = () => {
   const [activeTab, setActiveTab] = useState('allResponses');
-  const [responses, setResponses] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState(null);
+  const {
+    rows: responses,
+    isLoading: listLoading,
+    isError: listError,
+    error: listFetchError,
+    refetch: refetchPortalList,
+    invalidate: invalidatePortalList,
+    removeRow,
+  } = usePortalCustomersListQuery();
+  const loading = listLoading || syncing;
+  const displayError = error || (listError ? listFetchError?.message : null);
   const [selectedResponse, setSelectedResponse] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [editingLead, setEditingLead] = useState(null);
   const [isPortalEditMode, setIsPortalEditMode] = useState(false);
   const [editFormData, setEditFormData] = useState({});
   const [saving, setSaving] = useState(false);
-  const [googleForms, setGoogleForms] = useState([]);
+  const { forms: googleForms } = useGoogleFormsListQuery();
   const [selectedFormId, setSelectedFormId] = useState(null);
-  const [loadingForms, setLoadingForms] = useState(true);
   const [selectedLeads, setSelectedLeads] = useState(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isCreatingCustomer, setIsCreatingCustomer] = useState(false);
   const [isCreatingJobs, setIsCreatingJobs] = useState(false);
   const [leadJobsByDate, setLeadJobsByDate] = useState({});
+  const [leadJobsLoading, setLeadJobsLoading] = useState(false);
+  const [leadJobsError, setLeadJobsError] = useState(null);
+  const [portalDetailBundle, setPortalDetailBundle] = useState(null);
+  const [portalDetailLoading, setPortalDetailLoading] = useState(false);
+  const [portalDetailError, setPortalDetailError] = useState(null);
   const [createJobsStatus, setCreateJobsStatus] = useState(null);
   const [sapVerifyStatus, setSapVerifyStatus] = useState(null);
-  const [searchQuery, setSearchQuery] = useState('');
+  const {
+    draft: searchDraft,
+    setDraft: setSearchDraft,
+    applied: searchApplied,
+    clear: clearSearch,
+    onKeyDown: onSearchKeyDown,
+  } = useEnterToSearch();
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(10);
   const [showSyncPreviewModal, setShowSyncPreviewModal] = useState(false);
@@ -132,44 +246,145 @@ const CustomerLeadsPage = () => {
   const [editCodeSaving, setEditCodeSaving] = useState(false);
   const router = useRouter();
   const autoOpenedCustomerCodeRef = useRef(null);
+  const highlightHandledRef = useRef(null);
 
-  // Fetch Google Forms from database
   useEffect(() => {
-    fetchGoogleForms();
-    fetchLeads();
-  }, []);
+    if (googleForms.length > 0 && !selectedFormId) {
+      setSelectedFormId(googleForms[0].id);
+    }
+  }, [googleForms, selectedFormId]);
 
   // Reset to first page when search query changes
   useEffect(() => {
     setCurrentPage(1);
-  }, [searchQuery]);
+  }, [searchApplied]);
 
   // Fetch jobs for this lead when viewing modal (for "View Job" links per service date)
   useEffect(() => {
     if (!showModal || !selectedResponse?.id) {
       setLeadJobsByDate({});
+      setLeadJobsLoading(false);
+      setLeadJobsError(null);
+      return;
+    }
+    if (selectedResponse.rowType === 'customer') {
+      setLeadJobsByDate({});
+      setLeadJobsLoading(false);
+      setLeadJobsError(null);
+      return;
+    }
+    const hasServiceDate = [
+      selectedResponse.firstServiceDate,
+      selectedResponse.secondServiceDate,
+      selectedResponse.thirdServiceDate,
+      selectedResponse.fourthServiceDate,
+    ].some((d) => d && d !== '-');
+    if (!hasServiceDate) {
+      setLeadJobsByDate({});
+      setLeadJobsLoading(false);
+      setLeadJobsError(null);
       return;
     }
     if (!selectedResponse.customer_id) {
       setLeadJobsByDate({});
+      setLeadJobsLoading(false);
+      setLeadJobsError(null);
       return;
     }
     let cancelled = false;
-    fetch(`/api/leads/${selectedResponse.id}/jobs`)
-      .then((res) => (res.ok ? res.json() : { jobsByServiceDate: {} }))
-      .then((data) => {
-        if (!cancelled && data.jobsByServiceDate) setLeadJobsByDate(data.jobsByServiceDate);
+    setLeadJobsLoading(true);
+    setLeadJobsError(null);
+    setLeadJobsByDate({});
+    fetch(`/api/leads/${selectedResponse.id}/jobs`, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' },
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || `Failed to load jobs (${res.status})`);
+        }
+        return res.json();
       })
-      .catch(() => {
-        if (!cancelled) setLeadJobsByDate({});
+      .then((data) => {
+        if (!cancelled) {
+          setLeadJobsByDate(data.jobsByServiceDate || {});
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLeadJobsByDate({});
+          setLeadJobsError(err.message || 'Failed to load jobs for this lead');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLeadJobsLoading(false);
+        }
       });
     return () => { cancelled = true; };
   }, [showModal, selectedResponse?.id, selectedResponse?.customer_id]);
+
+  // Fetch contacts + locations when viewing a portal CP customer modal
+  useEffect(() => {
+    if (
+      !showModal ||
+      selectedResponse?.rowType !== 'customer' ||
+      !selectedResponse?.customer_code
+    ) {
+      setPortalDetailBundle(null);
+      setPortalDetailLoading(false);
+      setPortalDetailError(null);
+      return;
+    }
+
+    const customerCode = String(selectedResponse.customer_code).trim();
+    let cancelled = false;
+    setPortalDetailLoading(true);
+    setPortalDetailError(null);
+    setPortalDetailBundle(null);
+
+    fetch(`/api/customers/masterlist-bundle/${encodeURIComponent(customerCode)}`, {
+      credentials: 'include',
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' },
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || `Failed to load customer details (${res.status})`);
+        }
+        return res.json();
+      })
+      .then((data) => {
+        if (!cancelled) {
+          setPortalDetailBundle(data.partner || null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setPortalDetailBundle(null);
+          setPortalDetailError(err.message || 'Failed to load contacts and locations');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setPortalDetailLoading(false);
+        }
+      });
+
+    return () => { cancelled = true; };
+  }, [showModal, selectedResponse?.rowType, selectedResponse?.customer_code]);
 
   useEffect(() => {
     if (!showModal) {
       setCreateJobsStatus(null);
       setSapVerifyStatus(null);
+      setLeadJobsError(null);
+      setPortalDetailBundle(null);
+      setPortalDetailLoading(false);
+      setPortalDetailError(null);
     }
   }, [showModal, selectedResponse?.id]);
 
@@ -251,26 +466,34 @@ const CustomerLeadsPage = () => {
     router.replace('/customer-leads', undefined, { shallow: true });
   }, [router, responses, loading]);
 
-  const fetchGoogleForms = async () => {
-    try {
-      setLoadingForms(true);
-      const response = await fetch('/api/google-forms/list');
-      if (response.ok) {
-        const data = await response.json();
-        setGoogleForms(data.forms || []);
-        // Auto-select first form if available
-        if (data.forms && data.forms.length > 0 && !selectedFormId) {
-          setSelectedFormId(data.forms[0].id);
-        }
-      } else {
-        console.error('Failed to fetch Google Forms');
-      }
-    } catch (err) {
-      console.error('Error fetching Google Forms:', err);
-    } finally {
-      setLoadingForms(false);
+  useEffect(() => {
+    if (!router.isReady) return;
+
+    const rawHighlight = router.query.highlight;
+    const highlightCode = Array.isArray(rawHighlight) ? rawHighlight[0] : rawHighlight;
+    if (!highlightCode || highlightHandledRef.current === highlightCode) {
+      return;
     }
-  };
+
+    highlightHandledRef.current = highlightCode;
+    toast.success(`Customer ${highlightCode} created successfully`, {
+      position: 'top-right',
+      autoClose: 5000,
+    });
+
+    if (responses.length > 0) {
+      const matchingResponse = responses.find(
+        (response) =>
+          String(response.customer_code || '').toUpperCase() === String(highlightCode).toUpperCase()
+      );
+      if (matchingResponse) {
+        setSelectedResponse(matchingResponse);
+        setShowModal(true);
+      }
+    }
+
+    router.replace('/customer-leads', undefined, { shallow: true });
+  }, [router, router.isReady, router.query.highlight, responses]);
 
   // Helper function to extract form ID from URL
   const extractFormIdFromUrl = (url) => {
@@ -388,68 +611,7 @@ const CustomerLeadsPage = () => {
     }
   };
 
-  // Transform database format to frontend format
-  const transformLeadToResponse = (lead) => {
-    const firstName = lead.first_name || '';
-    const lastName = lead.last_name || '';
-    const effectiveName = getEffectiveLeadName(lead);
-    const fullName = effectiveName === 'Unknown Customer' ? '-' : effectiveName;
-    
-    // Build address from components if available, otherwise use address field
-    const addressParts = [
-      lead.building,
-      lead.street,
-      lead.postcode,
-      lead.country
-    ].filter(part => part && part.trim() !== '');
-    const address = addressParts.length > 0 
-      ? addressParts.join(', ') 
-      : (lead.address || '-');
-    
-    return {
-      id: lead.id,
-      timestamp: lead.submitted_at || lead.created_at,
-      email: lead.email,
-      block:
-        lead.block && String(lead.block).trim() !== '' && lead.block !== '-'
-          ? lead.block
-          : (lead.customer?.block != null && lead.customer.block !== '' ? lead.customer.block : '-'),
-      unit:
-        lead.unit && String(lead.unit).trim() !== '' && lead.unit !== '-'
-          ? lead.unit
-          : (lead.customer?.unit != null && lead.customer.unit !== '' ? lead.customer.unit : '-'),
-      address: address,
-      salutation: lead.salutation || '-',
-      firstName: firstName || '-',
-      lastName: lastName || '-',
-      fullName: fullName,
-      building: lead.building || '-',
-      street: lead.street || '-',
-      postcode: lead.postcode || '-',
-      country: lead.country || '-',
-      handphone:
-        (lead.handphone && String(lead.handphone).trim() !== '' && lead.handphone !== '-'
-          ? lead.handphone
-          : lead.customer?.phone_number) || '-',
-      firstServiceDate: lead.first_service_date || '-',
-      secondServiceDate: lead.second_service_date || '-',
-      thirdServiceDate: lead.third_service_date || '-',
-      fourthServiceDate: lead.fourth_service_date || '-',
-      timeSlot: lead.time_slot || '-',
-      agreedToTerms: lead.agreed_to_terms ? 'Yes' : 'No',
-      personalInfoConsent: lead.personal_info_consent ? 'Yes' : 'No',
-      status: lead.status || 'PENDING',
-      source: lead.source || 'GOOGLE_FORM',
-      notes: lead.notes,
-      // Customer sync fields (for converted leads)
-      customer_id: lead.customer_id || null,
-      customer_code: lead.customer?.customer_code || null,
-      sap_card_code: lead.customer?.sap_card_code || null,
-      synced_to_sap_at: lead.customer?.synced_to_sap_at || null,
-      // Keep original lead data for editing
-      _leadData: lead
-    };
-  };
+  // Transform database format to frontend format — use shared helper from buildPortalCustomersList.js
 
   const runGoogleFormSync = useCallback(async ({ formId, responseIds } = {}) => {
     let formIdToSync = formId;
@@ -573,15 +735,13 @@ const CustomerLeadsPage = () => {
   }, [googleForms, selectedFormId]);
 
   const fetchLeads = useCallback(async (syncFromGoogle = false) => {
-    setLoading(true);
     setError(null);
     try {
-      // If sync is requested, sync from Google Forms first
       if (syncFromGoogle) {
+        setSyncing(true);
         try {
           const result = await runGoogleFormSync();
           if (result?.aborted) {
-            setLoading(false);
             return;
           }
         } catch (syncErr) {
@@ -589,69 +749,23 @@ const CustomerLeadsPage = () => {
           if (!syncErr.message || syncErr.message === 'Failed to sync from Google Forms') {
             toast.warning('Could not sync from Google Forms. Showing existing leads.', {
               position: 'top-right',
-              autoClose: 5000
+              autoClose: 5000,
             });
           }
         }
       }
 
-      // Fetch leads and portal customers, then merge into one list (one view)
-      const [leadsRes, genericRes] = await Promise.all([
-        fetch('/api/leads', { credentials: 'include', cache: 'no-store' }),
-        fetch('/api/customers/generic', { credentials: 'include', cache: 'no-store' })
-      ]);
-      if (!leadsRes.ok) throw new Error('Failed to fetch leads');
-      const leadsData = await leadsRes.json();
-      const transformedLeads = (leadsData.leads || []).map(transformLeadToResponse);
-      const leadCustomerIds = new Set(transformedLeads.map(l => l.customer_id).filter(Boolean));
-
-      let genericCustomers = [];
-      if (genericRes.ok) {
-        const genericData = await genericRes.json();
-        genericCustomers = genericData.customers || [];
-      }
-      const standaloneCustomers = genericCustomers.filter(c => !leadCustomerIds.has(c.id));
-      const customerRows = standaloneCustomers.map(c => ({
-        id: `cust-${c.id}`,
-        rowType: 'customer',
-        customer_id: c.id,
-        customer_code: c.customer_code,
-        fullName: c.customer_name,
-        email: c.email,
-        handphone: c.phone_number || '-',
-        address: c.customer_address || '-',
-        block: (c.block != null && c.block !== '') ? c.block : '-',
-        unit: (c.unit != null && c.unit !== '') ? c.unit : '-',
-        notes: c.notes ?? '',
-        timestamp: null,
-        status: c.synced_to_sap_at ? 'CONVERTED' : 'Portal',
-        firstServiceDate: '-',
-        salutation: '-',
-        firstName: '-',
-        lastName: '-',
-        synced_to_sap_at: c.synced_to_sap_at || null
-      }));
-
-      const merged = [...transformedLeads, ...customerRows];
-      // Sort by customer code so CP00001, CP00002, ... appear in order (no-code last)
-      merged.sort((a, b) => {
-        const matchA = (a.customer_code || '').match(/^CP(\d+)$/i);
-        const matchB = (b.customer_code || '').match(/^CP(\d+)$/i);
-        const numA = matchA ? parseInt(matchA[1], 10) : 999999;
-        const numB = matchB ? parseInt(matchB[1], 10) : 999999;
-        return numA - numB;
-      });
-      setResponses(merged);
+      await refetchPortalList();
     } catch (err) {
       console.error('Error fetching leads:', err);
       setError(err.message);
       toast.error('Failed to load leads', {
-        position: "top-right"
+        position: 'top-right',
       });
     } finally {
-      setLoading(false);
+      setSyncing(false);
     }
-  }, [googleForms, selectedFormId, runGoogleFormSync]);
+  }, [refetchPortalList, runGoogleFormSync]);
 
   const handleConfirmSync = async () => {
     const form = googleForms.find(f => f.id === selectedFormId);
@@ -682,11 +796,11 @@ const CustomerLeadsPage = () => {
 
   // Filter data based on search query (works for both lead and customer rows)
   const filterData = useCallback((data) => {
-    if (!searchQuery.trim()) {
+    if (!searchApplied.trim()) {
       return data;
     }
 
-    const query = searchQuery.toLowerCase().trim();
+    const query = searchApplied.toLowerCase().trim();
     return data.filter(row => {
       const name = (row.fullName || '').toLowerCase();
       const email = (row.email || '').toLowerCase();
@@ -696,6 +810,7 @@ const CustomerLeadsPage = () => {
       const block = (row.block || '').toLowerCase();
       const unit = (row.unit || '').toLowerCase();
       const status = (row.status || '').toLowerCase();
+      const portalSource = (row.portalSource || '').toLowerCase();
       return (
         email.includes(query) ||
         name.includes(query) ||
@@ -704,10 +819,11 @@ const CustomerLeadsPage = () => {
         address.includes(query) ||
         block.includes(query) ||
         unit.includes(query) ||
-        status.includes(query)
+        status.includes(query) ||
+        portalSource.includes(query)
       );
     });
-  }, [searchQuery]);
+  }, [searchApplied]);
 
   // Get paginated data
   const getPaginatedData = (data) => {
@@ -721,11 +837,7 @@ const CustomerLeadsPage = () => {
     };
   };
 
-  // Handle search input change
-  const handleSearchChange = (e) => {
-    setSearchQuery(e.target.value);
-    setCurrentPage(1); // Reset to first page when searching
-  };
+  // Handle search input change — draft only; applied on Enter via hook
 
   const formatDate = (dateString) => {
     if (!dateString || dateString === '-') return '-';
@@ -922,40 +1034,48 @@ const CustomerLeadsPage = () => {
     }
   };
 
-  const handleDelete = useCallback(async (leadId) => {
-    if (!window.confirm('Are you sure you want to delete this lead?')) {
+  const handleDelete = useCallback(async (rowId) => {
+    const isPortalCustomer = String(rowId).startsWith('cust-');
+    const confirmMessage = isPortalCustomer
+      ? 'Are you sure you want to delete this portal customer?'
+      : 'Are you sure you want to delete this lead?';
+
+    if (!window.confirm(confirmMessage)) {
       return;
     }
 
     try {
-      const response = await fetch(`/api/leads/${leadId}`, {
-        method: 'DELETE'
-      });
+      let response;
+      if (isPortalCustomer) {
+        const customerId = String(rowId).replace(/^cust-/, '');
+        response = await fetch(`/api/customers/generic/${customerId}`, { method: 'DELETE' });
+      } else {
+        response = await fetch(`/api/leads/${rowId}`, { method: 'DELETE' });
+      }
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to delete lead');
+        throw new Error(errorData.error || (isPortalCustomer ? 'Failed to delete portal customer' : 'Failed to delete lead'));
       }
 
-      toast.success('Lead deleted successfully', {
-        position: "top-right"
+      toast.success(isPortalCustomer ? 'Portal customer deleted successfully' : 'Lead deleted successfully', {
+        position: 'top-right',
       });
 
-      // Refresh the list
-      await fetchLeads();
-      
-      // Close modal if deleted lead was selected
-      if (selectedResponse && selectedResponse.id === leadId) {
+      removeRow(rowId);
+      await invalidatePortalList();
+
+      if (selectedResponse && selectedResponse.id === rowId) {
         setShowModal(false);
         setSelectedResponse(null);
       }
     } catch (err) {
-      console.error('Error deleting lead:', err);
-      toast.error(err.message || 'Failed to delete lead', {
-        position: "top-right"
+      console.error('Error deleting row:', err);
+      toast.error(err.message || 'Failed to delete', {
+        position: 'top-right',
       });
     }
-  }, [fetchLeads, selectedResponse]);
+  }, [invalidatePortalList, removeRow, selectedResponse]);
 
   const handleOpenConvertPreview = useCallback(async (leadId) => {
     if (!leadId) return;
@@ -1024,6 +1144,11 @@ const CustomerLeadsPage = () => {
                 )}
               </div>
             )}
+            <div style={{ marginTop: '8px', opacity: 0.95 }}>
+              When SAP promotes this Lead to Customer, run <strong>Sync from SAP</strong> on the SAP Customers
+              page to update the masterlist to the official C code (CP→C promotion preserves all jobs on the
+              same customer record).
+            </div>
           </div>
         </div>,
         {
@@ -1274,19 +1399,37 @@ const CustomerLeadsPage = () => {
       }
     }),
     leadsColumnHelper.display({
-      id: 'status',
-      header: 'Status',
+      id: 'source',
+      header: 'Source',
       cell: ({ row }) => {
         const r = row.original;
-        const status = r.status || 'PENDING';
-        const bg = status === 'CONVERTED' ? 'success' : status === 'PENDING' ? 'warning' : status === 'CONTACTED' ? 'info' : status === 'REJECTED' ? 'danger' : status === 'COMPLETED' ? 'primary' : status === 'Portal' ? 'secondary' : 'secondary';
+        const { bg, label } = getPortalSourceBadgeProps(r.portalSource);
         return (
           <Badge
             bg={bg}
             className="text-uppercase"
             style={{ fontSize: '10px', padding: '4px 8px', fontWeight: '500' }}
           >
-            {status}
+            {label}
+          </Badge>
+        );
+      }
+    }),
+    leadsColumnHelper.display({
+      id: 'status',
+      header: 'Status',
+      cell: ({ row }) => {
+        const r = row.original;
+        const status = getRowWorkflowStatus(r);
+        const { bg, text, label } = getWorkflowStatusBadgeProps(status);
+        return (
+          <Badge
+            bg={bg}
+            text={text}
+            className="text-uppercase"
+            style={{ fontSize: '10px', padding: '4px 8px', fontWeight: '500' }}
+          >
+            {label}
           </Badge>
         );
       }
@@ -1297,66 +1440,16 @@ const CustomerLeadsPage = () => {
       cell: ({ row }) => {
         const r = row.original;
         return (
-          <div className="d-flex gap-1 flex-wrap align-items-center">
-            {r.rowType === 'customer' ? (
-              <>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => { setSelectedResponse(r); setShowModal(true); }}
-                  className="btn btn-primary btn-icon-text btn-sm"
-                  style={{ fontSize: '11px', padding: '4px 10px', textDecoration: 'none' }}
-                >
-                  <Eye size={14} className="icon-left" />
-                  View
-                </Button>
-                {(r.status === 'PORTAL' || r.status === 'Portal') && !r.synced_to_sap_at && (
-                  <Button
-                    variant="outline-warning"
-                    size="sm"
-                    onClick={() => handleEdit(r, { portal: true })}
-                    className="d-flex align-items-center justify-content-center"
-                    style={{ fontSize: '11px', padding: '4px 8px' }}
-                    title="Edit limited portal lead details"
-                  >
-                    <Edit size={12} />
-                  </Button>
-                )}
-              </>
-            ) : (
-              <>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => { setSelectedResponse(r); setShowModal(true); }}
-                  className="btn btn-primary btn-icon-text btn-sm"
-                  style={{ textDecoration: 'none' }}
-                >
-                  <Eye size={14} className="icon-left" />
-                  View
-                </Button>
-                <Button
-                  variant="outline-warning"
-                  size="sm"
-                  onClick={() => handleEdit(r)}
-                  className="d-flex align-items-center justify-content-center"
-                  title={isSyncedToSAP(r) ? 'Cannot edit: Lead has been synced to SAP' : 'Edit lead details'}
-                  style={{ fontSize: '11px', padding: '4px 8px' }}
-                >
-                  <Edit size={12} />
-                </Button>
-                <Button
-                  variant="outline-danger"
-                  size="sm"
-                  onClick={() => handleDelete(r.id)}
-                  className="d-flex align-items-center justify-content-center"
-                  style={{ fontSize: '11px', padding: '4px 8px' }}
-                >
-                  <X size={12} />
-                </Button>
-              </>
-            )}
-          </div>
+          <PortalRowActions
+            row={r}
+            onView={(item) => {
+              setSelectedResponse(item);
+              setShowModal(true);
+            }}
+            onEdit={handleEdit}
+            onDelete={handleDelete}
+            isSyncedToSAP={isSyncedToSAP}
+          />
         );
       }
     })
@@ -1414,12 +1507,30 @@ const CustomerLeadsPage = () => {
       const data = await response.json();
 
       const refetchLeadJobs = async () => {
-        const jobsRes = await fetch(`/api/leads/${leadId}/jobs`).then((r) => (r.ok ? r.json() : {}));
-        if (jobsRes.jobsByServiceDate) {
-          setLeadJobsByDate(jobsRes.jobsByServiceDate);
-          return jobsRes.jobsByServiceDate;
+        setLeadJobsLoading(true);
+        setLeadJobsError(null);
+        try {
+          const jobsRes = await fetch(`/api/leads/${leadId}/jobs`, {
+            credentials: 'include',
+            cache: 'no-store',
+            headers: { 'Cache-Control': 'no-cache' },
+          });
+          if (!jobsRes.ok) {
+            const body = await jobsRes.json().catch(() => ({}));
+            throw new Error(body.error || `Failed to load jobs (${jobsRes.status})`);
+          }
+          const data = await jobsRes.json();
+          if (data.jobsByServiceDate) {
+            setLeadJobsByDate(data.jobsByServiceDate);
+            return data.jobsByServiceDate;
+          }
+          return {};
+        } catch (err) {
+          setLeadJobsError(err.message || 'Failed to load jobs for this lead');
+          return {};
+        } finally {
+          setLeadJobsLoading(false);
         }
-        return {};
       };
 
       if (!response.ok) {
@@ -1538,10 +1649,10 @@ const CustomerLeadsPage = () => {
       );
     }
 
-    if (error) {
+    if (displayError) {
       return (
         <div className="text-center py-5">
-          <div className="text-danger mb-2">Error: {error}</div>
+          <div className="text-danger mb-2">Error: {displayError}</div>
           <Button variant="primary" onClick={() => fetchLeads(true)}>
             <RefreshCw size={16} className="me-2" />
             Sync & Retry
@@ -1566,11 +1677,14 @@ const CustomerLeadsPage = () => {
       );
     }
 
-    if (totalItems === 0 && searchQuery.trim()) {
+    if (totalItems === 0 && searchApplied.trim()) {
       return (
         <div className="text-center py-5">
-          <div className="text-muted mb-2">No leads found matching &quot;{searchQuery}&quot;</div>
-          <Button variant="outline-secondary" onClick={() => setSearchQuery('')}>
+          <div className="text-muted mb-2">No leads found matching &quot;{searchApplied}&quot;</div>
+          <Button variant="outline-secondary" onClick={() => {
+            clearSearch();
+            setCurrentPage(1);
+          }}>
             Clear Search
           </Button>
         </div>
@@ -1631,19 +1745,22 @@ const CustomerLeadsPage = () => {
                         style={{ marginTop: '0' }}
                       />
                       <Badge 
-                        bg={
-                          response.status === 'CONVERTED' ? 'success' :
-                          response.status === 'PENDING' ? 'warning' :
-                          response.status === 'CONTACTED' ? 'info' :
-                          response.status === 'REJECTED' ? 'danger' :
-                          response.status === 'COMPLETED' ? 'primary' :
-                          'secondary'
-                        }
+                        bg={getWorkflowStatusBadgeProps(getRowWorkflowStatus(response)).bg}
+                        text={getWorkflowStatusBadgeProps(getRowWorkflowStatus(response)).text}
                         className="text-uppercase"
                         style={{ fontSize: '10px', padding: '4px 8px' }}
                       >
-                        {response.status || (response.rowType === 'customer' ? 'Portal' : 'PENDING')}
+                        {getRowWorkflowStatus(response)}
                       </Badge>
+                      {response.portalSource && (
+                        <Badge
+                          bg={getPortalSourceBadgeProps(response.portalSource).bg}
+                          className="text-uppercase"
+                          style={{ fontSize: '10px', padding: '4px 8px' }}
+                        >
+                          {getPortalSourceBadgeProps(response.portalSource).label}
+                        </Badge>
+                      )}
                       {response.customer_code && (
                         <Badge bg="secondary" style={{ fontSize: '10px', padding: '4px 8px' }}>{response.customer_code}</Badge>
                       )}
@@ -1687,56 +1804,17 @@ const CustomerLeadsPage = () => {
                   </div>
 
                   <div className="d-flex gap-1 mt-2">
-                    {response.rowType === 'customer' ? (
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={() => {
-                          setSelectedResponse(response);
-                          setShowModal(true);
-                        }}
-                        className="flex-fill d-flex align-items-center justify-content-center gap-1"
-                        style={{ fontSize: '12px', textDecoration: 'none' }}
-                      >
-                        <Eye size={12} />
-                        View
-                      </Button>
-                    ) : (
-                      <>
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      onClick={() => {
-                        setSelectedResponse(response);
+                    <PortalRowActions
+                      row={response}
+                      mobile
+                      onView={(item) => {
+                        setSelectedResponse(item);
                         setShowModal(true);
                       }}
-                      className="flex-fill d-flex align-items-center justify-content-center gap-1"
-                      style={{ fontSize: '12px', textDecoration: 'none' }}
-                    >
-                      <Eye size={12} />
-                      View
-                    </Button>
-                    <Button
-                      variant="outline-warning"
-                      size="sm"
-                      onClick={() => handleEdit(response)}
-                      className="d-flex align-items-center justify-content-center"
-                      title={isSyncedToSAP(response) ? 'Cannot edit: Lead has been synced to SAP' : 'Edit lead details'}
-                      style={{ fontSize: '12px', padding: '4px 8px' }}
-                    >
-                      <Edit size={12} />
-                    </Button>
-                    <Button
-                      variant="outline-danger"
-                      size="sm"
-                      onClick={() => handleDelete(response.id)}
-                      className="d-flex align-items-center justify-content-center"
-                      style={{ fontSize: '12px', padding: '4px 8px' }}
-                    >
-                      <X size={12} />
-                    </Button>
-                      </>
-                    )}
+                      onEdit={handleEdit}
+                      onDelete={handleDelete}
+                      isSyncedToSAP={isSyncedToSAP}
+                    />
                   </div>
                 </Card.Body>
               </Card>
@@ -1823,7 +1901,7 @@ const CustomerLeadsPage = () => {
   };
 
   return (
-    <Container fluid className="px-4" style={{ paddingTop: '1rem', paddingBottom: '1rem' }}>
+    <Fragment>
       <style>{`
         .btn-primary.btn-icon-text {
           background-color: #3b82f6;
@@ -1859,15 +1937,15 @@ const CustomerLeadsPage = () => {
           <div
             style={{
               background: "linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)",
-              padding: "1.5rem 2rem",
+              padding: "2rem 2rem 1.5rem",
               borderRadius: "0 0 24px 24px",
-              marginTop: "-55px",
+              marginTop: "-39px",
               marginLeft: "10px",
               marginRight: "10px",
               marginBottom: "20px",
             }}
           >
-            <div className="d-flex justify-content-between align-items-start">
+            <div className="d-flex justify-content-between align-items-start gap-3">
               <div className="d-flex flex-column">
                 <div className="mb-3">
                   <h1
@@ -1964,6 +2042,22 @@ const CustomerLeadsPage = () => {
               </div>
 
               <div className="d-flex gap-2">
+                <Link href="/dashboard/customers/create" className="text-decoration-none">
+                  <Button
+                    variant="light"
+                    className="d-flex align-items-center gap-2"
+                    style={{
+                      border: "none",
+                      borderRadius: "12px",
+                      padding: "10px 20px",
+                      fontWeight: "500",
+                      boxShadow: "0 4px 6px rgba(0, 0, 0, 0.1)",
+                    }}
+                  >
+                    <Plus size={16} />
+                    Create Portal Customers
+                  </Button>
+                </Link>
                 <Button
                   variant="light"
                   onClick={handleOpenSyncPreview}
@@ -2000,11 +2094,10 @@ const CustomerLeadsPage = () => {
           </div>
         </Col>
       </Row>
-      {/* Global Search - outside the table card */}
+      {/* Global Search + table share one Col so sticky has room to stick (matches customers list) */}
       <Row>
-        <Col md={12} className="mb-3">
-          <Card className="border-0 shadow-sm" style={{ background: 'linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)' }}>
-            <Card.Body className="p-3">
+        <Col md={12} xs={12} className="mb-5">
+          <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_BLUE}>
               <Row className="align-items-center">
                 <Col md={12}>
                   <div className="d-flex align-items-center gap-3">
@@ -2014,15 +2107,16 @@ const CustomerLeadsPage = () => {
                         🌐 Global Search
                       </h6>
                       <small className="text-white" style={{ opacity: 0.9, fontSize: '0.75rem' }}>
-                        ⚡ Live • All Fields
+                        Press Enter to search
                       </small>
                     </div>
                     <div className="flex-grow-1">
                       <Form.Control
                         type="text"
                         placeholder="Search by email, name, phone, address, block, unit, status, or customer code (e.g. CP00001)..."
-                        value={searchQuery}
-                        onChange={handleSearchChange}
+                        value={searchDraft}
+                        onChange={(e) => setSearchDraft(e.target.value)}
+                        onKeyDown={onSearchKeyDown}
                         style={{
                           fontSize: '0.95rem',
                           padding: '0.65rem 1rem',
@@ -2034,11 +2128,14 @@ const CustomerLeadsPage = () => {
                         autoComplete="off"
                       />
                     </div>
-                    {searchQuery && (
+                    {(searchDraft || searchApplied) && (
                       <Button
                         variant="light"
                         size="sm"
-                        onClick={() => setSearchQuery('')}
+                        onClick={() => {
+                          clearSearch();
+                          setCurrentPage(1);
+                        }}
                         className="d-flex align-items-center gap-1"
                         style={{ minWidth: '90px', fontWeight: '500', borderRadius: '6px' }}
                       >
@@ -2047,7 +2144,7 @@ const CustomerLeadsPage = () => {
                       </Button>
                     )}
                   </div>
-                  {searchQuery ? (
+                  {searchApplied ? (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.95 }}>
                       <small style={{ fontSize: '0.85rem' }}>
                         ✓ Found <strong>{filterData(activeTab === 'allResponses' ? responses : pendingResponses).length}</strong> of <strong>{activeTab === 'allResponses' ? responses.length : pendingResponses.length}</strong> lead(s)
@@ -2056,18 +2153,14 @@ const CustomerLeadsPage = () => {
                   ) : (
                     <div className="mt-2 text-white d-flex align-items-center gap-2" style={{ opacity: 0.85 }}>
                       <small style={{ fontSize: '0.8rem' }}>
-                        💡 <strong>Tip:</strong> Search across email, name, phone, address, block, unit, status, or customer code (e.g. CP00001). Converted leads with a CP code appear in here. 
+                        💡 <strong>Tip:</strong> Press Enter to search by email, name, phone, address, block, unit, status, or customer code (e.g. CP00001). Converted leads with a CP code appear in here.
                       </small>
                     </div>
                   )}
                 </Col>
               </Row>
-            </Card.Body>
-          </Card>
-        </Col>
-      </Row>
-      <Row>
-        <Col xl={12} lg={12} md={12} sm={12}>
+          </DashboardListStickySearch>
+
           <Card className="shadow-sm">
             <Card.Body>
               <Tabs
@@ -2194,6 +2287,22 @@ const CustomerLeadsPage = () => {
                   {convertPreviewData.warnings.map((w) => (
                     <div key={w}>{w}</div>
                   ))}
+                </div>
+              )}
+              {convertPreviewData.siblingPortalCustomers?.length > 0 && (
+                <div className="alert alert-warning mb-3">
+                  <strong>Sibling portal records</strong>
+                  <ul className="mb-0 mt-2 ps-3">
+                    {convertPreviewData.siblingPortalCustomers.map((s) => (
+                      <li key={s.customer_code}>
+                        {s.customer_code} — {s.customer_name}
+                        {s.email ? ` (${s.email})` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mb-0 mt-2 small">
+                    Another CP record shares this email/phone. Review or merge before converting to SAP.
+                  </p>
                 </div>
               )}
               <Row className="mb-3 g-3">
@@ -2367,7 +2476,25 @@ const CustomerLeadsPage = () => {
                     {(syncPreviewData.skippedMissingCount || 0) > 0 && (
                       <Badge bg="warning" text="dark">{syncPreviewData.skippedMissingCount} skipped (missing fields)</Badge>
                     )}
+                    {(syncPreviewData.skippedEmailDuplicates?.length || 0) > 0 && (
+                      <Badge bg="danger">{syncPreviewData.skippedEmailDuplicates.length} duplicate email (skipped)</Badge>
+                    )}
                   </div>
+                  {(syncPreviewData.skippedEmailDuplicates?.length || 0) > 0 && (
+                    <div className="alert alert-warning mb-3">
+                      <strong>Duplicate email/phone in portal</strong>
+                      <ul className="mb-0 mt-2 ps-3 small">
+                        {syncPreviewData.skippedEmailDuplicates.map((row) => (
+                          <li key={`${row.email}-${row.existing_customer_code}`}>
+                            {row.full_name || row.email} — already exists as{' '}
+                            <Link href={`/customer-leads?highlight=${encodeURIComponent(row.existing_customer_code)}`}>
+                              {row.existing_customer_code}
+                            </Link>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                   {(syncPreviewData.willSync && syncPreviewData.willSync.length > 0) ? (
                     <>
                       <div className="mb-2 d-flex gap-2">
@@ -2498,6 +2625,8 @@ const CustomerLeadsPage = () => {
         onClose={() => setShowModal(false)}
         response={selectedResponse}
         leadJobsByDate={leadJobsByDate}
+        leadJobsLoading={leadJobsLoading}
+        leadJobsError={leadJobsError}
         createJobsStatus={createJobsStatus}
         isCreatingCustomer={isCreatingCustomer || convertPreviewLoading}
         onRequestConvertPreview={handleOpenConvertPreview}
@@ -2507,6 +2636,9 @@ const CustomerLeadsPage = () => {
         isSyncedToSAP={isSyncedToSAP}
         sapVerifyStatus={sapVerifyStatus}
         onSyncComplete={() => fetchLeads()}
+        portalDetailBundle={portalDetailBundle}
+        portalDetailLoading={portalDetailLoading}
+        portalDetailError={portalDetailError}
       />
       {/* Edit Lead Modal */}
       <Modal
@@ -2817,7 +2949,7 @@ const CustomerLeadsPage = () => {
         theme="light"
         limit={3}
       />
-    </Container>
+    </Fragment>
   );
 };
 

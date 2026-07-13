@@ -5,6 +5,7 @@
  * Caps: 50 (quick) / 200 (full). Short private cache.
  */
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import { withSession } from '../../../lib/api/withSession';
 import { textMatchesAllSearchTokens } from '../../../lib/utils/multiTokenSearch';
 import {
   SUPABASE_CUSTOMER_LIST_FLAT_SELECT,
@@ -333,7 +334,7 @@ async function searchFormLeadsFiltered(supabase, tokens, limit) {
   return data || [];
 }
 
-export default async function handler(req, res) {
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -430,4 +431,4 @@ export default async function handler(req, res) {
     console.error('global-masterlist:', e);
     return res.status(500).json({ error: e?.message || 'Search failed' });
   }
-}
+});

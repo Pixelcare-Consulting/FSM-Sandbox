@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Table, Spinner, Button, Modal, Form, InputGroup, Container, Row, Col } from 'react-bootstrap';
 import { Search, Eye, CaretUpFill, CaretDownFill, XCircle } from 'react-bootstrap-icons';
 import TablePagination from 'components/common/TablePagination';
@@ -27,9 +27,11 @@ const EQUIPMENT_FIELDS = [
   { key: 'Notes', label: 'Notes' },
 ];
 
-const EquipmentsTab = ({ customerData }) => {
-  const [equipments, setEquipments] = useState([]);
-  const [loading, setLoading] = useState(true);
+const EquipmentsTab = ({ customerData, equipments: initialEquipments = null, onEquipmentsLoaded }) => {
+  const [equipments, setEquipments] = useState(
+    Array.isArray(initialEquipments) ? initialEquipments : []
+  );
+  const [loading, setLoading] = useState(!Array.isArray(initialEquipments));
   const [error, setError] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [showModal, setShowModal] = useState(false);
@@ -38,23 +40,44 @@ const EquipmentsTab = ({ customerData }) => {
   const [equipmentsPerPage, setEquipmentsPerPage] = useState(20);
   const [sortField, setSortField] = useState('ItemCode');
   const [sortDirection, setSortDirection] = useState('desc');
+  const fetchGenerationRef = useRef(0);
+  const hasFetchedRef = useRef(Array.isArray(initialEquipments));
+  const lastCardCodeRef = useRef(customerData?.CardCode);
 
   useEffect(() => {
+    if (customerData?.CardCode !== lastCardCodeRef.current) {
+      lastCardCodeRef.current = customerData?.CardCode;
+      hasFetchedRef.current = Array.isArray(initialEquipments);
+    }
+
+    if (Array.isArray(initialEquipments)) {
+      setEquipments(initialEquipments);
+      setLoading(false);
+      hasFetchedRef.current = true;
+      return;
+    }
+
+    const cardCode = customerData?.CardCode;
+    if (!cardCode || hasFetchedRef.current) {
+      if (!cardCode) setLoading(false);
+      return;
+    }
+
+    hasFetchedRef.current = true;
+    const generation = ++fetchGenerationRef.current;
+    const isStale = () => generation !== fetchGenerationRef.current;
+
     const fetchEquipments = async () => {
-      if (!customerData?.CardCode) {
-        setLoading(false);
-        return;
-      }
-      
+      setLoading(true);
+      setError(null);
+
       try {
         const response = await fetch('/api/getEquipments', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            cardCode: customerData.CardCode
-          })
+          body: JSON.stringify({ cardCode }),
         });
 
         if (!response.ok) {
@@ -62,16 +85,24 @@ const EquipmentsTab = ({ customerData }) => {
         }
 
         const data = await response.json();
-        setEquipments(data || []);
+        const rows = Array.isArray(data) ? data : [];
+        if (!isStale()) {
+          setEquipments(rows);
+          onEquipmentsLoaded?.(rows);
+        }
       } catch (err) {
-        setError(err.message);
+        if (!isStale()) {
+          setError(err.message);
+        }
       } finally {
-        setLoading(false);
+        if (!isStale()) {
+          setLoading(false);
+        }
       }
     };
 
     fetchEquipments();
-  }, [customerData?.CardCode]);
+  }, [customerData?.CardCode, initialEquipments, onEquipmentsLoaded]);
 
   const handleSearch = (event) => {
     setSearchTerm(event.target.value);
@@ -100,7 +131,6 @@ const EquipmentsTab = ({ customerData }) => {
   };
 
   const buildServiceLocationAddress = (equipment) => {
-    // Build Service Location Address from equipment data: Building, Street, Country, Zip
     const parts = [
       equipment.Building,
       equipment.street,
@@ -122,8 +152,8 @@ const EquipmentsTab = ({ customerData }) => {
       <CaretDownFill className="ms-1" />;
   };
 
-  const sortEquipments = (equipments) => {
-    return [...equipments].sort((a, b) => {
+  const sortEquipments = (items) => {
+    return [...items].sort((a, b) => {
       let compareA = a[sortField];
       let compareB = b[sortField];
 
@@ -144,7 +174,7 @@ const EquipmentsTab = ({ customerData }) => {
     return (
       <div className="p-4 text-center">
         <Spinner animation="border" />
-        <span className="ms-2">Loading...</span>
+        <span className="ms-2">Loading equipment...</span>
       </div>
     );
   }

@@ -31,6 +31,9 @@ import "flatpickr/dist/themes/light.css";
 import { startOfMonth, endOfMonth, format, parseISO } from "date-fns";
 import { GeeksSEO } from "widgets";
 import { DashboardHeader } from "sub-components";
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from "../../../sub-components/dashboard/DashboardListStickySearch";
 import TablePagination from "../../../components/common/TablePagination";
 import {
   getAttendanceMinutes,
@@ -664,11 +667,10 @@ const AttendancePage = () => {
           Back to Technicians
         </Link>
 
-        <Card
-          className="border-0 shadow-sm mb-3"
-          style={{ background: "linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)" }}
+        <DashboardListStickySearch
+          style={STICKY_SEARCH_GRADIENT_BLUE}
+          bodyClassName="p-4"
         >
-          <Card.Body className="p-4">
             <Row className="align-items-center mb-3">
               <Col md={12}>
                 <div className="d-flex align-items-center gap-3 flex-wrap">
@@ -829,8 +831,7 @@ const AttendancePage = () => {
                 Range: {dateLabel}
               </p>
             ) : null}
-          </Card.Body>
-        </Card>
+        </DashboardListStickySearch>
 
         {hasLoaded && groups.length > 0 && (
           <Card className="border-0 shadow-sm mb-3">

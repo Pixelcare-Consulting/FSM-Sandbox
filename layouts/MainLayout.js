@@ -3,10 +3,8 @@ import FooterWithSocialIcons from "@/layouts/marketing/footers/FooterWithSocialI
 
 const MainLayout = ({ children, showFooter = true }) => {
   return (
-    // <div className="flex flex-col min-h-screen">
-    //   <main className="flex-grow flex flex-col">
-    <div>
-      <main>
+    <div className="d-flex flex-column min-vh-100">
+      <main className="flex-grow-1">
         {children}
       </main>
       {showFooter && <FooterWithSocialIcons />}

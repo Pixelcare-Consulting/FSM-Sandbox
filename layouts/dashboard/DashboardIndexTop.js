@@ -29,21 +29,23 @@ import NavbarTopRoutes from 'routes/dashboard/NavbarTopRoutes';
 // import utility function
 import { getCompanyDetails } from '../../utils/companyCache';
 import { useLogo } from '../../contexts/LogoContext';
-import { useSessionCheck } from '../../hooks/useSessionCheck';
-import Cookies from 'js-cookie';
+import { useDashboardBootstrap } from '../../hooks/useDashboardBootstrap';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 
 /** Horizontal padding for top-nav + page body — keep in sync with dashboard hero inner wrapper (overview). */
 const PAGE_GUTTER = 'px-3 px-sm-4';
 
 const DashboardIndexTop = (props) => {
 	const { logo } = useLogo();
-	const isAdminNav = Cookies.get('isAdmin') === 'true';
+	const { user } = useCurrentUser();
+	const isAdminNav = user?.role === 'ADMIN';
 	const [expandedMenu, setExpandedMenu] = useState(false);
-	useSessionCheck();
+	useDashboardBootstrap();
 
 	return (
 		<div>
 			<CompanyMemosSignInModal />
+			<header className="dashboard-sticky-header">
 			<Navbar
 				bg="white"
 				expand="lg"
@@ -64,21 +66,6 @@ const DashboardIndexTop = (props) => {
 								style={{ height: '76px', minWidth: '120px', maxWidth: '220px', width: 'auto', objectFit: 'contain' }} 
 							/>
 						</Navbar.Brand>
-						<span
-							className="ms-2 ms-md-3 flex-shrink-0 fw-bold text-uppercase"
-							style={{
-								fontSize: '0.9rem',
-								letterSpacing: '0.14em',
-								color: '#d97706',
-								border: '2px solid #d97706',
-								borderRadius: '4px',
-								padding: '4px 10px',
-								lineHeight: 1.2,
-							}}
-							aria-label="Sandbox environment"
-						>
-							SANDBOX
-						</span>
 						<CompanyMemoTicker />
 					</div>
 					{/* search box */}
@@ -136,6 +123,7 @@ const DashboardIndexTop = (props) => {
 					</Navbar.Collapse>
 				</Container>
 			</Navbar>
+			</header>
 			<Container fluid className={`mt-2 mb-6 ${PAGE_GUTTER}`}>
 				{props.children}
 			</Container>

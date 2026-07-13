@@ -8,9 +8,9 @@ import {
   coordinatedSessionLogout,
   shouldLogoutOnAuthError,
   isLogoutInProgress,
-  subscribeToSessionLogout,
   sleep,
   isWithinPostLoginGrace,
+  tryAcquireSessionProbe,
 } from '../lib/auth/sessionTabSync';
 
 /**
@@ -26,6 +26,9 @@ import {
  * Important: This is the only active session manager. Other hooks like
  * useSessionRenewal are deprecated and should not force logout.
  */
+
+// Stagger renewal polls (60s) vs getUserInfo session check (30s)
+const RENEWAL_POLL_INTERVAL_MS = 60 * 1000;
 
 // Module-level lock to prevent duplicate renewals across all component instances
 let globalRenewalInProgress = false;
@@ -101,15 +104,17 @@ function applyRenewalExpiryCookie(data) {
 const ActivityTracker = () => {
   const router = useRouter();
   useIdleTimeout();
+  const pathnameRef = useRef(router.pathname);
+  pathnameRef.current = router.pathname;
   const renewalInProgress = useRef(false);
   const lastRenewalTime = useRef(0);
   const lastWarningTime = useRef(0);
   const renewalAttempts = useRef(0);
-  const CHECK_INTERVAL = SESSION_CONFIG.RENEWAL_CHECK_INTERVAL_MS;
 
   const checkAndRenewSession = useCallback(async () => {
+    if (!pathnameRef.current.includes('/dashboard')) return;
     // Skip if on authentication pages
-    if (router.pathname.includes('/authentication') || router.pathname === '/sign-in') {
+    if (pathnameRef.current.includes('/authentication') || pathnameRef.current === '/sign-in') {
       return;
     }
 
@@ -157,6 +162,8 @@ const ActivityTracker = () => {
           
           // Trigger renewal to create missing session cookies
           try {
+            if (!tryAcquireSessionProbe()) return;
+
             renewalInProgress.current = true;
             globalRenewalInProgress = true;
             lastRenewalTime.current = now;
@@ -309,6 +316,8 @@ const ActivityTracker = () => {
         }
         
         // Set flags immediately before any async operations (both component and global)
+        if (!tryAcquireSessionProbe()) return;
+
         renewalInProgress.current = true;
         globalRenewalInProgress = true;
         lastRenewalTime.current = now;
@@ -449,32 +458,33 @@ const ActivityTracker = () => {
        // console.log('🏁 [ActivityTracker] Renewal process complete, flags cleared');
       }, 1000); // 1 second grace period
     }
-  }, [router, CHECK_INTERVAL]);
+  }, []);
+
+  const checkAndRenewSessionRef = useRef(checkAndRenewSession);
+  checkAndRenewSessionRef.current = checkAndRenewSession;
 
   // Check on mount and interval
   useEffect(() => {
-    // Initial check after small delay to ensure cookies are loaded
     const initialTimeout = setTimeout(() => {
-    //  console.log('🚀 [ActivityTracker] Starting initial session check...');
-      checkAndRenewSession();
-    }, 2000); // 2 second delay on mount
-    
-    const intervalId = setInterval(checkAndRenewSession, CHECK_INTERVAL);
-    
+      void checkAndRenewSessionRef.current();
+    }, 2000);
+
+    const intervalId = setInterval(() => {
+      void checkAndRenewSessionRef.current();
+    }, RENEWAL_POLL_INTERVAL_MS);
+
     return () => {
       clearTimeout(initialTimeout);
       clearInterval(intervalId);
     };
-  }, [checkAndRenewSession, CHECK_INTERVAL]);
+  }, []);
 
   // Check on tab focus (user returns to tab)
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        //console.log('👁️ [ActivityTracker] Tab visible, checking session...');
-        // Small delay to ensure browser has processed any cookie updates
         setTimeout(() => {
-          checkAndRenewSession();
+          void checkAndRenewSessionRef.current();
         }, 500);
       }
     };
@@ -483,15 +493,6 @@ const ActivityTracker = () => {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [checkAndRenewSession]);
-
-  // Redirect when another tab performs coordinated logout
-  useEffect(() => {
-    return subscribeToSessionLogout((message) => {
-      if (isLogoutInProgress()) return;
-      window.location.href =
-        '/sign-in?toast=' + encodeURIComponent(message || 'Session ended. Please log in again.');
-    });
   }, []);
 
   return null;

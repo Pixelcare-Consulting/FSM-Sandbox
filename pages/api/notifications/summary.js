@@ -16,6 +16,39 @@ const CACHE_TTL_MS = 30000;
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 20;
 
+/** Per-instance in-flight dedupe to avoid cache stampede on concurrent misses. */
+const inFlightQueries = new Map();
+
+async function loadNotificationsSummaryPayload(supabase, subjectIds, limit, cacheKey) {
+  const orClause = `${subjectIds.map((id) => `worker_id.eq.${id}`).join(',')},worker_id.is.null`;
+
+  const { data, totalCount } = await paginatedSelect(
+    supabase,
+    'notifications',
+    NOTIFICATIONS_SUMMARY_SELECT,
+    {
+      page: 1,
+      limit,
+      notDeleted: false,
+      countExact: true,
+      order: { column: 'created_at', ascending: false },
+      filters: (query) => query.or(orClause).eq('hidden', false),
+    }
+  );
+
+  const notifications = data || [];
+  const payload = {
+    notifications,
+    unreadCount: notifications.filter((n) => !n.read).length,
+    totalCount,
+    limit,
+    fetchedAt: new Date().toISOString(),
+  };
+
+  setListCache(cacheKey, payload, CACHE_TTL_MS);
+  return payload;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -48,39 +81,28 @@ export default async function handler(req, res) {
     return res.status(200).json(cached);
   }
 
-  try {
-    const supabase = getSupabaseAdmin();
-    if (!supabase) {
-      return res.status(503).json({ error: 'Database unavailable' });
-    }
+  const supabase = getSupabaseAdmin();
+  if (!supabase) {
+    return res.status(503).json({ error: 'Database unavailable' });
+  }
 
-    const orClause = `${subjectIds.map((id) => `worker_id.eq.${id}`).join(',')},worker_id.is.null`;
-
-    const { data, totalCount } = await paginatedSelect(
-      supabase,
-      'notifications',
-      NOTIFICATIONS_SUMMARY_SELECT,
-      {
-        page: 1,
-        limit,
-        notDeleted: false,
-        countExact: true,
-        order: { column: 'created_at', ascending: false },
-        filters: (query) => query.or(orClause).eq('hidden', false),
+  let inFlight = inFlightQueries.get(cacheKey);
+  const joinedInFlight = Boolean(inFlight);
+  if (!inFlight) {
+    inFlight = loadNotificationsSummaryPayload(supabase, subjectIds, limit, cacheKey).finally(() => {
+      if (inFlightQueries.get(cacheKey) === inFlight) {
+        inFlightQueries.delete(cacheKey);
       }
+    });
+    inFlightQueries.set(cacheKey, inFlight);
+  }
+
+  try {
+    const payload = await inFlight;
+    logResponseSize(
+      joinedInFlight ? 'notifications/summary (singleflight)' : 'notifications/summary',
+      payload
     );
-
-    const notifications = data || [];
-    const payload = {
-      notifications,
-      unreadCount: notifications.filter((n) => !n.read).length,
-      totalCount,
-      limit,
-      fetchedAt: new Date().toISOString(),
-    };
-
-    setListCache(cacheKey, payload, CACHE_TTL_MS);
-    logResponseSize('notifications/summary', payload);
 
     return res.status(200).json(payload);
   } catch (error) {

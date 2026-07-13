@@ -37,6 +37,8 @@ export function useCustomerJobHistoryQuery(customerId, params, { enabled = true 
       staleTime: STALE_TIME_MS,
       keepPreviousData: true,
       refetchOnWindowFocus: false,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
     }
   );
 

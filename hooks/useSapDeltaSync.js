@@ -23,6 +23,11 @@ const DEFAULT_TOAST_STYLES = {
     color: '#1e40af',
     border: '1px solid #bfdbfe',
   },
+  WARNING: {
+    background: '#fffbeb',
+    color: '#92400e',
+    border: '1px solid #fde68a',
+  },
 };
 
 /**
@@ -35,6 +40,7 @@ const DEFAULT_TOAST_STYLES = {
  */
 export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSuccess } = {}) {
   const [syncCode, setSyncCode] = useState('');
+  const [portalCustomerCode, setPortalCustomerCode] = useState('');
   const [isSyncingDelta, setIsSyncingDelta] = useState(false);
   const [syncDeltaError, setSyncDeltaError] = useState('');
   const [syncDeltaSummary, setSyncDeltaSummary] = useState(null);
@@ -44,6 +50,7 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
     preview: null,
     error: null,
     pendingCode: '',
+    pendingPortalCode: '',
   });
 
   const closePreviewModal = useCallback(() => {
@@ -54,11 +61,12 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
       preview: null,
       error: null,
       pendingCode: '',
+      pendingPortalCode: '',
     }));
   }, []);
 
   const runActualSync = useCallback(
-    async (normalizedCode) => {
+    async (normalizedCode, normalizedPortalCode = '') => {
       setIsSyncingDelta(true);
       setSyncDeltaError('');
       setSyncDeltaSummary(null);
@@ -79,6 +87,7 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
 
       const requestBody = {};
       if (normalizedCode) requestBody.customerCode = normalizedCode;
+      if (normalizedPortalCode) requestBody.portalCustomerCode = normalizedPortalCode;
 
       try {
         const response = await fetch('/api/customers/sync-delta', {
@@ -97,14 +106,28 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
         }
 
         const summary = payload.summary || {};
+        const warnings = Array.isArray(payload.warnings)
+          ? payload.warnings.filter(Boolean)
+          : [];
         setSyncDeltaSummary(summary);
         closePreviewModal();
 
         if (onSyncSuccess) {
-          await onSyncSuccess({ summary, normalizedCode, loadingToastId });
+          await onSyncSuccess({ summary, normalizedCode, loadingToastId, warnings, payload });
         }
 
-        return { summary, payload };
+        if (warnings.length > 0) {
+          toast(warnings.slice(0, 3).join(' · '), {
+            icon: '⚠️',
+            duration: 9000,
+            style: {
+              ...toastStyles.BASE,
+              ...(toastStyles.WARNING || DEFAULT_TOAST_STYLES.WARNING),
+            },
+          });
+        }
+
+        return { summary, payload, warnings };
       } catch (error) {
         const message =
           error?.name === 'AbortError'
@@ -127,9 +150,10 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
     [closePreviewModal, onSyncSuccess, toastStyles]
   );
 
-  const fetchPreview = useCallback(async (normalizedCode) => {
+  const fetchPreview = useCallback(async (normalizedCode, normalizedPortalCode = '') => {
     const requestBody = { preview: true };
     if (normalizedCode) requestBody.customerCode = normalizedCode;
+    if (normalizedPortalCode) requestBody.portalCustomerCode = normalizedPortalCode;
 
     const response = await fetch('/api/customers/sync-delta', {
       method: 'POST',
@@ -152,6 +176,7 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
     if (isSyncingDelta) return;
 
     const normalizedCode = String(syncCode || '').trim().toUpperCase();
+    const normalizedPortalCode = String(portalCustomerCode || '').trim().toUpperCase();
     setSyncDeltaError('');
     setPreviewModal({
       show: true,
@@ -159,10 +184,11 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
       preview: null,
       error: null,
       pendingCode: normalizedCode,
+      pendingPortalCode: normalizedPortalCode,
     });
 
     try {
-      const preview = await fetchPreview(normalizedCode);
+      const preview = await fetchPreview(normalizedCode, normalizedPortalCode);
       setPreviewModal((prev) => ({
         ...prev,
         loading: false,
@@ -177,16 +203,20 @@ export function useSapDeltaSync({ toastStyles = DEFAULT_TOAST_STYLES, onSyncSucc
         error: error?.message || 'Failed to load SAP preview',
       }));
     }
-  }, [fetchPreview, isSyncingDelta, syncCode]);
+  }, [fetchPreview, isSyncingDelta, portalCustomerCode, syncCode]);
 
   const confirmSyncFromPreview = useCallback(async () => {
     const normalizedCode = previewModal.pendingCode || String(syncCode || '').trim().toUpperCase();
-    await runActualSync(normalizedCode);
-  }, [previewModal.pendingCode, runActualSync, syncCode]);
+    const normalizedPortalCode =
+      previewModal.pendingPortalCode || String(portalCustomerCode || '').trim().toUpperCase();
+    await runActualSync(normalizedCode, normalizedPortalCode);
+  }, [portalCustomerCode, previewModal.pendingCode, previewModal.pendingPortalCode, runActualSync, syncCode]);
 
   return {
     syncCode,
     setSyncCode,
+    portalCustomerCode,
+    setPortalCustomerCode,
     isSyncingDelta,
     syncDeltaError,
     syncDeltaSummary,

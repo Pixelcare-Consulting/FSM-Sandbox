@@ -15,6 +15,7 @@
  * }
  */
 
+import { blockIfProduction } from '../../../lib/api/blockInProduction';
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 
 export default async function handler(req, res) {
@@ -26,13 +27,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // Only allow in development
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'This endpoint is only available in development mode' 
-    });
-  }
+  if (blockIfProduction(req, res)) return;
 
   try {
     const {

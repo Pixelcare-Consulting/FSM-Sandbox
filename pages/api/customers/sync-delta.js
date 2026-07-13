@@ -28,6 +28,11 @@ import {
   AUDIT_CATEGORIES,
   AUDIT_STATUS,
 } from '../../../lib/services/auditLog';
+import { invalidateListCache } from '../../../lib/supabase/listQueryHelpers';
+
+function invalidateSapMasterlistCache() {
+  invalidateListCache('customers-sap-masterlist');
+}
 
 function parseBody(req) {
   if (typeof req.body === 'string') {
@@ -228,6 +233,7 @@ export default async function handler(req, res) {
           summary.counts.masterlistCustomersUpdated = 1;
           summary.elapsedMs = Date.now() - startedAt;
           await logDeltaSyncAudit(req, summary, AUDIT_STATUS.SUCCESS);
+          invalidateSapMasterlistCache();
           return res.status(200).json({
             success: true,
             message: `Promoted ${promotion.from} → ${promotion.to}`,
@@ -303,6 +309,7 @@ export default async function handler(req, res) {
       }
 
       await logDeltaSyncAudit(req, summary, AUDIT_STATUS.SUCCESS);
+      invalidateSapMasterlistCache();
       const warnings = buildSyncResponseWarnings(summary);
       return res.status(200).json({
         success: true,
@@ -330,6 +337,7 @@ export default async function handler(req, res) {
     summary.elapsedMs = Date.now() - startedAt;
 
     await logDeltaSyncAudit(req, summary, AUDIT_STATUS.SUCCESS);
+    invalidateSapMasterlistCache();
     const warnings = buildSyncResponseWarnings(summary);
     return res.status(200).json({
       success: true,

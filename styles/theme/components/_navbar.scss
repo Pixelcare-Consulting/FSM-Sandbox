@@ -1,3 +1,46 @@
+// Header scrolls with the page; sticky list/scheduler UIs use this var (0 = stick to viewport top).
+:root {
+  --dashboard-sticky-header-height: 0px;
+}
+
+// Dashboard top header (logo bar + horizontal menu)
+.dashboard-sticky-header {
+  z-index: 1030;
+  background-color: var(--#{$prefix}navbar-bg, #fff);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+
+  .dropdown-menu {
+    z-index: 1031;
+  }
+
+  @media (max-width: 992px) {
+    .navbar-collapse {
+      z-index: 1031;
+    }
+  }
+}
+
+// List pages: global-search bar sticks below the dashboard header while scrolling long tables.
+.dashboard-list-sticky-search {
+  position: sticky;
+  top: var(--dashboard-sticky-header-height, 0px);
+  z-index: 20;
+  isolation: isolate;
+  transform: none !important;
+  background-color: #4171f5;
+  margin-top: -4px;
+  padding-top: 16px;
+  padding-bottom: 6px;
+  box-shadow:
+    0 -16px 0 0 var(--#{$prefix}body-bg, #fff),
+    0 4px 10px -2px rgba(15, 23, 42, 0.14);
+
+  &:hover,
+  &:focus-within {
+    transform: none !important;
+  }
+}
+
 // Navbar
 
 .navbar {

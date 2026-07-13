@@ -17,6 +17,7 @@ import {
   buildCreateChanges,
   mergeChanges,
 } from '../../../../utils/auditSnapshots';
+import customerCache from '../../../../lib/utils/customerCache';
 
 function jsonBody(req) {
   if (typeof req.body === 'string') {
@@ -373,6 +374,8 @@ export default async function handler(req, res) {
     changes: mergeChanges(customerChanges, contactChanges),
     status: AUDIT_STATUS.SUCCESS,
   });
+
+  customerCache.invalidateCustomer(cardCode);
 
   return res.status(200).json({ success: true, message: 'Customer masterlist updated' });
 }

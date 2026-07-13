@@ -32,7 +32,6 @@ import {
   GeoAltFill,
   CurrencyExchange,
   HouseFill,
-  CalendarRange,
   CheckCircleFill,
   XLg,
   ChevronLeft,
@@ -51,6 +50,9 @@ import {
   X as FeatherX,
 } from "react-feather";
 import Flatpickr from "react-flatpickr";
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from "../../../sub-components/dashboard/DashboardListStickySearch";
 import { GeeksSEO } from "widgets";
 import { getSupabaseClient } from "../../../lib/supabase/client";
 import { clientAuditLog } from "../../../utils/clientAuditLog";
@@ -75,12 +77,24 @@ import { jobDisplayCustomerName, parseEmbeddedCustomerName } from '../../../lib/
 import { uniqueActiveTechnicianJobs } from '../../../lib/jobs/uniqueActiveTechnicianJobs';
 import { softDeleteFollowUpsForJobs } from '../../../lib/followUps/followUpListSummary';
 import { useQueryClient } from 'react-query';
-import { useJobsListQuery } from '../../../hooks/queries/useJobsListQuery';
+import {
+  useJobsListQuery,
+  invalidateJobsListServerCache,
+  clearJobsListSessionCache,
+} from '../../../hooks/queries/useJobsListQuery';
+import { queryKeys } from '../../../lib/cache/queryKeys';
+import {
+  getDefaultJobsDateRange,
+  isUnboundedJobsDateRange,
+  persistJobsDateFilter,
+  readPersistedJobsDateFilter,
+} from '../../../lib/jobs/defaultJobsDateRange';
 import { textMatchesAllSearchTokens } from '../../../lib/utils/multiTokenSearch';
 import { formatSingaporeDate, formatSingaporeTimeHm } from '../../../lib/utils/singaporeDateTime';
 import { htmlToPlainText } from '../../../lib/utils/htmlToPlainText';
 
-const JOBS_REALTIME_DEBOUNCE_MS = 400;
+const JOBS_REALTIME_DEBOUNCE_MS = 2500;
+const JOBS_REALTIME_FULL_REFETCH_MIN_MS = 30_000;
 
 function formatDateYmd(d) {
   const y = d.getFullYear();
@@ -183,41 +197,12 @@ const getLocationDisplayValue = (location) => {
   return [primarySegment, unitNumber, ...otherSegments].join(", ");
 };
 
-/** PostgREST/Supabase caps each response at this many rows; paginate with `.range()` to load all jobs. */
-const JOBS_LIST_PAGE_SIZE = 1000;
-/** Rows per page in the jobs table (client-side slice). */
-const JOBS_TABLE_ROWS_PER_PAGE = 100;
-/**
- * Hydrating jobs with heavy embedded selects + `.range()` offset can stop after the first chunk in practice.
- * After we have ordered ids from a light query, fetch full rows in small `.in('id', ...)` batches (URL-safe).
- */
-const JOBS_FULL_BY_ID_BATCH = 150;
-/** Parallel Supabase requests — major speed-up vs sequential batches (~2k rows). */
-const JOBS_FETCH_CONCURRENCY = 6;
+/** Rows per page in the jobs table (server-paginated via list-summary API). */
+const JOBS_TABLE_ROWS_PER_PAGE = 25;
 /** Set to true to show the Job address sync action in the jobs list header. */
 const SHOW_JOB_ADDRESS_SYNC_BUTTON = false;
 /** Set true to re-enable manual SAP job sync button (debug only). Hidden while cron handles sync. */
 const SHOW_JOB_SYNC_SAP_BUTTON = false;
-
-/**
- * Run async operations with bounded concurrency. Preserves result order by index.
- * @param {Array<() => Promise<any>>} taskFns
- * @param {number} limit
- */
-async function runWithConcurrency(taskFns, limit) {
-  const results = new Array(taskFns.length);
-  let nextIndex = 0;
-  const workerCount = Math.min(limit, taskFns.length);
-  const worker = async () => {
-    for (;;) {
-      const i = nextIndex++;
-      if (i >= taskFns.length) break;
-      results[i] = await taskFns[i]();
-    }
-  };
-  await Promise.all(Array.from({ length: workerCount }, worker));
-  return results;
-}
 
 /**
  * Convert technical SAP/sync error messages into user-friendly text for the Sync to SAP result modal.
@@ -463,23 +448,16 @@ const ViewJobs = () => {
     message: '',
     errorMessage: null,
   });
-  const [filters, setFilters] = useState({
-    globalSearch: "", // Global search across all fields
-    status: "all",
-    priority: "all",
-    dateRange: {
-      start: null,
-      end: null
-    }
+  const [filters, setFilters] = useState(() => {
+    const persistedDate = readPersistedJobsDateFilter();
+    return {
+      status: "all",
+      priority: "all",
+      dateRange: persistedDate ?? getDefaultJobsDateRange(),
+    };
   });
-  const [debouncedGlobalSearch, setDebouncedGlobalSearch] = useState("");
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedGlobalSearch(filters.globalSearch);
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [filters.globalSearch]);
+  const [searchDraft, setSearchDraft] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
   const [jobStatuses, setJobStatuses] = useState(
     () => readCachedJobStatuses() || getDefaultJobStatuses()
   );
@@ -517,33 +495,39 @@ const ViewJobs = () => {
     void loadJobStatuses({ wait: !jobStatusesReadyRef.current });
   }, [loadJobStatuses]);
 
-  const jobListFiltersActive = useMemo(
+  const canClearJobFilters = useMemo(
     () =>
       Boolean(
-        (filters.globalSearch && filters.globalSearch.trim() !== "") ||
+        (appliedSearch && appliedSearch.trim() !== "") ||
         filters.status !== "all" ||
         filters.priority !== "all" ||
-        filters.dateRange.start ||
-        filters.dateRange.end
+        !isUnboundedJobsDateRange(filters.dateRange)
       ),
-    [filters]
+    [appliedSearch, filters]
   );
 
   const clearAllJobFilters = useCallback(() => {
+    const clearedRange = { start: null, end: null };
+    persistJobsDateFilter(clearedRange);
+    setSearchDraft("");
+    setAppliedSearch("");
     setFilters({
-      globalSearch: "",
       status: "all",
       priority: "all",
-      dateRange: { start: null, end: null },
+      dateRange: clearedRange,
     });
   }, []);
+
+  const applySearchDraft = useCallback(() => {
+    setAppliedSearch(searchDraft.trim());
+  }, [searchDraft]);
 
   const queryClient = useQueryClient();
 
   // Reset to page 0 when filters change
   useEffect(() => {
     setCurrentPage(0);
-  }, [debouncedGlobalSearch, filters.status, filters.priority, filters.dateRange.start, filters.dateRange.end]);
+  }, [appliedSearch, filters.status, filters.priority, filters.dateRange.start, filters.dateRange.end]);
 
   const [currentPage, setCurrentPage] = useState(0);
   const [perPage, setPerPage] = useState(JOBS_TABLE_ROWS_PER_PAGE);
@@ -574,7 +558,7 @@ const ViewJobs = () => {
     () => ({
       page: currentPage + 1,
       limit: perPage,
-      search: debouncedGlobalSearch || '',
+      search: appliedSearch || '',
       status: filters.status !== 'all' ? filters.status : '',
       statusValues,
       priority: filters.priority !== 'all' ? filters.priority : '',
@@ -584,7 +568,7 @@ const ViewJobs = () => {
     [
       currentPage,
       perPage,
-      debouncedGlobalSearch,
+      appliedSearch,
       filters.status,
       filters.priority,
       filters.dateRange.start,
@@ -596,20 +580,75 @@ const ViewJobs = () => {
   const {
     data: jobsData,
     isLoading: jobsLoading,
+    isFetching: jobsFetching,
     error: jobsQueryError,
     refetch: refetchJobs,
     patchRow,
     removeRow,
   } = useJobsListQuery(jobsQueryParams, { enabled: statusFilterReady });
 
+  const patchRowRef = useRef(patchRow);
+  const removeRowRef = useRef(removeRow);
+  const refetchJobsRef = useRef(refetchJobs);
+  patchRowRef.current = patchRow;
+  removeRowRef.current = removeRow;
+  refetchJobsRef.current = refetchJobs;
+
+  const lastFullRefetchAtRef = useRef(0);
+
+  const handleRefreshJobsList = useCallback(async () => {
+    invalidateJobsListServerCache();
+    clearJobsListSessionCache(queryKeys.jobsList(jobsQueryParams));
+    lastFullRefetchAtRef.current = Date.now();
+    await refetchJobs();
+  }, [jobsQueryParams, refetchJobs]);
+
+  const prevRoutePathRef = useRef(null);
+
+  useEffect(() => {
+    const onRouteChangeStart = () => {
+      prevRoutePathRef.current = router.asPath.split('?')[0];
+    };
+    const onRouteChangeComplete = (url) => {
+      const pathname = url.split('?')[0];
+      const prevPath = prevRoutePathRef.current ?? '';
+      if (
+        pathname === '/dashboard/jobs/list-jobs' &&
+        prevPath === '/dashboard/jobs/create-jobs'
+      ) {
+        void refetchJobs();
+      }
+    };
+
+    router.events.on('routeChangeStart', onRouteChangeStart);
+    router.events.on('routeChangeComplete', onRouteChangeComplete);
+    return () => {
+      router.events.off('routeChangeStart', onRouteChangeStart);
+      router.events.off('routeChangeComplete', onRouteChangeComplete);
+    };
+  }, [router, refetchJobs]);
+
   const jobs = jobsData?.jobs || [];
   const jobsTotalCount = jobsData?.totalCount ?? 0;
-  const loading = jobsLoading;
+
+  useEffect(() => {
+    if (jobsTotalCount <= 0) {
+      if (currentPage !== 0) setCurrentPage(0);
+      return;
+    }
+    const maxPage = Math.max(0, Math.ceil(jobsTotalCount / perPage) - 1);
+    if (currentPage > maxPage) setCurrentPage(maxPage);
+  }, [jobsTotalCount, perPage, currentPage]);
+
+  const isInitialLoad = jobsLoading && !jobsData;
+  const isRefreshing = jobsLoading && Boolean(jobsData);
+  const showTable =
+    (jobsData?.jobs?.length ?? 0) > 0 || (!jobsLoading && jobsTotalCount > 0);
   const error = jobsQueryError?.message ?? null;
 
   const refreshJobs = useCallback(() => {
-    queryClient.invalidateQueries(['jobs']);
-  }, [queryClient]);
+    queryClient.invalidateQueries(queryKeys.jobsList(jobsQueryParams));
+  }, [queryClient, jobsQueryParams]);
 
   // Server-side filters applied via /api/jobs/list-summary
   const filteredJobs = jobs;
@@ -797,6 +836,7 @@ const ViewJobs = () => {
         Swal.fire("Deleted!", "The job has been removed.", "success");
         
         removeRow(job.id);
+        invalidateJobsListServerCache();
 
         // Clear selection if this job was selected
         setSelectedRows(prev => prev.filter(id => id !== job.id));
@@ -877,6 +917,8 @@ const ViewJobs = () => {
         for (const deletedJob of selectedJobs) {
           removeRow(deletedJob.id);
         }
+
+        invalidateJobsListServerCache();
 
         // Clear selection
         setSelectedRows([]);
@@ -1512,8 +1554,8 @@ const ViewJobs = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   ], [jobStatuses]);
 
-  const REALTIME_DEBOUNCE_MS = JOBS_REALTIME_DEBOUNCE_MS;
   const jobsRealtimeDebounceRef = useRef(null);
+  const pendingRealtimeEventsRef = useRef([]);
 
   useEffect(() => {
     const supabase = getSupabaseClient();
@@ -1522,50 +1564,86 @@ const ViewJobs = () => {
     let cancelled = false;
     let realtimeChannel = null;
 
-    const patchOrRemoveRow = async (payload) => {
-      if (cancelled) return;
-
-      const eventType = payload.eventType;
-      const rowId = payload.new?.id || payload.old?.id;
-
-      if (eventType === 'DELETE' || payload.new?.deleted_at) {
-        removeRow(rowId);
+    const throttledRefetch = (immediate = false) => {
+      const now = Date.now();
+      if (!immediate && now - lastFullRefetchAtRef.current < JOBS_REALTIME_FULL_REFETCH_MIN_MS) {
         return;
       }
+      lastFullRefetchAtRef.current = now;
+      void refetchJobsRef.current();
+    };
 
-      if (!rowId) {
-        void refetchJobs();
-        return;
+    const patchSingleRow = async (rowId, eventType) => {
+      const singleParams = new URLSearchParams({
+        jobId: rowId,
+        limit: '1',
+        page: '1',
+      });
+      const singleRes = await fetch(
+        `/api/jobs/list-summary?${singleParams.toString()}`,
+        { cache: 'no-store', credentials: 'same-origin' }
+      );
+
+      if (!singleRes.ok) {
+        throttledRefetch();
+        return false;
       }
 
-      try {
-        const singleParams = new URLSearchParams({
-          jobId: rowId,
-          limit: '1',
-          page: '1',
-        });
-        const singleRes = await fetch(
-          `/api/jobs/list-summary?${singleParams.toString()}`,
-          { cache: 'no-store', credentials: 'same-origin' }
-        );
+      const singlePayload = await singleRes.json();
+      const row = singlePayload.jobs?.[0];
 
-        if (!singleRes.ok) {
-          void refetchJobs();
+      if (!row) {
+        removeRowRef.current(rowId);
+        return true;
+      }
+
+      patchRowRef.current(row, eventType);
+      return true;
+    };
+
+    const processBatchedEvents = async (events) => {
+      if (cancelled || !events.length) return;
+
+      const deleteIds = new Set();
+      const updateIds = new Map();
+
+      for (const payload of events) {
+        const eventType = payload.eventType;
+        const rowId = payload.new?.id || payload.old?.id;
+
+        if (eventType === 'DELETE' || payload.new?.deleted_at) {
+          if (rowId) deleteIds.add(rowId);
+          continue;
+        }
+
+        if (!rowId) {
+          throttledRefetch();
           return;
         }
 
-        const singlePayload = await singleRes.json();
-        const row = singlePayload.jobs?.[0];
+        updateIds.set(rowId, eventType);
+      }
 
-        if (!row) {
-          removeRow(rowId);
-          return;
+      deleteIds.forEach((rowId) => {
+        removeRowRef.current(rowId);
+      });
+      deleteIds.forEach((id) => updateIds.delete(id));
+
+      if (updateIds.size === 0) return;
+
+      let patchFailures = 0;
+      for (const [rowId, eventType] of updateIds) {
+        try {
+          const ok = await patchSingleRow(rowId, eventType);
+          if (!ok) patchFailures += 1;
+        } catch (patchErr) {
+          console.warn('Job realtime patch failed:', patchErr);
+          patchFailures += 1;
         }
+      }
 
-        patchRow(row, eventType);
-      } catch (patchErr) {
-        console.warn('Job realtime patch failed:', patchErr);
-        void refetchJobs();
+      if (patchFailures > 0) {
+        throttledRefetch();
       }
     };
 
@@ -1580,12 +1658,15 @@ const ViewJobs = () => {
           filter: 'deleted_at=is.null',
         },
         (payload) => {
+          pendingRealtimeEventsRef.current.push(payload);
           if (jobsRealtimeDebounceRef.current) {
             clearTimeout(jobsRealtimeDebounceRef.current);
           }
           jobsRealtimeDebounceRef.current = setTimeout(() => {
-            void patchOrRemoveRow(payload);
-          }, REALTIME_DEBOUNCE_MS);
+            const batch = pendingRealtimeEventsRef.current;
+            pendingRealtimeEventsRef.current = [];
+            void processBatchedEvents(batch);
+          }, JOBS_REALTIME_DEBOUNCE_MS);
         }
       )
       .subscribe();
@@ -1595,11 +1676,12 @@ const ViewJobs = () => {
       if (jobsRealtimeDebounceRef.current) {
         clearTimeout(jobsRealtimeDebounceRef.current);
       }
+      pendingRealtimeEventsRef.current = [];
       if (realtimeChannel) {
         supabase.removeChannel(realtimeChannel);
       }
     };
-  }, [patchRow, removeRow, refetchJobs]);
+  }, []);
 
   const handleRowClick = (row) => {
     Swal.fire({
@@ -1756,6 +1838,7 @@ const ViewJobs = () => {
 
                 Swal.fire("Deleted!", "The job has been removed.", "success");
                 removeRow(row.id);
+                invalidateJobsListServerCache();
               } catch (error) {
                 console.error("Delete error:", error);
                 Swal.fire(
@@ -3096,25 +3179,30 @@ const ViewJobs = () => {
         <div style={{ width: "100%", maxWidth: "100%", paddingLeft: "1.5rem", paddingRight: "1.5rem" }}>
           <Row>
             <Col md={12} xs={12} className="mb-5">
-              <Card
-                className="border-0 shadow-sm mb-3"
-                style={{ background: "linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)" }}
+              <DashboardListStickySearch
+                style={STICKY_SEARCH_GRADIENT_BLUE}
+                bodyClassName="p-4"
               >
-                <Card.Body className="p-4">
                   <Row className="align-items-center mb-3">
                     <Col md={12}>
                       <div className="d-flex align-items-center gap-3">
                         <div style={{ minWidth: "140px" }}>
                           <h6 className="mb-0 text-white d-flex align-items-center">🔍 Search Filters</h6>
                           <small className="text-white" style={{ opacity: 0.9, fontSize: "0.75rem" }}>
-                            ⚡ Live • All Fields
+                            Press Enter to search
                           </small>
                         </div>
                         <div className="flex-grow-1">
                           <Form.Control
                             type="text"
-                            value={filters.globalSearch}
-                            onChange={(e) => setFilters((prev) => ({ ...prev, globalSearch: e.target.value }))}
+                            value={searchDraft}
+                            onChange={(e) => setSearchDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                applySearchDraft();
+                              }
+                            }}
                             placeholder="🔍 Search anything... Job Number, Customer, Status, Priority, Location, Technician, etc."
                             style={{
                               fontSize: "0.95rem",
@@ -3127,22 +3215,21 @@ const ViewJobs = () => {
                             autoComplete="off"
                           />
                         </div>
-                        {jobListFiltersActive && (
-                          <Button
-                            variant="light"
-                            size="sm"
-                            onClick={clearAllJobFilters}
-                            className="d-flex align-items-center gap-1"
-                            style={{
-                              minWidth: "90px",
-                              fontWeight: "500",
-                              borderRadius: "6px",
-                            }}
-                          >
-                            <FeatherX size={14} />
-                            Clear
-                          </Button>
-                        )}
+                        <Button
+                          variant="light"
+                          size="sm"
+                          onClick={clearAllJobFilters}
+                          disabled={!canClearJobFilters}
+                          className="d-flex align-items-center gap-1"
+                          style={{
+                            minWidth: "90px",
+                            fontWeight: "500",
+                            borderRadius: "6px",
+                          }}
+                        >
+                          <FeatherX size={14} />
+                          Clear
+                        </Button>
                       </div>
                     </Col>
                   </Row>
@@ -3225,6 +3312,7 @@ const ViewJobs = () => {
                               }}
                             />
                             <Flatpickr
+                              key={`start-${filters.dateRange.start}`}
                               value={filters.dateRange.start ? new Date(`${filters.dateRange.start}T00:00:00`) : null}
                               options={{
                                 dateFormat: "d/m/Y",
@@ -3248,11 +3336,18 @@ const ViewJobs = () => {
                                   const y = d.getFullYear();
                                   const m = String(d.getMonth() + 1).padStart(2, "0");
                                   const day = String(d.getDate()).padStart(2, "0");
+                                  const nextRange = {
+                                    ...filters.dateRange,
+                                    start: `${y}-${m}-${day}`,
+                                  };
+                                  persistJobsDateFilter(nextRange);
                                   setFilters((prev) => ({
                                     ...prev,
                                     dateRange: { ...prev.dateRange, start: `${y}-${m}-${day}` },
                                   }));
                                 } else {
+                                  const nextRange = { ...filters.dateRange, start: null };
+                                  persistJobsDateFilter(nextRange);
                                   setFilters((prev) => ({
                                     ...prev,
                                     dateRange: { ...prev.dateRange, start: null },
@@ -3284,6 +3379,7 @@ const ViewJobs = () => {
                               }}
                             />
                             <Flatpickr
+                              key={`end-${filters.dateRange.end}`}
                               value={filters.dateRange.end ? new Date(`${filters.dateRange.end}T00:00:00`) : null}
                               options={{
                                 dateFormat: "d/m/Y",
@@ -3307,11 +3403,18 @@ const ViewJobs = () => {
                                   const y = d.getFullYear();
                                   const m = String(d.getMonth() + 1).padStart(2, "0");
                                   const day = String(d.getDate()).padStart(2, "0");
+                                  const nextRange = {
+                                    ...filters.dateRange,
+                                    end: `${y}-${m}-${day}`,
+                                  };
+                                  persistJobsDateFilter(nextRange);
                                   setFilters((prev) => ({
                                     ...prev,
                                     dateRange: { ...prev.dateRange, end: `${y}-${m}-${day}` },
                                   }));
                                 } else {
+                                  const nextRange = { ...filters.dateRange, end: null };
+                                  persistJobsDateFilter(nextRange);
                                   setFilters((prev) => ({
                                     ...prev,
                                     dateRange: { ...prev.dateRange, end: null },
@@ -3322,10 +3425,25 @@ const ViewJobs = () => {
                           </div>
                         </div>
                       </div>
+                      {filters.dateRange.start && !filters.dateRange.end && (
+                        <small
+                          className="text-white d-block text-end mt-2"
+                          style={{ opacity: 0.75, fontSize: "0.7rem" }}
+                        >
+                          Showing jobs from {formatSingaporeDate(filters.dateRange.start)} onward
+                        </small>
+                      )}
+                      {isUnboundedJobsDateRange(filters.dateRange) && (
+                        <small
+                          className="text-white d-block text-end mt-2"
+                          style={{ opacity: 0.75, fontSize: "0.7rem" }}
+                        >
+                          Showing all scheduled jobs
+                        </small>
+                      )}
                     </Col>
                   </Row>
-                </Card.Body>
-              </Card>
+              </DashboardListStickySearch>
 
               <Card className="border-0 shadow-sm">
                 <Card.Header className="bg-transparent border-0 px-3 pt-3 pb-0">
@@ -3333,11 +3451,17 @@ const ViewJobs = () => {
                     <h5 className="mb-0" style={{ fontSize: '1.25rem', fontWeight: '600', color: '#1e293b' }}>
                       Jobs
                     </h5>
-                    {!loading && (
+                    {!isInitialLoad && (
                       <span className="text-muted small">
                         {jobsTotalCount.toLocaleString()}{' '}
                         {jobsTotalCount === 1 ? 'job' : 'jobs'}
                       </span>
+                    )}
+                    {isRefreshing && (
+                      <Badge bg="light" text="dark" className="d-inline-flex align-items-center gap-1">
+                        <Spinner animation="border" size="sm" style={{ width: '0.65rem', height: '0.65rem' }} />
+                        Updating…
+                      </Badge>
                     )}
                   </div>
                 </Card.Header>
@@ -3355,7 +3479,7 @@ const ViewJobs = () => {
                               setCurrentPage(0);
                             }}
                             className="me-2"
-                            disabled={loading}
+                            disabled={isInitialLoad}
                             aria-label="Rows per page"
                           >
                             <option value={10}>10</option>
@@ -3369,7 +3493,7 @@ const ViewJobs = () => {
                       <div className="d-flex align-items-center gap-3 flex-wrap ms-md-auto">
                         <div className="text-muted d-flex align-items-center">
                           <ListUl size={14} className="me-2 flex-shrink-0" />
-                          {loading ? (
+                          {isInitialLoad ? (
                             <span>Loading...</span>
                           ) : jobsTotalCount === 0 ? (
                             <span>Showing 0 of 0</span>
@@ -3435,6 +3559,28 @@ const ViewJobs = () => {
                           </Button>
                         </span>
                       </OverlayTrigger>
+                      <Button
+                        onClick={() => void handleRefreshJobsList()}
+                        disabled={jobsFetching}
+                        variant="outline-primary"
+                        size="sm"
+                        style={{
+                          borderRadius: '8px',
+                          padding: '8px 14px',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '8px',
+                          fontWeight: 600,
+                        }}
+                        aria-label="Refresh Table List"
+                      >
+                        {jobsFetching ? (
+                          <Spinner animation="border" size="sm" />
+                        ) : (
+                          <RefreshCw size={16} />
+                        )}
+                        <span>Refresh Table List</span>
+                      </Button>
                       {SHOW_JOB_ADDRESS_SYNC_BUTTON && (
                         <OverlayTrigger
                           placement="bottom"
@@ -3508,13 +3654,13 @@ const ViewJobs = () => {
                     </div>
                   )}
                   
-                  {loading ? (
+                  {isInitialLoad ? (
                     <div className="text-center py-5">
                       <div className="spinner-border text-primary" role="status">
                         <span className="visually-hidden">Loading...</span>
                       </div>
                     </div>
-                          ) : jobsTotalCount === 0 ? (
+                  ) : !showTable && jobsTotalCount === 0 ? (
                     <div className="text-center py-5">
                       <p className="mb-0 text-muted">No jobs found matching the selected filters</p>
                     </div>
@@ -3524,7 +3670,7 @@ const ViewJobs = () => {
                         <ResponsiveTable
                           data={sortedAndPaginatedJobs}
                           columns={muiColumns}
-                          loading={loading}
+                          loading={isRefreshing}
                           selectable={true}
                           selectedRows={selectedRows}
                           onSelectionChange={handleSelectionChange}
@@ -3552,7 +3698,7 @@ const ViewJobs = () => {
                           onPageChange={(newPage) => {
                             setCurrentPage(newPage - 1);
                           }}
-                          disabled={loading}
+                          disabled={isRefreshing}
                         />
                       </div>
                     </>

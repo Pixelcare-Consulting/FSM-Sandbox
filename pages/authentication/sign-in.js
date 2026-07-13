@@ -4,8 +4,96 @@ import { useRouter } from "next/router";
 import { Alert, Card, Form, Button, Image, Spinner, InputGroup, Container, Row, Col } from "react-bootstrap";
 import { useSettings } from "../../hooks/useSettings";
 import { FaEnvelope, FaLock, FaEye, FaEyeSlash } from 'react-icons/fa';
-import { toast } from 'react-hot-toast';
 import Swal from 'sweetalert2';
+import Cookies from 'js-cookie';
+import {
+  clearSharedLastActivityAt,
+  recordSessionProbe,
+  resetSharedActivityOnLogin,
+  syncActivityWithLoginSession,
+} from '../../lib/auth/sessionTabSync';
+import { fetchAuthenticatedUser } from '../../lib/auth/sessionProbe';
+import { getQueryClient } from '../../lib/queryClient';
+import { clearWarmupDone, runAppWarmup } from '../../lib/session/appWarmup';
+
+const signInDebug = process.env.NODE_ENV !== 'production';
+
+function signInDebugLog(...args) {
+  if (signInDebug) console.log(...args);
+}
+
+const LOGIN_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const FAIL_STORAGE_KEY = 'loginFailTracking';
+const FAIL_WINDOW_MS = 5 * 60 * 1000;
+const DASHBOARD_HOME = '/dashboard/overview';
+
+function validateLoginInput(email, password) {
+  const trimmedEmail = (email || '').trim();
+  const trimmedPassword = password || '';
+
+  if (!trimmedEmail || !trimmedPassword) {
+    return { valid: false, message: 'Email and password are required.' };
+  }
+  if (!LOGIN_EMAIL_REGEX.test(trimmedEmail)) {
+    return { valid: false, message: 'Please enter a valid email address.' };
+  }
+
+  return { valid: true, normalizedEmail: trimmedEmail.toLowerCase() };
+}
+
+function readFailTracking() {
+  if (typeof window === 'undefined') {
+    return { count: 0, firstFailAt: null };
+  }
+  try {
+    const raw = sessionStorage.getItem(FAIL_STORAGE_KEY);
+    if (!raw) return { count: 0, firstFailAt: null };
+    return JSON.parse(raw);
+  } catch {
+    return { count: 0, firstFailAt: null };
+  }
+}
+
+function recordClientLoginFail() {
+  const now = Date.now();
+  let { count, firstFailAt } = readFailTracking();
+  if (!firstFailAt || now - firstFailAt > FAIL_WINDOW_MS) {
+    count = 0;
+    firstFailAt = now;
+  }
+  count += 1;
+  sessionStorage.setItem(FAIL_STORAGE_KEY, JSON.stringify({ count, firstFailAt }));
+  return count >= 3 ? 15 : 5;
+}
+
+function clearClientLoginFailTracking() {
+  if (typeof window !== 'undefined') {
+    sessionStorage.removeItem(FAIL_STORAGE_KEY);
+  }
+}
+
+function hasSessionCookies() {
+  const uid = Cookies.get('uid');
+  const sessionId = Cookies.get('sessionId');
+  return Boolean(uid && sessionId);
+}
+
+function updateWarmupModal(modal, { percent, label }, sapConnectionFailed) {
+  const titleClass = sapConnectionFailed ? 'text-warning' : 'text-primary';
+  modal.querySelector('.swal2-title').innerHTML =
+    `<span class="fw-bold ${titleClass}">Preparing your workspace</span>`;
+  modal.querySelector('.swal2-html-container').innerHTML = `
+    <div class="text-center mb-2">
+      <div class="spinner-border ${sapConnectionFailed ? 'text-warning' : 'text-primary'} mb-2" role="status">
+        <span class="visually-hidden">Loading...</span>
+      </div>
+      <div class="text-muted mb-2">${label}</div>
+      <div class="progress" style="height: 6px;">
+        <div class="progress-bar ${sapConnectionFailed ? 'bg-warning' : ''} progress-bar-striped progress-bar-animated" role="progressbar" style="width: ${percent}%"></div>
+      </div>
+    </div>
+  `;
+}
 
 const loadingMessages = [
   { title: '<span class="fw-bold text-primary">Welcome Back!</span>', message: 'Verifying your credentials with our secure servers...', progress: 15 },
@@ -24,6 +112,58 @@ const SignIn = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [alertMessage, setAlertMessage] = useState(null);
+  const [alertVariant, setAlertVariant] = useState('warning');
+  const [cooldownUntil, setCooldownUntil] = useState(0);
+  const [cooldownTick, setCooldownTick] = useState(0);
+
+  const cooldownSecondsRemaining =
+    cooldownUntil > Date.now()
+      ? Math.ceil((cooldownUntil - Date.now()) / 1000)
+      : 0;
+  const isInCooldown = cooldownSecondsRemaining > 0;
+
+  const startCooldown = (seconds) => {
+    setCooldownUntil(Date.now() + seconds * 1000);
+  };
+
+  const showAuthError = (message, retryAfterSeconds) => {
+    let text = message || 'Invalid email or password. Please try again.';
+    if (text === 'Failed to fetch') {
+      text = 'Unable to reach the server. Check your connection and try again.';
+    } else if (/invalid login credentials/i.test(text)) {
+      text = 'Invalid email or password. Please check your credentials and try again.';
+    }
+    const cooldownSec =
+      typeof retryAfterSeconds === 'number' && retryAfterSeconds > 0
+        ? retryAfterSeconds
+        : recordClientLoginFail();
+    startCooldown(cooldownSec);
+    setAlertVariant('danger');
+    setAlertMessage(text);
+    Swal.fire({
+      icon: 'error',
+      title: 'Sign In Failed',
+      text,
+      confirmButtonText: 'Try Again',
+      confirmButtonColor: '#0061f2',
+    });
+  };
+
+  // Self-heal stale idle-timer data — users should never need DevTools/localStorage cleanup.
+  useEffect(() => {
+    syncActivityWithLoginSession(Cookies.get);
+  }, []);
+
+  useEffect(() => {
+    if (!isInCooldown) return undefined;
+    const interval = setInterval(() => {
+      if (Date.now() >= cooldownUntil) {
+        setCooldownUntil(0);
+      }
+      setCooldownTick(Date.now());
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [cooldownUntil, isInCooldown]);
 
   useEffect(() => {
     if (!router.isReady) return;
@@ -33,56 +173,48 @@ const SignIn = () => {
       typeof raw === "string" ? raw : Array.isArray(raw) ? raw[0] : null;
 
     setAlertMessage(message || null);
+    setAlertVariant('warning');
   }, [router.isReady, router.query.toast, router.query.alertmessage]);
 
   useEffect(() => {
+    if (!router.isReady) return undefined;
+
+    let cancelled = false;
+
     const checkAuth = async () => {
-      console.log('🔍 Checking authentication state...');
-      const cookies = document.cookie.split(';').reduce((acc, cookie) => {
-        const [key, value] = cookie.trim().split('=');
-        acc[key] = value;
-        return acc;
-      }, {});
+      signInDebugLog('🔍 Checking authentication state...');
 
-      console.log('📊 Current cookies:', cookies);
+      if (!hasSessionCookies()) {
+        signInDebugLog('⚠️ No session cookies (uid + sessionId), showing sign-in form');
+        return;
+      }
 
-      // Check for ESSENTIAL authentication cookies (including sessionId for single-device)
-      const essentialCookies = [
-        'B1SESSION',
-        'B1SESSION_EXPIRY',
-        'ROUTEID',
-        'uid',
-        'sessionId'
-      ];
-
-      const hasEssentialCookies = essentialCookies.every(cookieName => {
-        const hasCookie = !!cookies[cookieName];
-        console.log(`🍪 ${cookieName}: ${hasCookie ? '✅' : '❌'}`);
-        return hasCookie;
-      });
-
-      // Also check optional cookies but don't block on them
-      const optionalCookies = ['customToken', 'workerId', 'sapConnectionStatus', 'LAST_ACTIVITY'];
-      optionalCookies.forEach(cookieName => {
-        const hasCookie = !!cookies[cookieName];
-        console.log(`🍪 ${cookieName} (optional): ${hasCookie ? '✅' : '❌'}`);
-      });
-
-      if (hasEssentialCookies) {
-        console.log('✅ Essential cookies present');
-        const expiryTime = new Date(cookies.B1SESSION_EXPIRY).getTime();
-        if (Date.now() < expiryTime) {
-          console.log('🔄 Valid session found, redirecting to dashboard');
-          router.push("/");
-        } else {
-          console.log('⚠️ Session expired:', new Date(expiryTime));
+      const expiryRaw = Cookies.get('B1SESSION_EXPIRY');
+      if (expiryRaw) {
+        const expiryTime = new Date(expiryRaw).getTime();
+        if (!Number.isNaN(expiryTime) && Date.now() >= expiryTime) {
+          signInDebugLog('⚠️ B1SESSION_EXPIRY in the past, skipping redirect');
+          return;
         }
+      }
+
+      // HttpOnly cookies (e.g. B1SESSION) must be validated server-side, not via document.cookie.
+      const user = await fetchAuthenticatedUser();
+      if (cancelled) return;
+
+      if (user) {
+        signInDebugLog('🔄 Valid session found via server probe, redirecting to dashboard');
+        router.replace(DASHBOARD_HOME);
       } else {
-        console.log('⚠️ Missing essential cookies');
+        signInDebugLog('⚠️ Session probe failed or returned no user');
       }
     };
+
     checkAuth();
-  }, [router]);
+    return () => {
+      cancelled = true;
+    };
+  }, [router.isReady, router.replace]);
 
   useEffect(() => {
     return () => {
@@ -94,29 +226,42 @@ const SignIn = () => {
   const handleSubmit = async (e) => {
     e.preventDefault();
 
+    if (isInCooldown) {
+      setAlertVariant('warning');
+      setAlertMessage(`Please wait ${cooldownSecondsRemaining}s before trying again.`);
+      return;
+    }
+
+    const validation = validateLoginInput(email, password);
+    if (!validation.valid) {
+      setAlertVariant('danger');
+      setAlertMessage(validation.message);
+      return;
+    }
+
+    const normalizedEmail = validation.normalizedEmail;
+
     try {
       setIsLoading(true);
+      clearSharedLastActivityAt();
 
-      // Prevent duplicate login: if already logged in as this user, redirect
-      const existingRes = await fetch('/api/getUserInfo', {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-        headers: { 'Content-Type': 'application/json' }
-      });
-      if (existingRes.ok) {
-        const { user } = await existingRes.json();
-        const existingEmail = (user?.email || user?.username || '').toLowerCase().trim();
-        const enteredEmail = (email || '').toLowerCase().trim();
-        if (existingEmail && enteredEmail && existingEmail === enteredEmail) {
-          toast('Already logged in. Redirecting...', { icon: '✓' });
-          router.push('/');
-          setIsLoading(false);
-          return;
+      // Prevent duplicate login only when session cookies exist
+      if (hasSessionCookies()) {
+        const user = await fetchAuthenticatedUser();
+        if (user) {
+          const existingEmail = (user?.email || user?.username || '').toLowerCase().trim();
+          const enteredEmail = normalizedEmail;
+          if (existingEmail && enteredEmail && existingEmail === enteredEmail) {
+            setAlertVariant('info');
+            setAlertMessage('Already logged in. Redirecting to your dashboard...');
+            router.push(DASHBOARD_HOME);
+            setIsLoading(false);
+            return;
+          }
         }
       }
 
-      console.log('🔄 Starting authentication process...');
+      signInDebugLog('🔄 Starting authentication process...');
 
       Swal.fire({
         title: loadingMessages[0].title,
@@ -140,17 +285,27 @@ const SignIn = () => {
             const response = await fetch('/api/login', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ email, password }),
+              body: JSON.stringify({ email: normalizedEmail, password }),
               credentials: 'include'
             });
 
             if (!response.ok) {
               const errorData = await response.json().catch(() => ({}));
-              throw new Error(errorData.message || 'Authentication failed');
+              if (response.status === 429) {
+                throw Object.assign(
+                  new Error(errorData.message || 'Too many login attempts. Please try again later.'),
+                  { retryAfterSeconds: errorData.retryAfterSeconds || 15 }
+                );
+              }
+              const fallback =
+                response.status === 401
+                  ? 'Invalid email or password. Please check your credentials and try again.'
+                  : 'Authentication failed. Please try again.';
+              throw new Error(errorData.message || fallback);
             }
 
             const data = await response.json();
-            console.log('📊 Server response:', data);
+            signInDebugLog('📊 Server response:', data);
             const sapConnectionFailed = data.sapConnectionStatus === 'failed';
 
             for (let i = 1; i < loadingMessages.length; i++) {
@@ -198,7 +353,7 @@ const SignIn = () => {
               modal.querySelector('.swal2-html-container').innerHTML = `
                 <div class="text-center">
                   <div class="checkmark-circle mb-2"><div class="checkmark draw"></div></div>
-                  <div class="text-muted mb-2">SAS Field Service Portal SANDBOX environment is ready. Verifying session...</div>
+                  <div class="text-muted mb-2">SAS Field Service Portal is ready. Verifying session...</div>
                   <div class="progress mb-2" style="height: 6px;"><div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div></div>
                 </div>
               `;
@@ -206,12 +361,17 @@ const SignIn = () => {
 
             await new Promise((resolve) => setTimeout(resolve, 500));
 
-            const verifyRes = await fetch('/api/getUserInfo', {
-              method: 'GET',
-              credentials: 'include',
-              cache: 'no-store',
-              headers: { 'Content-Type': 'application/json' },
-            });
+            let verifyRes;
+            try {
+              verifyRes = await fetch('/api/getUserInfo', {
+                method: 'GET',
+                credentials: 'include',
+                cache: 'no-store',
+                headers: { 'Content-Type': 'application/json' },
+              });
+            } finally {
+              recordSessionProbe();
+            }
 
             if (!verifyRes.ok) {
               if (verifyRes.status === 401) {
@@ -222,46 +382,71 @@ const SignIn = () => {
               throw new Error('Session verification failed. Please try again.');
             }
 
-            const countdownHtml = (seconds) =>
-              `<div class="countdown-text text-muted small">Redirecting in <span class="fw-bold text-primary" id="countdown">${seconds}</span> seconds...</div>`;
+            clearClientLoginFailTracking();
+            resetSharedActivityOnLogin(Cookies.get);
+            clearWarmupDone();
 
-            if (sapConnectionFailed) {
-              modal.querySelector('.swal2-html-container').innerHTML = `
+            const renderWarmupHtml = (seconds, warmupLabel = 'Caching dashboard data…', percent = 0) => {
+              const barClass = sapConnectionFailed ? 'bg-warning' : 'bg-success';
+              const successBlock = sapConnectionFailed
+                ? `<div class="mb-3"><div class="text-warning" style="font-size: 3rem;">⚠️</div></div>
+                   <div class="text-muted mb-3">You're in! SAP Business One connection is limited—some features may be unavailable.</div>`
+                : `<div class="checkmark-circle mb-2"><div class="checkmark draw"></div></div>
+                   <div class="text-muted mb-2">SAS Field Service Portal is ready. Preparing your workspace…</div>`;
+
+              return `
                 <div class="text-center">
-                  <div class="mb-3"><div class="text-warning" style="font-size: 3rem;">⚠️</div></div>
-                  <div class="text-muted mb-3">You're in! SAP Business One connection is limited—some features may be unavailable.</div>
-                  <div class="progress mb-3" style="height: 6px;"><div class="progress-bar bg-warning" role="progressbar" style="width: 100%"></div></div>
-                  ${countdownHtml(3)}
+                  ${successBlock}
+                  <div class="warmup-status text-muted small mb-2">${warmupLabel}</div>
+                  <div class="progress mb-2" style="height: 6px;">
+                    <div class="progress-bar ${barClass} progress-bar-striped progress-bar-animated" role="progressbar" style="width: ${percent}%"></div>
+                  </div>
+                  <div class="countdown-text text-muted small">Redirecting in <span class="fw-bold text-primary" id="countdown">${seconds}</span> seconds...</div>
                 </div>
               `;
-            } else {
-              modal.querySelector('.swal2-html-container').innerHTML = `
-                <div class="text-center">
-                  <div class="checkmark-circle mb-2"><div class="checkmark draw"></div></div>
-                  <div class="text-muted mb-2">SAS Field Service Portal is ready. Redirecting to your dashboard...</div>
-                  <div class="progress mb-2" style="height: 6px;"><div class="progress-bar bg-success" role="progressbar" style="width: 100%"></div></div>
-                  ${countdownHtml(3)}
-                </div>
-              `;
-            }
+            };
+
+            const updateWarmupProgress = (update) => {
+              const progressBar = modal.querySelector('.progress-bar');
+              const messageEl = modal.querySelector('.warmup-status');
+              if (progressBar && typeof update.percent === 'number') {
+                progressBar.style.width = `${update.percent}%`;
+              }
+              if (messageEl && update.label) {
+                messageEl.textContent = update.label;
+              }
+            };
+
+            modal.querySelector('.swal2-title').innerHTML = sapConnectionFailed
+              ? '<span class="fw-bold text-warning">Logged In</span>'
+              : '<span class="fw-bold text-success">You\'re In!</span>';
+            modal.querySelector('.swal2-html-container').innerHTML = renderWarmupHtml(3);
+
+            const queryClient = getQueryClient();
+            const warmupPromise = runAppWarmup({
+              queryClient,
+              onProgress: updateWarmupProgress,
+            });
 
             const el = modal.querySelector('#countdown');
             for (let s = 3; s >= 1; s--) {
               if (el) el.textContent = s;
-              await new Promise(r => setTimeout(r, 1000));
+              await new Promise((r) => setTimeout(r, 1000));
             }
-            window.location.href = '/';
+
+            await warmupPromise;
+            window.location.href = DASHBOARD_HOME;
           } catch (error) {
             console.error('❌ Authentication error:', error);
             Swal.close();
-            toast.error(error.message || 'Unable to connect. Please try again.');
+            showAuthError(error.message, error.retryAfterSeconds);
             setIsLoading(false);
           }
         }
       });
     } catch (error) {
       console.error('❌ Authentication error:', error);
-      toast.error(error.message || 'Unable to connect. Please try again.');
+      showAuthError(error.message);
       setIsLoading(false);
     } finally {
       setIsLoading(false);
@@ -278,7 +463,7 @@ const SignIn = () => {
               <div className="overlay-gradient d-flex flex-column justify-content-center text-white p-5 h-100">
                 <h1 className="display-4 fw-bold mb-4">Welcome Back!</h1>
                 <p className="lead">
-                  Access your SAS Field Service Management SANDBOX environment dashboard to manage your operations efficiently.
+                  Access your SAS Field Service Management dashboard to manage your operations efficiently.
                 </p>
               </div>
             </div>
@@ -303,7 +488,7 @@ const SignIn = () => {
                 <Form onSubmit={handleSubmit}>
                   {alertMessage ? (
                     <Alert
-                      variant="warning"
+                      variant={alertVariant}
                       dismissible
                       className="mb-4 border-0 shadow-sm"
                       onClose={() => setAlertMessage(null)}
@@ -324,7 +509,7 @@ const SignIn = () => {
                         className="border-0 py-2.5"
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
-                        disabled={isLoading}
+                        disabled={isLoading || isInCooldown}
                         required
                       />
                     </InputGroup>
@@ -341,13 +526,13 @@ const SignIn = () => {
                         className="border-0 py-2.5"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        disabled={isLoading}
+                        disabled={isLoading || isInCooldown}
                         required
                       />
                       <Button
                         variant="light"
                         onClick={() => setShowPassword(!showPassword)}
-                        disabled={isLoading}
+                        disabled={isLoading || isInCooldown}
                       >
                         {showPassword ? <FaEyeSlash /> : <FaEye />}
                       </Button>
@@ -367,7 +552,7 @@ const SignIn = () => {
                     variant="primary"
                     type="submit"
                     className="w-75 py-3 mb-4 rounded-pill shadow-sm mx-auto d-block"
-                    disabled={isLoading}
+                    disabled={isLoading || isInCooldown}
                   >
                     {isLoading ? (
                       <div className="d-flex align-items-center justify-content-center">
@@ -378,6 +563,8 @@ const SignIn = () => {
                         />
                         <span>Signing in...</span>
                       </div>
+                    ) : isInCooldown ? (
+                      `Try again in ${cooldownSecondsRemaining}s`
                     ) : (
                       'Sign In'
                     )}

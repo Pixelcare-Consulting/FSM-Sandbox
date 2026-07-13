@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import dynamic from "next/dynamic";
 import { format, addDays, subDays, addMonths, subMonths, addWeeks, subWeeks, isSameDay, startOfMonth, endOfMonth, eachDayOfInterval, startOfWeek, endOfWeek, startOfDay, parseISO, isValid } from "date-fns";
 import { useRouter } from "next/router";
-import { Button, Form, Modal } from "react-bootstrap";
+import { Button, Form, Modal, Spinner } from "react-bootstrap";
 import Select from "react-select";
 import PortalModal, {
   PortalConfirmPanel,
@@ -14,10 +14,25 @@ import {
   updateTechnicianSchedule,
   updateTechnicianColor,
   reassignTechnician,
+  updateJobStatusFromScheduler,
+  rescheduleJobAppointment,
   hydrateSchedulerEvent,
 } from "../../../../lib/scheduler/technicianSchedulerService";
 import { useSchedulerData } from "../../../../lib/scheduler/useSchedulerData";
 import { useSchedulerFreshness } from "../../../../lib/scheduler/useSchedulerFreshness";
+import {
+  invalidateAllWindowCaches,
+  invalidateSchedulerCache,
+  invalidateSchedulerServerCache,
+  techniciansCacheKey,
+  getSiteContactFromCache,
+  setSiteContactCache,
+  seedSiteContactCacheFromEvents,
+} from "../../../../lib/scheduler/schedulerCache";
+import {
+  computeSchedulerFetchRange,
+  schedulerFetchRangeKey,
+} from "../../../../lib/scheduler/schedulerFetchRange";
 import {
   buildEventsByTechAndDay,
   getEventsForTechAndDay,
@@ -33,7 +48,8 @@ import {
   getTechnicianAvailabilityIssues,
   technicianOnLeaveDate,
 } from "../../../../lib/calendar/availability";
-import { toSingaporeYmd } from "../../../../lib/utils/singaporeDateTime";
+import { toSingaporeYmd, buildSingaporeDateTimeFromForm } from "../../../../lib/utils/singaporeDateTime";
+import { formatDurationLabel } from "../../../../lib/jobs/scheduleDuration";
 import { getWorkerViewPath } from "../../../../utils/workerRoutes";
 import {
   fetchJobStatuses,
@@ -56,6 +72,8 @@ import {
   PersonFill as PersonFillIcon,
 } from "react-bootstrap-icons";
 import { phoneLinkRow } from "../../../../lib/utils/toTelHref";
+import SchedulerJobStatusEditModal from "./_components/SchedulerJobStatusEditModal";
+import SchedulerJobScheduleEditModal from "./_components/SchedulerJobScheduleEditModal";
 
 /** Shorter lines under the title while data loads */
 const SCHEDULER_LOADING_STATUS_LINES = [
@@ -378,33 +396,115 @@ function JobDetailDescription({ raw, sanitizeHtml, styles: s }) {
   );
 }
 
+const mapEmbedUrlCache = new Map();
+const mapIframePool = new Map();
+
+const HIDDEN_MAP_POOL_ID = "fsm-scheduler-map-iframe-pool";
+
+function getCachedMapEmbedUrl(location) {
+  const key = String(location || "").trim();
+  if (!key) return "";
+  if (mapEmbedUrlCache.has(key)) return mapEmbedUrlCache.get(key);
+  const url = `https://maps.google.com/maps?q=${encodeURIComponent(key)}&z=16&output=embed`;
+  mapEmbedUrlCache.set(key, url);
+  return url;
+}
+
+function getHiddenMapPoolHost() {
+  if (typeof document === "undefined") return null;
+  let host = document.getElementById(HIDDEN_MAP_POOL_ID);
+  if (!host) {
+    host = document.createElement("div");
+    host.id = HIDDEN_MAP_POOL_ID;
+    host.setAttribute("aria-hidden", "true");
+    host.style.cssText =
+      "position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden;pointer-events:none;visibility:hidden;";
+    document.body.appendChild(host);
+  }
+  return host;
+}
+
+function parkMapIframe(locationKey, container) {
+  if (!locationKey || !container) return;
+  const iframe = mapIframePool.get(locationKey);
+  if (!iframe || iframe.parentElement !== container) return;
+  const host = getHiddenMapPoolHost();
+  if (host) host.appendChild(iframe);
+}
+
+function acquireMapIframe(locationKey, embedUrl, frameClassName, title, onLoad) {
+  let iframe = mapIframePool.get(locationKey);
+  if (iframe) {
+    if (onLoad) {
+      if (iframe.dataset.loaded === "true") onLoad();
+      else iframe.addEventListener("load", onLoad, { once: true });
+    }
+    return iframe;
+  }
+
+  iframe = document.createElement("iframe");
+  iframe.title = title;
+  iframe.src = embedUrl;
+  iframe.className = frameClassName;
+  iframe.loading = "lazy";
+  iframe.referrerPolicy = "no-referrer-when-downgrade";
+  iframe.allowFullscreen = true;
+  iframe.addEventListener(
+    "load",
+    () => {
+      iframe.dataset.loaded = "true";
+      onLoad?.();
+    },
+    { once: true }
+  );
+  mapIframePool.set(locationKey, iframe);
+  return iframe;
+}
+
 function JobDetailLocationPanel({ location, locationParts, styles: s, mapActive = false }) {
-  const [mapReady, setMapReady] = useState(false);
+  const mapWrapRef = useRef(null);
   const [iframeLoaded, setIframeLoaded] = useState(false);
+  const locationKey = String(location || "").trim();
 
   useEffect(() => {
-    if (!mapActive || !location || location === "No Location") {
-      setMapReady(false);
+    const pooled = locationKey ? mapIframePool.get(locationKey) : null;
+    setIframeLoaded(Boolean(pooled?.dataset?.loaded === "true"));
+  }, [locationKey]);
+
+  useEffect(() => {
+    if (!mapActive || !locationKey) return undefined;
+
+    const wrap = mapWrapRef.current;
+    if (!wrap) return undefined;
+
+    const embedUrl = getCachedMapEmbedUrl(locationKey);
+    const iframe = acquireMapIframe(
+      locationKey,
+      embedUrl,
+      s.jobDetailMapFrame,
+      `Map for ${locationKey}`,
+      () => setIframeLoaded(true)
+    );
+
+    if (iframe.dataset.loaded === "true") {
+      setIframeLoaded(true);
+    } else {
       setIframeLoaded(false);
-      return undefined;
     }
 
-    let cancelled = false;
-    let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(() => {
-        if (!cancelled) setMapReady(true);
-      });
-    });
+    wrap.appendChild(iframe);
 
     return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf1);
-      if (raf2) cancelAnimationFrame(raf2);
-      setMapReady(false);
-      setIframeLoaded(false);
+      parkMapIframe(locationKey, wrap);
     };
-  }, [mapActive, location]);
+  }, [mapActive, locationKey, s.jobDetailMapFrame]);
+
+  useEffect(() => {
+    if (mapActive || !locationKey) return undefined;
+    const wrap = mapWrapRef.current;
+    if (wrap) parkMapIframe(locationKey, wrap);
+    return undefined;
+  }, [mapActive, locationKey]);
 
   if (!location || location === "No Location") {
     return (
@@ -418,8 +518,7 @@ function JobDetailLocationPanel({ location, locationParts, styles: s, mapActive 
   }
 
   const mapsSearchUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(location)}`;
-  const embedUrl = getCachedMapEmbedUrl(location);
-  const showMapSkeleton = mapReady && !iframeLoaded;
+  const showMapSkeleton = mapActive && !iframeLoaded;
 
   return (
     <section className={s.jobDetailBlock}>
@@ -435,26 +534,13 @@ function JobDetailLocationPanel({ location, locationParts, styles: s, mapActive 
             <div className={s.jobDetailLocFull}>{location}</div>
           )}
         </div>
-        <div className={s.jobDetailMapWrap} aria-busy={mapReady && !iframeLoaded}>
-          {!mapReady ? (
-            <div className={s.jobDetailMapPlaceholder} aria-hidden>
-              <span className={s.jobDetailMapPlaceholderText}>Map preview</span>
-            </div>
-          ) : null}
+        <div
+          ref={mapWrapRef}
+          className={s.jobDetailMapWrap}
+          aria-busy={mapActive && !iframeLoaded}
+        >
           {showMapSkeleton ? (
             <div className={s.jobDetailMapSkeleton} aria-hidden />
-          ) : null}
-          {mapReady ? (
-            <iframe
-              title={`Map for ${location}`}
-              src={embedUrl}
-              className={s.jobDetailMapFrame}
-              data-loaded={iframeLoaded ? "true" : "false"}
-              loading="lazy"
-              referrerPolicy="no-referrer-when-downgrade"
-              allowFullScreen
-              onLoad={() => setIframeLoaded(true)}
-            />
           ) : null}
         </div>
         <a
@@ -468,17 +554,6 @@ function JobDetailLocationPanel({ location, locationParts, styles: s, mapActive 
       </div>
     </section>
   );
-}
-
-const mapEmbedUrlCache = new Map();
-
-function getCachedMapEmbedUrl(location) {
-  const key = String(location || "").trim();
-  if (!key) return "";
-  if (mapEmbedUrlCache.has(key)) return mapEmbedUrlCache.get(key);
-  const url = `https://maps.google.com/maps?q=${encodeURIComponent(key)}&z=16&output=embed`;
-  mapEmbedUrlCache.set(key, url);
-  return url;
 }
 
 function compareJobsByScheduleTime(a, b) {
@@ -497,6 +572,13 @@ function formatSchedulerDateInputValue(date, viewMode) {
   return viewMode === "month" ? format(date, "yyyy-MM") : format(date, "yyyy-MM-dd");
 }
 
+function formatSchedulerDateDisplay(date, viewMode) {
+  if (viewMode === "month") {
+    return format(date, "MM/yyyy");
+  }
+  return `${format(date, "dd/MM/yyyy")} (${format(date, "EEE")})`;
+}
+
 function parseSchedulerDateInputValue(value, viewMode) {
   if (!value) return null;
   const raw = value + (viewMode === "month" ? "-01" : "");
@@ -504,8 +586,16 @@ function parseSchedulerDateInputValue(value, viewMode) {
   return isValid(parsed) ? startOfDay(parsed) : null;
 }
 
-function getEventsForDayFromIndex(eventsByTechAndDay, ymd) {
+function getEventsForDayFromIndex(eventsByTechAndDay, ymd, allowedTechIds) {
   const dayJobs = [];
+  if (allowedTechIds) {
+    for (const techId of allowedTechIds) {
+      const dayMap = eventsByTechAndDay.get(techId);
+      const jobs = dayMap?.get(ymd);
+      if (jobs?.length) dayJobs.push(...jobs);
+    }
+    return dayJobs;
+  }
   for (const dayMap of eventsByTechAndDay.values()) {
     const jobs = dayMap.get(ymd);
     if (jobs?.length) dayJobs.push(...jobs);
@@ -524,6 +614,10 @@ const Scheduler = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [viewMode, setViewMode] = useState('day');
   const includeUndated = viewMode === 'day';
+  const schedulerRangeKey = useMemo(() => {
+    const range = computeSchedulerFetchRange(viewMode, selectedDate);
+    return `${schedulerFetchRangeKey(range)}|undated:${includeUndated}`;
+  }, [viewMode, selectedDate, includeUndated]);
   const {
     resources,
     setResources,
@@ -532,6 +626,8 @@ const Scheduler = () => {
     calendarEvents,
     undatedByTech,
     loading,
+    isInitialLoad,
+    isRefreshing,
     hasLoadedOnceRef,
     refreshData,
     patchEvent,
@@ -540,16 +636,32 @@ const Scheduler = () => {
     viewMode,
     selectedDate,
     refreshData,
-    enabled: !loading,
+    enabled: !isInitialLoad,
     includeUndated,
   });
+
+  useEffect(() => {
+    seedSiteContactCacheFromEvents(schedulerRangeKey, events);
+  }, [schedulerRangeKey, events]);
+
+  const handleRefreshSchedule = useCallback(async () => {
+    invalidateSchedulerServerCache();
+    invalidateAllWindowCaches();
+    invalidateSchedulerCache(techniciansCacheKey());
+    await refreshData(undefined, { force: true });
+  }, [refreshData]);
+
   const [customerFilter, setCustomerFilter] = useState('');
   const [showAssignConfirm, setShowAssignConfirm] = useState(false);
   const [assignmentData, setAssignmentData] = useState(null);
   const [createAsRecurring, setCreateAsRecurring] = useState(false);
   const [showReassignModal, setShowReassignModal] = useState(false);
+  const [showStatusEditModal, setShowStatusEditModal] = useState(false);
+  const [showScheduleEditModal, setShowScheduleEditModal] = useState(false);
   const [selectedNewTechnician, setSelectedNewTechnician] = useState(null);
   const [isReassigning, setIsReassigning] = useState(false);
+  const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
+  const [isUpdatingSchedule, setIsUpdatingSchedule] = useState(false);
   const [showColorPicker, setShowColorPicker] = useState(false);
   const [selectedTechnicianForColor, setSelectedTechnicianForColor] = useState(null);
   const [selectedColor, setSelectedColor] = useState('#667eea');
@@ -558,7 +670,9 @@ const Scheduler = () => {
   const dailyGridScrollRef = useRef(null);
   const schedulerPageRootRef = useRef(null);
   const toolbarRef = useRef(null);
+  const hiddenDateInputRef = useRef(null);
   const jobModalClosingRef = useRef(false);
+  const jobSiteContactAbortRef = useRef(null);
   const [jobStatuses, setJobStatuses] = useState(
     () => readCachedJobStatuses() || getDefaultJobStatuses()
   );
@@ -665,23 +779,38 @@ const Scheduler = () => {
     setDateInputValue(formatSchedulerDateInputValue(selectedDate, viewMode));
   }, [dateInputValue, viewMode, selectedDate]);
 
-  const loadJobSiteContact = useCallback(async (job) => {
+  const loadJobSiteContact = useCallback(async (job, { signal } = {}) => {
     if (!job?.jobId) return job;
     const m = job.meta || {};
-    if (m.siteContactName || m.siteContactPhone || m.siteContactEmail) return job;
+    if (m.siteContactResolved) return job;
+    if (signal?.aborted) return job;
+
+    const cached = getSiteContactFromCache(schedulerRangeKey, job.jobId);
+    if (cached) {
+      return { ...job, meta: { ...m, ...cached, siteContactResolved: true } };
+    }
+
     try {
       const response = await fetch(
         `/api/scheduler/job-site-contact?jobId=${encodeURIComponent(job.jobId)}`,
-        { credentials: "same-origin", headers: { Accept: "application/json" } }
+        {
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+          signal,
+        }
       );
+      if (signal?.aborted) return job;
       if (!response.ok) return job;
       const siteMeta = await response.json();
+      if (signal?.aborted) return job;
       if (!siteMeta || typeof siteMeta !== "object") return job;
-      return { ...job, meta: { ...m, ...siteMeta } };
-    } catch {
+      setSiteContactCache(schedulerRangeKey, job.jobId, siteMeta);
+      return { ...job, meta: { ...m, ...siteMeta, siteContactResolved: true } };
+    } catch (err) {
+      if (err?.name === "AbortError") return job;
       return job;
     }
-  }, []);
+  }, [schedulerRangeKey]);
 
   /* Sync horizontal scroll: header scroll → update grid; grid scroll → update header */
   const scrollSyncLockRef = useRef(false);
@@ -740,12 +869,26 @@ const Scheduler = () => {
     };
   }, [viewMode, loading]);
 
+  /**
+   * Per open/close cycle (Network tab cleared, Fetch/XHR filter):
+   * - 0 GET /api/scheduler/job-site-contact when meta.siteContactResolved (Phase 2 window load).
+   * - 0 GET /api/scheduler/technician-data while 90s client cache is warm.
+   * - 0 portal XHR on close; reopen same job = 0 new portal XHR if contact already resolved.
+   * - Google Maps: one embed per unique location per session; reopen same location = 0 reload (pooled iframe).
+   */
   const handleJobClick = (job) => {
     if (jobModalClosingRef.current) return;
+    jobSiteContactAbortRef.current?.abort();
+    jobSiteContactAbortRef.current = null;
+
     setSelectedJob(job);
     setShowJobModal(true);
-    void loadJobSiteContact(job).then((enriched) => {
-      if (!enriched) return;
+    if (job?.meta?.siteContactResolved) return;
+
+    const abortController = new AbortController();
+    jobSiteContactAbortRef.current = abortController;
+    void loadJobSiteContact(job, { signal: abortController.signal }).then((enriched) => {
+      if (abortController.signal.aborted || !enriched) return;
       setSelectedJob((prev) =>
         prev && (prev.event_id === enriched.event_id || prev.id === enriched.id) ? enriched : prev
       );
@@ -761,6 +904,8 @@ const Scheduler = () => {
 
   const handleCloseModal = (event) => {
     event?.stopPropagation?.();
+    jobSiteContactAbortRef.current?.abort();
+    jobSiteContactAbortRef.current = null;
     jobModalClosingRef.current = true;
     setShowJobModal(false);
     setShowReassignModal(false);
@@ -773,7 +918,7 @@ const Scheduler = () => {
 
   const handleViewFullJob = () => {
     if (selectedJob?.jobId) {
-      const url = `/jobs/view/${selectedJob.jobId}`;
+      const url = `/dashboard/jobs/${selectedJob.jobId}`;
       window.open(url, '_blank', 'noopener,noreferrer');
     }
   };
@@ -860,6 +1005,8 @@ const Scheduler = () => {
         color: selectedNewTechnician.color || hydrated.color,
       });
 
+      invalidateSchedulerServerCache();
+
       setShowReassignModal(false);
       setSelectedNewTechnician(null);
     } catch (error) {
@@ -870,6 +1017,9 @@ const Scheduler = () => {
     }
   };
 
+  const jobSubModalOpen =
+    showReassignModal || showStatusEditModal || showScheduleEditModal;
+
   const handleOpenReassignModal = () => {
     setSelectedNewTechnician(null);
     setShowReassignModal(true);
@@ -879,6 +1029,104 @@ const Scheduler = () => {
     if (isReassigning) return;
     setShowReassignModal(false);
     setSelectedNewTechnician(null);
+  };
+
+  const handleOpenStatusEditModal = () => {
+    setShowStatusEditModal(true);
+  };
+
+  const handleCloseStatusEditModal = () => {
+    if (isUpdatingStatus) return;
+    setShowStatusEditModal(false);
+  };
+
+  const handleOpenScheduleEditModal = () => {
+    setShowScheduleEditModal(true);
+  };
+
+  const handleCloseScheduleEditModal = () => {
+    if (isUpdatingSchedule) return;
+    setShowScheduleEditModal(false);
+  };
+
+  const handleUpdateStatus = async (nextStatus) => {
+    if (!selectedJob || !nextStatus) return;
+
+    setIsUpdatingStatus(true);
+    try {
+      const updatedEvent = await updateJobStatusFromScheduler({
+        jobId: selectedJob.jobId,
+        technicianJobId: selectedJob.technicianJobId,
+        status: nextStatus,
+        previousStatus: selectedJob.jobStatus,
+        jobStatuses,
+      });
+
+      const hydrated = hydrateSchedulerEvent(updatedEvent, resources);
+      patchEvent({
+        ...hydrated,
+        color: getJobStatusColorFromSettings(hydrated.jobStatus) || hydrated.color,
+      });
+      setSelectedJob(hydrated);
+      invalidateSchedulerServerCache();
+      setShowStatusEditModal(false);
+    } catch (error) {
+      console.error("Status update error:", error);
+    } finally {
+      setIsUpdatingStatus(false);
+    }
+  };
+
+  const handleUpdateSchedule = async ({
+    appointmentDate,
+    startTime,
+    endTime,
+    durationHours,
+    durationMinutes,
+  }) => {
+    if (!selectedJob) return;
+
+    const hasAppointmentChange = appointmentDate && startTime && endTime;
+    const hasDurationChange =
+      durationHours !== undefined || durationMinutes !== undefined;
+
+    if (!hasAppointmentChange && !hasDurationChange) return;
+
+    let start = null;
+    let end = null;
+    if (hasAppointmentChange) {
+      start = buildSingaporeDateTimeFromForm(appointmentDate, startTime);
+      end = buildSingaporeDateTimeFromForm(appointmentDate, endTime);
+      if (!start || !end) return;
+    }
+
+    setIsUpdatingSchedule(true);
+    try {
+      const updatedEvent = await rescheduleJobAppointment({
+        jobId: selectedJob.jobId,
+        jobScheduleId: selectedJob.jobScheduleId,
+        technicianJobId: selectedJob.technicianJobId,
+        technicianId: selectedJob.technicianId || selectedJob.resourceId,
+        start: hasAppointmentChange ? start : undefined,
+        end: hasAppointmentChange ? end : undefined,
+        location: selectedJob.location,
+        durationHours: hasDurationChange ? durationHours : undefined,
+        durationMinutes: hasDurationChange ? durationMinutes : undefined,
+      });
+
+      const hydrated = hydrateSchedulerEvent(updatedEvent, resources);
+      patchEvent({
+        ...hydrated,
+        color: getJobStatusColorFromSettings(hydrated.jobStatus) || hydrated.color,
+      });
+      setSelectedJob(hydrated);
+      invalidateSchedulerServerCache();
+      setShowScheduleEditModal(false);
+    } catch (error) {
+      console.error("Schedule update error:", error);
+    } finally {
+      setIsUpdatingSchedule(false);
+    }
   };
 
   const handleWorkerAvatarClick = (tech, e) => {
@@ -1077,6 +1325,7 @@ const Scheduler = () => {
     const email = (tech.subtext || tech.email || '').toLowerCase();
     return name.includes(searchLower) || email.includes(searchLower);
   });
+  const allowedTechIds = new Set(filteredResources.map((t) => String(t.id)));
   const activeWorkerCount = filteredResources.filter(isTechnicianActive).length;
   const inactiveWorkerCount = filteredResources.length - activeWorkerCount;
   const workerAccountStatusSummary = (
@@ -1143,7 +1392,7 @@ const Scheduler = () => {
             const isCurrentMonth = day.getMonth() === selectedDate.getMonth();
             const dayYmd = toSingaporeYmd(day);
             const hasCompanyEvent = companyEventsCoverDate(calendarEvents, dayYmd);
-            const dayJobs = getEventsForDayFromIndex(eventsByTechAndDay, dayYmd);
+            const dayJobs = getEventsForDayFromIndex(eventsByTechAndDay, dayYmd, allowedTechIds);
 
             return (
               <div 
@@ -1179,7 +1428,7 @@ const Scheduler = () => {
     );
   };
 
-  if (loading && !hasLoadedOnceRef.current) {
+  if (isInitialLoad) {
     return (
       <CustomerListLoadingIndicator
         loading
@@ -1221,20 +1470,47 @@ const Scheduler = () => {
               >
                 ←
               </button>
-              <input
-                type={viewMode === 'month' ? 'month' : 'date'}
-                value={dateInputValue}
-                onChange={(e) => setDateInputValue(e.target.value)}
-                onBlur={commitDateFromInput}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitDateFromInput();
-                    e.currentTarget.blur();
-                  }
-                }}
-                className={styles.dateInput}
-              />
+              {viewMode === 'month' ? (
+                <input
+                  type="month"
+                  value={dateInputValue}
+                  onChange={(e) => setDateInputValue(e.target.value)}
+                  onBlur={commitDateFromInput}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      commitDateFromInput();
+                      e.currentTarget.blur();
+                    }
+                  }}
+                  className={styles.dateInput}
+                />
+              ) : (
+                <div className={styles.datePickerGroup}>
+                  <button
+                    type="button"
+                    className={styles.dateDisplayBtn}
+                    onClick={() => hiddenDateInputRef.current?.showPicker?.()}
+                    title="Change date"
+                  >
+                    {formatSchedulerDateDisplay(selectedDate, viewMode)}
+                  </button>
+                  <input
+                    ref={hiddenDateInputRef}
+                    type="date"
+                    value={dateInputValue}
+                    onChange={(e) => {
+                      const nextValue = e.target.value;
+                      setDateInputValue(nextValue);
+                      const parsed = parseSchedulerDateInputValue(nextValue, viewMode);
+                      if (parsed) setSelectedDate(parsed);
+                    }}
+                    className={styles.hiddenDateInput}
+                    tabIndex={-1}
+                    aria-hidden="true"
+                  />
+                </div>
+              )}
               <button 
                 onClick={() => {
                   if (viewMode === 'month') {
@@ -1287,8 +1563,32 @@ const Scheduler = () => {
               </div>
             </div>
 
-            {/* <div className={styles.toolbarRight}>
-              <button onClick={refreshData} className={styles.btnOutline}>Refresh</button>
+            {/* DO NOT REMOVE THIS REFRESH SCHEDULE BUTTON 
+            <div className={styles.toolbarRight}>
+              {isRefreshing && (
+                <span className="text-muted small d-flex align-items-center gap-1 me-2">
+                  <Spinner animation="border" size="sm" />
+                  Updating…
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleRefreshSchedule()}
+                className={styles.btnOutline}
+                disabled={isRefreshing}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                }}
+              >
+                {isRefreshing ? (
+                  <Spinner animation="border" size="sm" />
+                ) : (
+                  <ArrowRepeatIcon size={16} />
+                )}
+                Refresh Schedule
+              </button>
             </div> */}
           </div>
 
@@ -1330,25 +1630,24 @@ const Scheduler = () => {
           {viewMode === 'day' && (
             <div className={styles.dailyViewHeaderSticky}>
               <div className={styles.dailyViewHeaderScroll} ref={dailyHeaderScrollRef}>
-                <div className={styles.dailyViewWorkerLabel}>
-                  <span>WORKERS ({filteredResources.length})</span>
-                  {workerAccountStatusSummary}
-                </div>
-                <div className={styles.dailyViewDateAndTime}>
-                  <div className={`${styles.dailyViewDateText} ${isSameDay(selectedDate, new Date()) ? styles.todayHeader : ''} ${
+                <div className={`${styles.dailyViewDateCell} ${isSameDay(selectedDate, new Date()) ? styles.todayHeader : ''} ${
                     companyEventsCoverDate(calendarEvents, toSingaporeYmd(selectedDate))
                       ? styles.companyCalendarDayHeader
                       : ""
                   }`}>
-                    {format(selectedDate, 'EEE')} {format(selectedDate, 'd')} {format(selectedDate, 'MMM')}
-                  </div>
-                  <div className={styles.dailyViewTimeSlots}>
-                    {Array.from({ length: 24 }, (_, pairIndex) => (
-                      <div key={pairIndex} className={styles.dailyViewTimeSlot}>
-                        {formatDailyHeaderSlotRange(pairIndex)}
-                      </div>
-                    ))}
-                  </div>
+                  {format(selectedDate, 'EEE')} {format(selectedDate, 'd')} {format(selectedDate, 'MMM')}
+                </div>
+                <div className={styles.dailyViewDateSpacer} aria-hidden="true" />
+                <div className={styles.dailyViewWorkerLabel}>
+                  <span>WORKERS ({filteredResources.length})</span>
+                  {workerAccountStatusSummary}
+                </div>
+                <div className={styles.dailyViewTimeSlots}>
+                  {Array.from({ length: 24 }, (_, pairIndex) => (
+                    <div key={pairIndex} className={styles.dailyViewTimeSlot}>
+                      {formatDailyHeaderSlotRange(pairIndex)}
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
@@ -1503,7 +1802,7 @@ const Scheduler = () => {
                               key={a.assignmentId}
                               className={styles.unscheduledJobPill}
                               title={`${a.jobTitle || 'Untitled'} — ${a.customerName || 'No customer'} | Status: ${a.jobStatus || 'N/A'}`}
-                              onClick={() => router.push(`/jobs/view/${a.jobId}`)}
+                              onClick={() => router.push(`/dashboard/jobs/${a.jobId}`)}
                             >
                               #{a.jobNumber || a.jobId}
                             </span>
@@ -1706,7 +2005,7 @@ const Scheduler = () => {
 
       {/* Job Detail Modal */}
       <PortalModal
-        show={showJobModal && !showReassignModal}
+        show={showJobModal && !jobSubModalOpen}
         onHide={handleCloseModal}
         title={
           selectedJob?.jobNumber
@@ -1716,25 +2015,53 @@ const Scheduler = () => {
         subtitle={
           selectedJob ? (
             <span className={styles.jobDetailHeaderMeta}>
-              <span
-                className={styles.jobStatusPill}
-                style={{
-                  background:
-                    getJobStatusColorFromSettings(selectedJob.jobStatus) || "#6b7280",
-                }}
-              >
-                {getJobStatusLabelFromSettings(selectedJob.jobStatus) ||
-                  selectedJob.jobStatus ||
-                  "N/A"}
+              <span className={styles.jobDetailHeaderMetaGroup}>
+                <span
+                  className={styles.jobStatusPill}
+                  style={{
+                    background:
+                      getJobStatusColorFromSettings(selectedJob.jobStatus) || "#6b7280",
+                  }}
+                >
+                  {getJobStatusLabelFromSettings(selectedJob.jobStatus) ||
+                    selectedJob.jobStatus ||
+                    "N/A"}
+                </span>
+                <button
+                  type="button"
+                  className={styles.jobDetailHeaderEditAction}
+                  onClick={handleOpenStatusEditModal}
+                  disabled={isUpdatingStatus || isUpdatingSchedule || isReassigning}
+                >
+                  Edit status
+                </button>
               </span>
-              <span className={styles.jobDetailHeaderTime}>
-                <ClockIcon aria-hidden />
-                {formatModalOriginalAppointmentTime(selectedJob)}
+              <span className={styles.jobDetailHeaderMetaGroup}>
+                <span className={styles.jobDetailHeaderTime}>
+                  <ClockIcon aria-hidden />
+                  {formatModalOriginalAppointmentTime(selectedJob)}
+                </span>
+                <button
+                  type="button"
+                  className={styles.jobDetailHeaderEditAction}
+                  onClick={handleOpenScheduleEditModal}
+                  disabled={isUpdatingStatus || isUpdatingSchedule || isReassigning}
+                >
+                  Edit schedule
+                </button>
               </span>
+              {formatDurationLabel(selectedJob.durationHours) ? (
+                <span className={styles.jobDetailHeaderDuration}>
+                  Est. work: {formatDurationLabel(selectedJob.durationHours)}
+                </span>
+              ) : null}
             </span>
           ) : null
         }
         size="xl"
+        modalClassName={styles.jobDetailPortalModal}
+        headerClassName={styles.jobDetailModalHeader}
+        contentExtraClassName={styles.jobDetailModalContent}
         bodyClassName={styles.jobDetailModalBody}
         footer={
           <>
@@ -1902,7 +2229,7 @@ const Scheduler = () => {
                         location={loc}
                         locationParts={locationParts}
                         styles={styles}
-                        mapActive={showJobModal && !showReassignModal}
+                        mapActive={showJobModal && !jobSubModalOpen}
                       />
                     </div>
                   </div>
@@ -1910,6 +2237,24 @@ const Scheduler = () => {
               );
             })()}
       </PortalModal>
+
+      <SchedulerJobStatusEditModal
+        show={showStatusEditModal}
+        onHide={handleCloseStatusEditModal}
+        selectedJob={selectedJob}
+        jobStatuses={jobStatuses}
+        onSave={handleUpdateStatus}
+        isSaving={isUpdatingStatus}
+        selectStyles={REASSIGN_TECHNICIAN_SELECT_STYLES}
+      />
+
+      <SchedulerJobScheduleEditModal
+        show={showScheduleEditModal}
+        onHide={handleCloseScheduleEditModal}
+        selectedJob={selectedJob}
+        onSave={handleUpdateSchedule}
+        isSaving={isUpdatingSchedule}
+      />
 
       <PortalModal
         show={showReassignModal && !!selectedJob}

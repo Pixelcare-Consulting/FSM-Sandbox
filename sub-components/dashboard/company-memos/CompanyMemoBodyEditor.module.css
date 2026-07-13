@@ -1,0 +1,66 @@
+.wrap :global(.ql-toolbar.ql-snow) {
+  border-top-left-radius: 0.375rem;
+  border-top-right-radius: 0.375rem;
+  border-color: var(--bs-border-color, #dee2e6);
+  background: var(--bs-tertiary-bg, #f8f9fa);
+  flex-wrap: wrap;
+}
+
+.wrap :global(.ql-container.ql-snow) {
+  border-bottom-left-radius: 0.375rem;
+  border-bottom-right-radius: 0.375rem;
+  border-color: var(--bs-border-color, #dee2e6);
+  font-family: inherit;
+}
+
+.wrap :global(.ql-editor) {
+  min-height: 280px;
+  font-size: 0.9375rem;
+  line-height: 1.55;
+}
+
+.wrap :global(.ql-editor.ql-blank::before) {
+  color: var(--bs-secondary-color, #6c757d);
+  font-style: normal;
+}
+
+.wrap :global(.ql-editor p) {
+  margin: 0 0 6px 0;
+  line-height: 1.45;
+}
+
+.wrap :global(.ql-editor h1),
+.wrap :global(.ql-editor h2),
+.wrap :global(.ql-editor h3),
+.wrap :global(.ql-editor h4) {
+  margin: 0 0 6px 0;
+  line-height: 1.25;
+}
+
+.wrap :global(.ql-editor ul),
+.wrap :global(.ql-editor ol) {
+  margin: 0 0 8px 0;
+  padding-left: 1.25em;
+}
+
+.wrap :global(.ql-editor li) {
+  margin: 0 0 2px 0;
+  line-height: 1.45;
+}
+
+/* Suppress legacy Quill 1 list markers if theme CSS leaks */
+.wrap :global(.ql-editor li::before) {
+  content: none !important;
+  display: none !important;
+}
+
+.wrap :global(.ql-editor img) {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.375rem;
+}
+
+.wrapUploading :global(.ql-toolbar button.ql-image) {
+  opacity: 0.5;
+  pointer-events: none;
+}

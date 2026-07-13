@@ -34,8 +34,11 @@ function addressDetailsStorageName(siteId, addressType) {
   return base;
 }
 
+/** Strip trailing postal tails: middot (` · 403032`) and comma (` , 403032`). */
 function stripTrailingPostalFromSiteKey(siteId) {
-  return str(siteId).replace(/ · \d+$/, '');
+  return str(siteId)
+    .replace(/ · \d+$/, '')
+    .replace(/, \d+$/, '');
 }
 
 /**

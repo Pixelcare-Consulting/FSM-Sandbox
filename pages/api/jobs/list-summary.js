@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import { withSession } from '../../../lib/api/withSession';
 import {
   SUPABASE_JOB_LIST_BASE_SELECT,
   formatJobListSummaryRow,
@@ -13,6 +14,7 @@ import {
 } from '../../../lib/jobs/jobStatusFilter';
 import {
   getListCache,
+  invalidateListCache,
   logResponseSize,
   paginatedSelect,
   parseSearchTokens,
@@ -20,10 +22,30 @@ import {
   setListCache,
 } from '../../../lib/supabase/listQueryHelpers';
 
-const CACHE_TTL_MS = 45000;
+const CACHE_TTL_DEFAULT_MS = 120_000;
+const CACHE_TTL_SEARCH_MS = 45_000;
+const JOB_STATUSES_CACHE_KEY = 'job-statuses-for-filter';
+const JOB_STATUSES_CACHE_TTL_MS = 8 * 60 * 1000;
+const COUNT_CACHE_TTL_MS = 3 * 60 * 1000;
 const SCHEDULE_FETCH_CONCURRENCY = 6;
 
-export default async function handler(req, res) {
+function buildCountCacheKey({ search, status, statusValues, priority, dateFrom, dateTo, jobId }) {
+  return `jobs-summary-count:${search}:${status}:${statusValues}:${priority}:${dateFrom}:${dateTo}:${jobId}`;
+}
+
+function resolveListCacheTtl(search, tokens) {
+  return tokens.length > 0 || search ? CACHE_TTL_SEARCH_MS : CACHE_TTL_DEFAULT_MS;
+}
+
+async function loadCachedJobStatusesForFilter(supabase) {
+  const cached = getListCache(JOB_STATUSES_CACHE_KEY, JOB_STATUSES_CACHE_TTL_MS);
+  if (cached) return cached;
+  const statuses = await loadJobStatusesForFilter(supabase);
+  setListCache(JOB_STATUSES_CACHE_KEY, statuses, JOB_STATUSES_CACHE_TTL_MS);
+  return statuses;
+}
+
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -42,8 +64,11 @@ export default async function handler(req, res) {
   const sortAsc = req.query.sortDir === 'asc';
   const jobId = String(req.query.jobId || '').trim();
 
+  const tokens = parseSearchTokens(search);
+  const listCacheTtl = resolveListCacheTtl(search, tokens);
+
   const cacheKey = `jobs-summary:${page}:${limit}:${search}:${status}:${statusValues}:${priority}:${dateFrom}:${dateTo}:${sort}:${sortAsc}:${jobId}`;
-  const cached = getListCache(cacheKey, CACHE_TTL_MS);
+  const cached = getListCache(cacheKey, listCacheTtl);
   if (cached) {
     logResponseSize('jobs/list-summary (cached)', cached);
     return res.status(200).json(cached);
@@ -55,8 +80,7 @@ export default async function handler(req, res) {
       return res.status(503).json({ error: 'Database unavailable' });
     }
 
-    const tokens = parseSearchTokens(search);
-    const jobStatusesForFilter = await loadJobStatusesForFilter(supabase);
+    const jobStatusesForFilter = await loadCachedJobStatusesForFilter(supabase);
 
     let jobIdFilter = null;
     if (jobId) {
@@ -71,7 +95,7 @@ export default async function handler(req, res) {
           limit,
           fetchedAt: new Date().toISOString(),
         };
-        setListCache(cacheKey, emptyPayload, CACHE_TTL_MS);
+        setListCache(cacheKey, emptyPayload, listCacheTtl);
         logResponseSize('jobs/list-summary (empty job filter)', emptyPayload);
         return res.status(200).json(emptyPayload);
       }
@@ -84,7 +108,78 @@ export default async function handler(req, res) {
           ? 'status'
           : 'created_at';
 
-    const { data: dbRows, totalCount } = await paginatedSelect(
+    const countCacheKey = buildCountCacheKey({
+      search,
+      status,
+      statusValues,
+      priority,
+      dateFrom,
+      dateTo,
+      jobId,
+    });
+    const cachedTotalCount = getListCache(countCacheKey, COUNT_CACHE_TTL_MS);
+
+    const applyListFilters = (query) => {
+      let q = query;
+      if (jobId) {
+        return q.eq('id', jobId);
+      }
+      if (Array.isArray(jobIdFilter)) {
+        q = q.in('id', jobIdFilter);
+      }
+      if (statusValues) {
+        q = applyJobStatusValuesFilter(q, statusValues);
+      } else if (status && status !== 'all') {
+        q = applyJobStatusFilter(q, status, jobStatusesForFilter);
+      }
+      if (priority && priority !== 'all') {
+        q = q.ilike('priority', priority.toUpperCase());
+      }
+      if (dateFrom) {
+        q = q.gte('scheduled_start', `${dateFrom}T00:00:00`);
+      }
+      if (dateTo) {
+        q = q.lte('scheduled_start', `${dateTo}T23:59:59`);
+      }
+      return q;
+    };
+
+    if (tokens.length === 0 && cachedTotalCount != null) {
+      const maxPageForCachedCount =
+        cachedTotalCount > 0 ? Math.ceil(cachedTotalCount / limit) : 0;
+      if (page > maxPageForCachedCount) {
+        invalidateListCache(countCacheKey);
+        const { totalCount: exactCount } = await paginatedSelect(
+          supabase,
+          'jobs',
+          'id',
+          {
+            page: 1,
+            limit: 1,
+            countMode: 'exact',
+            filters: applyListFilters,
+          }
+        );
+        const correctedCount = exactCount ?? 0;
+        if (correctedCount > 0) {
+          setListCache(countCacheKey, correctedCount, COUNT_CACHE_TTL_MS);
+        }
+        const outOfRangePayload = {
+          jobs: [],
+          totalCount: correctedCount,
+          page,
+          limit,
+          fetchedAt: new Date().toISOString(),
+        };
+        logResponseSize('jobs/list-summary (out of range, cached count)', outOfRangePayload);
+        return res.status(200).json(outOfRangePayload);
+      }
+    }
+
+    let countMode =
+      tokens.length > 0 ? 'planned' : cachedTotalCount != null ? 'planned' : 'exact';
+
+    const paginatedResult = await paginatedSelect(
       supabase,
       'jobs',
       SUPABASE_JOB_LIST_BASE_SELECT,
@@ -92,33 +187,50 @@ export default async function handler(req, res) {
         page,
         limit,
         order: { column: sortColumn, ascending: sortAsc },
-        countMode: tokens.length > 0 ? 'planned' : 'exact',
-        filters: (query) => {
-          let q = query;
-          if (jobId) {
-            return q.eq('id', jobId);
-          }
-          if (Array.isArray(jobIdFilter)) {
-            q = q.in('id', jobIdFilter);
-          }
-          if (statusValues) {
-            q = applyJobStatusValuesFilter(q, statusValues);
-          } else if (status && status !== 'all') {
-            q = applyJobStatusFilter(q, status, jobStatusesForFilter);
-          }
-          if (priority && priority !== 'all') {
-            q = q.ilike('priority', priority.toUpperCase());
-          }
-          if (dateFrom) {
-            q = q.gte('scheduled_start', `${dateFrom}T00:00:00`);
-          }
-          if (dateTo) {
-            q = q.lte('scheduled_start', `${dateTo}T23:59:59`);
-          }
-          return q;
-        },
+        countMode,
+        filters: applyListFilters,
       }
     );
+
+    const { data: dbRows, totalCount: queriedCount, outOfRange } = paginatedResult;
+
+    if (outOfRange) {
+      invalidateListCache(countCacheKey);
+      let correctedCount = queriedCount ?? 0;
+      if (tokens.length === 0) {
+        const { totalCount: exactCount } = await paginatedSelect(
+          supabase,
+          'jobs',
+          'id',
+          {
+            page: 1,
+            limit: 1,
+            countMode: 'exact',
+            filters: applyListFilters,
+          }
+        );
+        correctedCount = exactCount ?? correctedCount;
+        if (correctedCount > 0) {
+          setListCache(countCacheKey, correctedCount, COUNT_CACHE_TTL_MS);
+        }
+      }
+      const outOfRangePayload = {
+        jobs: [],
+        totalCount: correctedCount,
+        page,
+        limit,
+        fetchedAt: new Date().toISOString(),
+      };
+      logResponseSize('jobs/list-summary (out of range)', outOfRangePayload);
+      return res.status(200).json(outOfRangePayload);
+    }
+
+    let totalCount = queriedCount;
+    if (tokens.length === 0 && cachedTotalCount != null) {
+      totalCount = cachedTotalCount;
+    } else if (tokens.length === 0 && countMode === 'exact' && queriedCount != null) {
+      setListCache(countCacheKey, queriedCount, COUNT_CACHE_TTL_MS);
+    }
 
     const jobIds = (dbRows || []).map((j) => j.id).filter(Boolean);
 
@@ -179,7 +291,7 @@ export default async function handler(req, res) {
       fetchedAt: new Date().toISOString(),
     };
 
-    setListCache(cacheKey, payload, CACHE_TTL_MS);
+    setListCache(cacheKey, payload, listCacheTtl);
     logResponseSize('jobs/list-summary', payload);
 
     return res.status(200).json(payload);
@@ -189,4 +301,4 @@ export default async function handler(req, res) {
       error: error.message || 'Unable to load jobs summary.',
     });
   }
-}
+});

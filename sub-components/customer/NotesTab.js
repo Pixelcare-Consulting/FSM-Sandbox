@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Form, Button, Card, ListGroup, Row, Col, InputGroup, Modal, Badge } from 'react-bootstrap';
 import TablePagination from 'components/common/TablePagination';
 import { getSupabaseClient } from '../../lib/supabase/client';
@@ -7,9 +7,29 @@ import { Trash, PencilSquare, Plus, Save, X, Tags, Search } from 'react-bootstra
 import { formatDistanceToNow } from 'date-fns';
 import Cookies from 'js-cookie';
 import toast from 'react-hot-toast';
+import { formatSingaporeDateWithTime } from '../../lib/utils/singaporeDateTime';
 import { AllNotesTable } from './AllNotesTable';
 
-export const NotesTab = ({ customerId }) => {
+function normalizeNoteRow(note) {
+  return {
+    id: note.id,
+    content: note.content,
+    userEmail: note.userEmail || note.user_email || 'Unknown',
+    tags: note.tags || [],
+    createdAt: note.createdAt
+      ? (typeof note.createdAt === 'string'
+        ? { toDate: () => new Date(note.createdAt) }
+        : note.createdAt)
+      : null,
+    updatedAt: note.updatedAt
+      ? (typeof note.updatedAt === 'string'
+        ? { toDate: () => new Date(note.updatedAt) }
+        : note.updatedAt)
+      : null,
+  };
+}
+
+export const NotesTab = ({ customerId, customerUuid: customerUuidProp = null }) => {
   const [notes, setNotes] = useState([]);
   const [newNote, setNewNote] = useState('');
   const [latestNote, setLatestNote] = useState(null);
@@ -17,7 +37,9 @@ export const NotesTab = ({ customerId }) => {
   const [showTagModal, setShowTagModal] = useState(false);
   const [selectedTags, setSelectedTags] = useState([]);
   const [newTag, setNewTag] = useState('');
-  const [customerUuid, setCustomerUuid] = useState(null);
+  const [customerUuid, setCustomerUuid] = useState(customerUuidProp);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [totalNoteCount, setTotalNoteCount] = useState(0);
 
   const [availableTags, setAvailableTags] = useState(['Important', 'Follow-up', 'Resolved', 'Pending', 'Question']);
 
@@ -38,11 +60,16 @@ export const NotesTab = ({ customerId }) => {
     setUserEmail(emailFromCookie || 'Unknown');
   }, []);
 
-  // Get customer UUID from customer code
+  // Resolve customer UUID — skip findByCode when bundle already provided it
   useEffect(() => {
+    if (customerUuidProp) {
+      setCustomerUuid(customerUuidProp);
+      return;
+    }
+
     const fetchCustomerUuid = async () => {
       if (!customerId) return;
-      
+
       try {
         const customer = await customerService.findByCode(customerId);
         if (customer) {
@@ -54,7 +81,47 @@ export const NotesTab = ({ customerId }) => {
     };
 
     fetchCustomerUuid();
-  }, [customerId]);
+  }, [customerId, customerUuidProp]);
+
+  const fetchNotesPage = useCallback(async (page = currentPage) => {
+    if (!customerUuid) return;
+
+    setNotesLoading(true);
+    try {
+      const searchParams = new URLSearchParams({
+        page: String(page),
+        limit: String(notesPerPage),
+      });
+      const response = await fetch(
+        `/api/customers/notes/${encodeURIComponent(customerUuid)}?${searchParams.toString()}`,
+        { credentials: 'same-origin', cache: 'no-store' }
+      );
+
+      if (!response.ok) {
+        console.error('Error fetching notes:', await response.text());
+        return;
+      }
+
+      const payload = await response.json();
+      const fetchedNotes = (payload.notes || []).map(normalizeNoteRow);
+      setNotes(fetchedNotes);
+      setTotalNoteCount(payload.totalCount ?? fetchedNotes.length);
+      if (fetchedNotes.length > 0 && page === 1) {
+        setLatestNote(fetchedNotes[0]);
+      } else if (fetchedNotes.length === 0) {
+        setLatestNote(null);
+      }
+    } catch (error) {
+      console.error('Error fetching notes:', error);
+    } finally {
+      setNotesLoading(false);
+    }
+  }, [customerUuid, currentPage, notesPerPage]);
+
+  useEffect(() => {
+    if (!customerUuid) return;
+    fetchNotesPage(currentPage);
+  }, [customerUuid, currentPage, notesPerPage, fetchNotesPage]);
 
   useEffect(() => {
     if (!customerUuid) return;
@@ -62,43 +129,8 @@ export const NotesTab = ({ customerId }) => {
     const supabase = getSupabaseClient();
     if (!supabase) return;
 
-    // Fetch notes from Supabase
-    const fetchNotes = async () => {
-      try {
-        const { data, error } = await supabase
-          .from('customer_notes')
-          .select('*')
-          .eq('customer_id', customerUuid)
-          .is('deleted_at', null)
-          .order('created_at', { ascending: false });
+    let debounceTimer = null;
 
-        if (error) {
-          console.error('Error fetching notes:', error);
-          return;
-        }
-
-        // Transform Supabase data to match expected format
-        const fetchedNotes = (data || []).map(note => ({
-          id: note.id,
-          content: note.content,
-          userEmail: note.user_email || 'Unknown',
-          tags: note.tags || [],
-          createdAt: note.created_at ? { toDate: () => new Date(note.created_at) } : null,
-          updatedAt: note.updated_at ? { toDate: () => new Date(note.updated_at) } : null
-        }));
-
-        setNotes(fetchedNotes);
-        if (fetchedNotes.length > 0) {
-          setLatestNote(fetchedNotes[0]);
-        }
-      } catch (error) {
-        console.error('Error fetching notes:', error);
-      }
-    };
-
-    fetchNotes();
-
-    // Set up real-time subscription
     const channel = supabase
       .channel(`customer_notes:${customerUuid}`)
       .on(
@@ -110,15 +142,19 @@ export const NotesTab = ({ customerId }) => {
           filter: `customer_id=eq.${customerUuid}`
         },
         () => {
-          fetchNotes(); // Refetch on changes
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            fetchNotesPage(currentPage);
+          }, 400);
         }
       )
       .subscribe();
 
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       supabase.removeChannel(channel);
     };
-  }, [customerUuid]);
+  }, [customerUuid, currentPage, fetchNotesPage]);
 
   // Filter notes based on search term
   const filteredNotes = notes.filter(note =>
@@ -127,16 +163,11 @@ export const NotesTab = ({ customerId }) => {
     note.userEmail.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  // Get current notes for pagination
-  const indexOfLastNote = currentPage * notesPerPage;
-  const indexOfFirstNote = indexOfLastNote - notesPerPage;
-  const currentNotes = filteredNotes.slice(indexOfFirstNote, indexOfLastNote);
+  const currentNotes = filteredNotes;
 
-  // Change page
   const paginate = (pageNumber) => setCurrentPage(pageNumber);
 
-  // Add this function to calculate total pages
-  const totalPages = Math.ceil(filteredNotes.length / notesPerPage);
+  const totalPages = Math.max(1, Math.ceil(totalNoteCount / notesPerPage));
 
   const handleAddNote = async (e) => {
     e.preventDefault();
@@ -173,45 +204,8 @@ export const NotesTab = ({ customerId }) => {
       setSelectedTags([]);
       setShowTagModal(false);
       toast.success('Note added successfully!');
-      
-      // Manually refresh notes list to ensure UI updates immediately
-      // The real-time subscription should also handle this, but this ensures it works
-      setTimeout(() => {
-        const fetchNotes = async () => {
-          try {
-            const { data, error } = await supabase
-              .from('customer_notes')
-              .select('*')
-              .eq('customer_id', customerUuid)
-              .is('deleted_at', null)
-              .order('created_at', { ascending: false });
-
-            if (error) {
-              console.error('Error fetching notes:', error);
-              return;
-            }
-
-            const fetchedNotes = (data || []).map(note => ({
-              id: note.id,
-              content: note.content,
-              userEmail: note.user_email || 'Unknown',
-              tags: note.tags || [],
-              createdAt: note.created_at ? { toDate: () => new Date(note.created_at) } : null,
-              updatedAt: note.updated_at ? { toDate: () => new Date(note.updated_at) } : null
-            }));
-
-            setNotes(fetchedNotes);
-            if (fetchedNotes.length > 0) {
-              setLatestNote(fetchedNotes[0]);
-            }
-            // Reset to first page to show the new note
-            setCurrentPage(1);
-          } catch (error) {
-            console.error('Error fetching notes:', error);
-          }
-        };
-        fetchNotes();
-      }, 500);
+      setCurrentPage(1);
+      await fetchNotesPage(1);
     } catch (error) {
       console.error('Error adding note:', error);
       toast.error(`Error adding note: ${error.message || 'Please try again.'}`);
@@ -246,37 +240,7 @@ export const NotesTab = ({ customerId }) => {
     } catch (error) {
       console.error('Error deleting note:', error);
       toast.error(`Error deleting note: ${error.message || 'Please try again.'}`);
-      // Refresh notes on error to ensure consistency
-      if (customerUuid) {
-        const fetchNotes = async () => {
-          try {
-            const { data, error } = await supabase
-              .from('customer_notes')
-              .select('*')
-              .eq('customer_id', customerUuid)
-              .is('deleted_at', null)
-              .order('created_at', { ascending: false });
-
-            if (!error && data) {
-              const fetchedNotes = (data || []).map(note => ({
-                id: note.id,
-                content: note.content,
-                userEmail: note.user_email || 'Unknown',
-                tags: note.tags || [],
-                createdAt: note.created_at ? { toDate: () => new Date(note.created_at) } : null,
-                updatedAt: note.updated_at ? { toDate: () => new Date(note.updated_at) } : null
-              }));
-              setNotes(fetchedNotes);
-              if (fetchedNotes.length > 0) {
-                setLatestNote(fetchedNotes[0]);
-              }
-            }
-          } catch (err) {
-            console.error('Error refreshing notes:', err);
-          }
-        };
-        fetchNotes();
-      }
+      await fetchNotesPage(currentPage);
     }
   };
 
@@ -424,7 +388,16 @@ export const NotesTab = ({ customerId }) => {
                 </InputGroup>
 
                 <ListGroup variant="flush">
-                  {currentNotes.map((note) => (
+                  {notesLoading ? (
+                    <ListGroup.Item className="text-center py-4 text-muted">
+                      Loading notes...
+                    </ListGroup.Item>
+                  ) : currentNotes.length === 0 ? (
+                    <ListGroup.Item className="text-center py-4 text-muted">
+                      No notes found.
+                    </ListGroup.Item>
+                  ) : (
+                  currentNotes.map((note) => (
                     <ListGroup.Item key={note.id} className="border-bottom py-3">
                       <Row>
                         {/* Left side: Note content, tags, and email */}
@@ -464,7 +437,7 @@ export const NotesTab = ({ customerId }) => {
                         <Col xs={3} className="text-end">
                           <div className="mb-2">
                             <small className="text-muted d-block">
-                              {note.createdAt?.toDate().toLocaleString() || 'Date not available'}
+                              {formatSingaporeDateWithTime(note.createdAt?.toDate?.() ?? note.createdAt) || 'Date not available'}
                             </small>
                           </div>
                           
@@ -510,15 +483,15 @@ export const NotesTab = ({ customerId }) => {
                         </Col>
                       </Row>
                     </ListGroup.Item>
-                  ))}
+                  )))}
                 </ListGroup>
 
                 {/* Pagination */}
                 <TablePagination
                   currentPage={currentPage}
                   totalPages={totalPages}
-                  totalItems={filteredNotes.length}
-                  onPageChange={(newPage) => setCurrentPage(newPage)}
+                  totalItems={totalNoteCount}
+                  onPageChange={(newPage) => paginate(newPage)}
                 />
 
                 <Button 
@@ -541,7 +514,7 @@ export const NotesTab = ({ customerId }) => {
                   <>
                     <Card.Text>{latestNote.content}</Card.Text>
                     <Card.Subtitle className="text-muted mt-2">
-                      {latestNote.createdAt?.toDate().toLocaleString() || 'Date not available'}
+                      {formatSingaporeDateWithTime(latestNote.createdAt?.toDate?.() ?? latestNote.createdAt) || 'Date not available'}
                       ({formatDistanceToNow(latestNote.createdAt?.toDate() || new Date(), { addSuffix: true })})
                     </Card.Subtitle>
                     <div className="mt-2">
@@ -604,6 +577,7 @@ export const NotesTab = ({ customerId }) => {
           notes={notes} 
           onClose={() => handleViewChange(false)}
           customerId={customerId}
+          customerUuid={customerUuid}
         />
       )}
 

@@ -1,3 +1,4 @@
+import { withSession } from '../../../lib/api/withSession';
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 import {
   fetchJobsForStatusReport,
@@ -8,7 +9,7 @@ import { getListCache, logResponseSize, setListCache } from '../../../lib/supaba
 
 const CACHE_TTL_MS = 60000;
 
-export default async function handler(req, res) {
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -72,4 +73,4 @@ export default async function handler(req, res) {
       error: error.message || 'Unable to load job status report.',
     });
   }
-}
+});

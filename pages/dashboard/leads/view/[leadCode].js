@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Container,
   Row,
@@ -17,9 +17,7 @@ import { ServiceLocationTab } from 'sub-components/customer/ServiceLocationTab';
 import { HistoryTab } from 'sub-components/customer/HistoryTab';
 import Link from 'next/link';
 import { MasterlistEntityEditModal } from '../../../../sub-components/dashboard/MasterlistEntityEditModal';
-import { fetchWithTimeout } from '../../../../lib/utils/fetchWithTimeout';
-
-const BUNDLE_TIMEOUT_MS = 45_000;
+import { useLeadDetailQuery } from '../../../../hooks/queries/useLeadDetailQuery';
 
 const HEADER_BG = 'linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)';
 
@@ -51,84 +49,40 @@ function useResolvedLeadCode(router) {
 
 const ViewSapLeadMasterlist = () => {
   const [activeTab, setActiveTab] = useState('accountInfo');
-  const [detailData, setDetailData] = useState(null);
-  const [addressDetails, setAddressDetails] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
   const [editModalOpen, setEditModalOpen] = useState(false);
   const router = useRouter();
   const resolvedLeadCode = useResolvedLeadCode(router);
-  const loadGenerationRef = useRef(0);
 
-  const loadLeadDetail = useCallback(async () => {
-    const code = resolvedLeadCode;
-    if (!code) return;
+  const {
+    data: detailBundle,
+    isLoading: detailLoading,
+    isFetching: detailFetching,
+    error: detailQueryError,
+    refetch: refetchLeadDetail,
+  } = useLeadDetailQuery(resolvedLeadCode, {
+    enabled: router.isReady && Boolean(resolvedLeadCode),
+  });
 
-    const generation = ++loadGenerationRef.current;
-    const isStale = () => generation !== loadGenerationRef.current;
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const bundleRes = await fetchWithTimeout(
-        `/api/leads/masterlist-bundle/${encodeURIComponent(code)}`,
-        { credentials: 'same-origin' },
-        BUNDLE_TIMEOUT_MS,
-      );
-
-      if (isStale()) return;
-
-      if (!bundleRes.ok) {
-        throw new Error(`Failed to load lead bundle (${bundleRes.status})`);
-      }
-
-      const bundleJson = await bundleRes.json();
-      if (!bundleJson?.success) {
-        throw new Error(bundleJson?.error || 'Failed to load lead bundle');
-      }
-
-      if (!bundleJson.partner) {
-        setDetailData(null);
-        setAddressDetails(null);
-        setError(
-          'This code is not in the Supabase SAP lead masterlist. Import with pnpm migrate:aifm-sap-leads or open the live SAP list.',
-        );
-        setLoading(false);
-        return;
-      }
-
-      setDetailData(bundleJson.partner);
-      setAddressDetails(bundleJson.addressDetails || { data: {}, dataByCustomerLocationId: {} });
-      setError(null);
-      setLoading(false);
-    } catch (e) {
-      if (isStale()) return;
-      console.error('Lead detail load error:', e);
-      const message =
-        e?.name === 'AbortError'
-          ? 'Request timed out loading lead data. Please try again.'
-          : e.message || 'Failed to load lead.';
-      setError(message);
-      setDetailData(null);
-      setLoading(false);
-    }
-  }, [resolvedLeadCode]);
-
-  useEffect(() => {
-    if (!router.isReady) return;
-
+  const detailData = detailBundle?.partner ?? null;
+  const addressDetails = detailBundle?.addressDetails ?? null;
+  const loading =
+    !router.isReady ||
+    (Boolean(resolvedLeadCode) && (detailLoading || detailFetching));
+  const error = useMemo(() => {
+    if (!router.isReady) return null;
     if (!resolvedLeadCode) {
-      setLoading(false);
-      setDetailData(null);
-      setError(
-        'Could not read the lead code from this URL. Use the leads list or try opening the lead again.'
-      );
-      return;
+      return 'Could not read the lead code from this URL. Use the leads list or try opening the lead again.';
     }
-
-    loadLeadDetail();
-  }, [router.isReady, resolvedLeadCode, loadLeadDetail]);
+    if (detailQueryError) {
+      return detailQueryError?.name === 'AbortError'
+        ? 'Request timed out loading lead data. Please try again.'
+        : detailQueryError.message || 'Failed to load lead.';
+    }
+    if (detailBundle && !detailBundle.partner) {
+      return 'This code is not in the Supabase SAP lead masterlist. Import with pnpm migrate:aifm-sap-leads or open the live SAP list.';
+    }
+    return null;
+  }, [router.isReady, resolvedLeadCode, detailQueryError, detailBundle]);
 
   const handleTabChange = (key) => {
     if (key) setActiveTab(key);
@@ -357,7 +311,7 @@ const ViewSapLeadMasterlist = () => {
         mode="lead"
         code={resolvedLeadCode}
         customerData={detailData}
-        onSaved={loadLeadDetail}
+        onSaved={() => refetchLeadDetail()}
       />
 
       <Row>
@@ -375,7 +329,8 @@ const ViewSapLeadMasterlist = () => {
                     masterlistContactEdit={
                       resolvedLeadCode ? { kind: 'lead', code: resolvedLeadCode } : null
                     }
-                    onMasterlistContactSaved={loadLeadDetail}
+                    onMasterlistContactSaved={() => refetchLeadDetail()}
+                    onLocationDeleted={refetchLeadDetail}
                   />
                 </Tab>
                 <Tab eventKey="notes" title="Notes">

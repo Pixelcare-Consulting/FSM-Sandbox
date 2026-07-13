@@ -9,6 +9,7 @@ import { canManageUpdateLogsFolder } from '../../../lib/utils/companyMemoDevAcce
 import { Container, Row, Col, Button, Form } from 'react-bootstrap';
 import { useQueryClient } from 'react-query';
 import Swal from 'sweetalert2';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 import Cookies from 'js-cookie';
 import toast from 'react-hot-toast';
 import { GeeksSEO } from 'widgets';
@@ -26,17 +27,18 @@ const CompanyMemoNew = () => {
   const [allowed, setAllowed] = useState(null);
   const [values, setValues] = useState(defaultCompanyMemoValues);
   const [saving, setSaving] = useState(false);
-  const viewerEmail = Cookies.get('email') || '';
+  const { user } = useCurrentUser();
+  const viewerEmail = user?.email || Cookies.get('email') || '';
   const canManageUpdateLogs = canManageUpdateLogsFolder(viewerEmail);
 
   useEffect(() => {
-    if (Cookies.get('isAdmin') !== 'true') {
+    if (user?.role !== 'ADMIN') {
       router.replace('/dashboard');
       setAllowed(false);
       return;
     }
     setAllowed(true);
-  }, [router]);
+  }, [router, user?.role]);
 
   useEffect(() => {
     if (!router.isReady) return;
@@ -57,7 +59,7 @@ const CompanyMemoNew = () => {
 
   const onSubmit = async (e) => {
     e.preventDefault();
-    const uid = Cookies.get('uid');
+    const uid = user?.id || user?.uid;
     if (!uid) {
       toast.error('Not signed in');
       return;

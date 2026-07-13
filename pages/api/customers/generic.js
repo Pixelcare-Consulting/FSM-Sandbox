@@ -7,6 +7,15 @@
 import { customerService } from '../../../lib/supabase/database';
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 import {
+  getListCache,
+  setListCache,
+  invalidateListCache,
+} from '../../../lib/supabase/listQueryHelpers';
+import {
+  PORTAL_LIST_CACHE_PREFIX,
+  PORTAL_LIST_CACHE_TTL_MS,
+} from '../../../lib/leads/portalListCache';
+import {
   writeAuditLogFromRequest,
   AUDIT_ACTIONS,
   AUDIT_CATEGORIES,
@@ -41,8 +50,16 @@ export default async function handler(req, res) {
 
   if (req.method === 'GET') {
     try {
+      const cacheKey = `${PORTAL_LIST_CACHE_PREFIX}generic`;
+      const cached = getListCache(cacheKey, PORTAL_LIST_CACHE_TTL_MS);
+      if (cached) {
+        return res.status(200).json(cached);
+      }
+
       const customers = await customerService.getGenericCustomers(supabase);
-      return res.status(200).json({ success: true, customers });
+      const payload = { success: true, customers };
+      setListCache(cacheKey, payload, PORTAL_LIST_CACHE_TTL_MS);
+      return res.status(200).json(payload);
     } catch (err) {
       console.error('Portal customers list error:', err);
       return res.status(500).json({ success: false, error: err.message || 'Failed to list customers' });
@@ -74,6 +91,7 @@ export default async function handler(req, res) {
 
     try {
       const customer = await customerService.create(customerData, supabase);
+      invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
       await writeAuditLogFromRequest(req, {
         action: AUDIT_ACTIONS.CUSTOMER_CREATE,
         category: AUDIT_CATEGORIES.CUSTOMER,

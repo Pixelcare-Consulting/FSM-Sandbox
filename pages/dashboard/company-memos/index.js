@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import {
@@ -18,9 +18,14 @@ import { Eye, Pencil, Trash } from 'lucide-react';
 import { useQuery, useQueryClient } from 'react-query';
 import Swal from 'sweetalert2';
 import toast from 'react-hot-toast';
+import { useEnterToSearch } from '@/hooks/useEnterToSearch';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 import Cookies from 'js-cookie';
 import { GeeksSEO } from 'widgets';
 import { DashboardHeader } from 'sub-components';
+import DashboardListStickySearch, {
+  STICKY_SEARCH_GRADIENT_BLUE,
+} from 'sub-components/dashboard/DashboardListStickySearch';
 import DefaultDashboardLayout from 'layouts/dashboard/DashboardIndexTop';
 import TablePagination from '../../../components/common/TablePagination';
 import {
@@ -28,6 +33,12 @@ import {
   canMutateCompanyMemoWithFolder,
   memoFoldersForEmail,
 } from '../../../lib/utils/companyMemoDevAccess';
+import {
+  COMPANY_MEMOS_LIST_STALE_MS,
+  COMPANY_MEMOS_QUERY_OPTIONS,
+  companyMemosListQueryKey,
+  fetchCompanyMemosListSummary,
+} from '../../../lib/companyMemos/companyMemosQueryKeys';
 import { memoBodyToPlainText } from '../../../lib/utils/memoHtml';
 
 function truncate(str, n) {
@@ -70,15 +81,22 @@ const MEMO_TD = {
 const CompanyMemosList = () => {
   const router = useRouter();
   const queryClient = useQueryClient();
-  const viewerUid = Cookies.get('uid');
-  const viewerEmail = Cookies.get('email') || '';
+  const { user } = useCurrentUser();
+  const viewerUid = user?.id || user?.uid;
+  const viewerEmail = user?.email || Cookies.get('email') || '';
   const canManageUpdateLogs = canManageUpdateLogsFolder(viewerEmail);
   const folderFilterOptions = useMemo(
     () => memoFoldersForEmail(viewerEmail),
     [viewerEmail]
   );
   const [allowed, setAllowed] = useState(null);
-  const [globalSearch, setGlobalSearch] = useState('');
+  const {
+    draft: globalSearchDraft,
+    setDraft: setGlobalSearchDraft,
+    applied: globalSearchApplied,
+    clear: clearGlobalSearch,
+    onKeyDown: onGlobalSearchKeyDown,
+  } = useEnterToSearch();
   /** 'all' | 'high' | 'medium' | 'low' */
   const [priorityFilter, setPriorityFilter] = useState('all');
   /** 'all' or a folder name */
@@ -87,13 +105,13 @@ const CompanyMemosList = () => {
   const [itemsPerPage] = useState(25);
 
   useEffect(() => {
-    if (Cookies.get('isAdmin') !== 'true') {
+    if (user?.role !== 'ADMIN') {
       router.replace('/dashboard');
       setAllowed(false);
       return;
     }
     setAllowed(true);
-  }, [router]);
+  }, [router, user?.role]);
 
   useEffect(() => {
     if (!router.isReady) return;
@@ -105,46 +123,54 @@ const CompanyMemosList = () => {
     }
   }, [router.isReady, router.query.folder, folderFilterOptions]);
 
-  const fetchMemos = useCallback(async () => {
-    const params = new URLSearchParams({
-      page: String(currentPage),
-      limit: String(itemsPerPage),
-    });
-    if (globalSearch.trim()) params.set('search', globalSearch.trim());
-    if (folderFilter !== 'all') params.set('folder', folderFilter);
-    if (priorityFilter !== 'all') params.set('priority', priorityFilter);
+  const listParams = {
+    page: currentPage,
+    limit: itemsPerPage,
+    search: globalSearchApplied,
+    folder: folderFilter,
+    priority: priorityFilter,
+  };
 
-    const response = await fetch(`/api/company-memos/list-summary?${params.toString()}`, {
-      credentials: 'same-origin',
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.error || body.message || `Failed to load memos (${response.status})`);
-    }
-    return response.json();
-  }, [currentPage, itemsPerPage, globalSearch, folderFilter, priorityFilter]);
+  const listQueryKey = companyMemosListQueryKey(listParams);
 
-  const { data, isLoading } = useQuery(
-    ['company-memos', 'admin', 'list', currentPage, itemsPerPage, globalSearch, folderFilter, priorityFilter],
-    fetchMemos,
-    { enabled: allowed === true, staleTime: 30 * 1000, keepPreviousData: true }
+  const fetchMemos = useCallback(
+    () =>
+      fetchCompanyMemosListSummary({
+        page: currentPage,
+        limit: itemsPerPage,
+        search: globalSearchApplied,
+        folder: folderFilter,
+        priority: priorityFilter,
+      }),
+    [currentPage, itemsPerPage, globalSearchApplied, folderFilter, priorityFilter]
   );
+
+  const { data, isLoading } = useQuery(listQueryKey, fetchMemos, {
+    enabled: allowed === true,
+    staleTime: COMPANY_MEMOS_LIST_STALE_MS,
+    keepPreviousData: true,
+    ...COMPANY_MEMOS_QUERY_OPTIONS,
+  });
 
   const rows = data?.memos || [];
   const totalCount = data?.totalCount ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / itemsPerPage));
 
   const hasActiveFilters =
-    globalSearch.trim().length > 0 ||
+    globalSearchApplied.length > 0 ||
     priorityFilter !== 'all' ||
     folderFilter !== 'all';
 
   const clearAllFilters = () => {
-    setGlobalSearch('');
+    clearGlobalSearch();
     setPriorityFilter('all');
     setFolderFilter('all');
     setCurrentPage(1);
   };
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [globalSearchApplied, folderFilter, priorityFilter]);
 
   const onDelete = async (row) => {
     if (!canMutateCompanyMemoWithFolder(row, viewerUid, viewerEmail)) {
@@ -209,11 +235,7 @@ const CompanyMemosList = () => {
       />
       <Row>
         <Col xs={12}>
-          <Card
-            className="border-0 shadow-sm mb-3"
-            style={{ background: 'linear-gradient(90deg, #4171F5 0%, #3DAAF5 100%)' }}
-          >
-            <Card.Body className="p-3">
+          <DashboardListStickySearch style={STICKY_SEARCH_GRADIENT_BLUE}>
               <Row className="align-items-center">
                 <Col md={12}>
                   <div className="d-flex align-items-center gap-3 flex-wrap">
@@ -226,17 +248,15 @@ const CompanyMemosList = () => {
                         className="text-white"
                         style={{ opacity: 0.9, fontSize: '0.75rem' }}
                       >
-                        ⚡ Live • All Fields
+                        Press Enter to search
                       </small>
                     </div>
                     <div className="flex-grow-1" style={{ minWidth: 200 }}>
                       <Form.Control
                         type="text"
-                        value={globalSearch}
-                        onChange={(e) => {
-                          setGlobalSearch(e.target.value);
-                          setCurrentPage(1);
-                        }}
+                        value={globalSearchDraft}
+                        onChange={(e) => setGlobalSearchDraft(e.target.value)}
+                        onKeyDown={onGlobalSearchKeyDown}
                         placeholder="🔍 Search anything… Subject, Content, Priority, Expires, From, Header, Sign-in, etc."
                         style={{
                           fontSize: '0.95rem',
@@ -354,6 +374,12 @@ const CompanyMemosList = () => {
                             <strong className="text-capitalize">{priorityFilter}</strong>
                           </>
                         ) : null}
+                        {globalSearchApplied ? (
+                          <>
+                            {' '}
+                            · Search: <strong>{globalSearchApplied}</strong>
+                          </>
+                        ) : null}
                       </small>
                     </div>
                   ) : (
@@ -362,7 +388,7 @@ const CompanyMemosList = () => {
                       style={{ opacity: 0.85 }}
                     >
                       <small style={{ fontSize: '0.8rem' }}>
-                        💡 <strong>Tip:</strong> Search across ALL fields instantly — Subject,
+                        💡 <strong>Tip:</strong> Press Enter to search across Subject,
                         Content, Priority, expiry dates, author, header ticker, sign-in banner, and
                         more!
                       </small>
@@ -370,8 +396,7 @@ const CompanyMemosList = () => {
                   )}
                 </Col>
               </Row>
-            </Card.Body>
-          </Card>
+          </DashboardListStickySearch>
 
           <Card className="border-0 shadow-sm company-memos-list-table">
             <Card.Body className="p-4">

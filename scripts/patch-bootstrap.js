@@ -1,20 +1,15 @@
 const fs = require('fs');
 const path = require('path');
+const glob = require('glob');
 
-// Resolve bootstrap/scss without glob (glob is a devDependency and may be skipped on Vercel when NODE_ENV=production).
+// Find bootstrap scss directory (handles pnpm structure)
 const findBootstrapScss = () => {
-  const candidates = [
+  const possiblePaths = [
     path.join(__dirname, '../node_modules/bootstrap/scss'),
+    ...glob.sync(path.join(__dirname, '../node_modules/.pnpm/bootstrap@*/node_modules/bootstrap/scss')),
   ];
-
-  try {
-    const bootstrapPkg = require.resolve('bootstrap/package.json');
-    candidates.push(path.join(path.dirname(bootstrapPkg), 'scss'));
-  } catch {
-    // bootstrap not installed yet
-  }
-
-  for (const testPath of candidates) {
+  
+  for (const testPath of possiblePaths) {
     if (fs.existsSync(testPath)) {
       return testPath;
     }

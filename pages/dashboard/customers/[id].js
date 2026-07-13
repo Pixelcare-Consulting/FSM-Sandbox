@@ -22,12 +22,11 @@ import QuotationsTab from 'sub-components/customer/QuotationsTab';
 import Link from 'next/link';
 import Cookies from 'js-cookie';
 import { MasterlistEntityEditModal } from '../../../sub-components/dashboard/MasterlistEntityEditModal';
-import { enrichPartnerWithSapContacts } from '../../../lib/customers/contactResolution';
-import { fetchWithTimeout } from '../../../lib/utils/fetchWithTimeout';
-
-const BUNDLE_TIMEOUT_MS = 45_000;
-const EQUIPMENT_TIMEOUT_MS = 30_000;
-const SAP_CUSTOMER_TIMEOUT_MS = 35_000;
+import {
+  enrichPartnerWithSapContacts,
+  partnerHasMeaningfulContacts,
+} from '../../../lib/customers/contactResolution';
+import { useCustomerDetailQuery } from '../../../hooks/queries/useCustomerDetailQuery';
 
 function useResolvedCustomerCardCode(router) {
   return useMemo(() => {
@@ -45,16 +44,44 @@ function useResolvedCustomerCardCode(router) {
 
 const ViewCustomer = () => {
   const [activeTab, setActiveTab] = useState('accountInfo');
-  const [customerData, setCustomerData] = useState(null);
-  const [addressDetails, setAddressDetails] = useState(null);
-  const [equipments, setEquipments] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [masterlistEditable, setMasterlistEditable] = useState(false);
+  const [enrichedPartner, setEnrichedPartner] = useState(null);
+  const [equipments, setEquipments] = useState(null);
+  const [visitedTabs, setVisitedTabs] = useState(() => new Set(['accountInfo']));
   const [editModalOpen, setEditModalOpen] = useState(false);
   const router = useRouter();
   const resolvedCustomerId = useResolvedCustomerCardCode(router);
-  const loadGenerationRef = useRef(0);
+  const sapContactsEnrichAttemptedRef = useRef(false);
+  const previousCustomerIdRef = useRef('');
+
+  const {
+    data: detailData,
+    isLoading: detailLoading,
+    isFetching: detailFetching,
+    error: detailQueryError,
+    refetchFresh,
+  } = useCustomerDetailQuery(resolvedCustomerId, {
+    enabled: router.isReady && Boolean(resolvedCustomerId),
+  });
+
+  const customerData = enrichedPartner ?? detailData?.partner ?? null;
+  const addressDetails = detailData?.addressDetails ?? null;
+  const customerUuid = detailData?.customerUuid ?? null;
+  const masterlistEditable = detailData?.fromMasterlist ?? false;
+  const loading =
+    !router.isReady ||
+    (Boolean(resolvedCustomerId) && (detailLoading || detailFetching));
+  const error = useMemo(() => {
+    if (!router.isReady) return null;
+    if (!resolvedCustomerId) {
+      return 'Could not read the customer code from this URL. Open the customer again from the list.';
+    }
+    if (detailQueryError) {
+      return detailQueryError?.name === 'AbortError'
+        ? 'Request timed out loading customer data. Please try again.'
+        : detailQueryError.message || 'Failed to load data.';
+    }
+    return null;
+  }, [router.isReady, resolvedCustomerId, detailQueryError]);
 
   const isPortalCustomerNotSyncedError = (customerId, errorMessage) => {
     if (!customerId || typeof customerId !== 'string' || !errorMessage) return false;
@@ -70,118 +97,28 @@ const ViewCustomer = () => {
     );
   };
   
-  const loadCustomerDetail = useCallback(async () => {
-    const cardCode = resolvedCustomerId;
-    if (!cardCode) return;
-
-    const generation = ++loadGenerationRef.current;
-    const isStale = () => generation !== loadGenerationRef.current;
-
-    setLoading(true);
-    setMasterlistEditable(false);
-    setError(null);
-
-    try {
-      const [bundleOutcome, equipmentOutcome] = await Promise.all([
-        (async () => {
-          try {
-            const bundleRes = await fetchWithTimeout(
-              `/api/customers/masterlist-bundle/${encodeURIComponent(cardCode)}`,
-              { credentials: 'same-origin' },
-              BUNDLE_TIMEOUT_MS,
-            );
-            if (!bundleRes.ok) return { partner: null, fromMasterlist: false, addressDetails: null };
-            const bundleJson = await bundleRes.json();
-            if (bundleJson?.success && bundleJson.partner) {
-              return {
-                partner: bundleJson.partner,
-                fromMasterlist: true,
-                addressDetails: bundleJson.addressDetails || { data: {}, dataByCustomerLocationId: {} },
-              };
-            }
-            return { partner: null, fromMasterlist: false, addressDetails: null };
-          } catch (bundleErr) {
-            console.warn('masterlist-bundle fetch failed:', bundleErr);
-            return { partner: null, fromMasterlist: false, addressDetails: null };
-          }
-        })(),
-        (async () => {
-          try {
-            const equipmentResponse = await fetchWithTimeout(
-              '/api/getEquipments',
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cardCode }),
-              },
-              EQUIPMENT_TIMEOUT_MS,
-            );
-            return equipmentResponse.ok ? await equipmentResponse.json() : [];
-          } catch (equipmentErr) {
-            console.warn('getEquipments fetch failed:', equipmentErr);
-            return [];
-          }
-        })(),
-      ]);
-
-      if (isStale()) return;
-
-      let customerInfo = bundleOutcome.partner;
-      const fromMasterlist = bundleOutcome.fromMasterlist;
-      let bundledAddressDetails = bundleOutcome.addressDetails;
-
-      if (!customerInfo) {
-        const customerResponse = await fetchWithTimeout(
-          `/api/getCustomerCode?cardCode=${encodeURIComponent(cardCode)}`,
-          {},
-          SAP_CUSTOMER_TIMEOUT_MS,
-        );
-        if (!customerResponse.ok) {
-          throw new Error(`Failed to fetch customer details: ${await customerResponse.text()}`);
-        }
-        customerInfo = await customerResponse.json();
-        bundledAddressDetails = null;
-      }
-
-      if (isStale()) return;
-
-      setMasterlistEditable(fromMasterlist);
-      setCustomerData(customerInfo);
-      setAddressDetails(bundledAddressDetails);
-      setEquipments(Array.isArray(equipmentOutcome) ? equipmentOutcome : []);
-      setError(null);
-      setLoading(false);
-
-      if (fromMasterlist && customerInfo) {
-        enrichPartnerWithSapContacts(customerInfo, cardCode).then((enriched) => {
-          if (isStale() || enriched === customerInfo) return;
-          setCustomerData(enriched);
-        });
-      }
-    } catch (err) {
-      if (isStale()) return;
-      console.error('Error fetching data:', err);
-      const message =
-        err?.name === 'AbortError'
-          ? 'Request timed out loading customer data. Please try again.'
-          : err.message || 'Failed to load data.';
-      setError(message);
-      setLoading(false);
-    }
-  }, [resolvedCustomerId]);
+  useEffect(() => {
+    if (!router.isReady || !resolvedCustomerId) return;
+    if (previousCustomerIdRef.current === resolvedCustomerId) return;
+    previousCustomerIdRef.current = resolvedCustomerId;
+    sapContactsEnrichAttemptedRef.current = false;
+    setEnrichedPartner(null);
+    setEquipments(null);
+    setVisitedTabs(new Set(['accountInfo']));
+    setActiveTab('accountInfo');
+  }, [router.isReady, resolvedCustomerId]);
 
   useEffect(() => {
-    if (!router.isReady) return;
-    if (!resolvedCustomerId) {
-      setLoading(false);
-      setCustomerData(null);
-      setEquipments([]);
-      setMasterlistEditable(false);
-      setError('Could not read the customer code from this URL. Open the customer again from the list.');
-      return;
-    }
-    loadCustomerDetail();
-  }, [router.isReady, resolvedCustomerId, loadCustomerDetail]);
+    if (!router.isReady || !resolvedCustomerId) return;
+    sapContactsEnrichAttemptedRef.current = false;
+    setEnrichedPartner(null);
+  }, [router.isReady, resolvedCustomerId, detailData]);
+
+  const refreshCustomerDetail = useCallback(async () => {
+    setEnrichedPartner(null);
+    sapContactsEnrichAttemptedRef.current = false;
+    await refetchFresh();
+  }, [refetchFresh]);
 
   useEffect(() => {
     if (!router.isReady) return;
@@ -200,8 +137,37 @@ const ViewCustomer = () => {
     return () => window.clearTimeout(redirectTimer);
   }, [router, resolvedCustomerId, error]);
 
+  const maybeEnrichSapContacts = useCallback(() => {
+    if (!masterlistEditable || !customerData || !resolvedCustomerId) return;
+    if (sapContactsEnrichAttemptedRef.current) return;
+    if (partnerHasMeaningfulContacts(customerData)) return;
+
+    sapContactsEnrichAttemptedRef.current = true;
+    const cardCode = resolvedCustomerId;
+    const snapshot = customerData;
+
+    enrichPartnerWithSapContacts(snapshot, cardCode).then((enriched) => {
+      if (enriched === snapshot) return;
+      setEnrichedPartner(enriched);
+    });
+  }, [masterlistEditable, customerData, resolvedCustomerId]);
+
+  const handleEquipmentsLoaded = useCallback((data) => {
+    setEquipments(Array.isArray(data) ? data : []);
+  }, []);
+
   const handleTabChange = (key) => {
-    if (key) setActiveTab(key);
+    if (!key) return;
+    setActiveTab(key);
+    setVisitedTabs((prev) => {
+      if (prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+    if (key === 'serviceLocation') {
+      maybeEnrichSapContacts();
+    }
   };
 
   if (loading) {
@@ -220,86 +186,38 @@ const ViewCustomer = () => {
                 marginBottom: "20px",
               }}
             >
-              <div className="d-flex justify-content-between align-items-start">
-                <div className="d-flex flex-column">
-                  <div className="mb-3">
-                    <h1
-                      className="mb-2"
-                      style={{
-                        fontSize: "28px",
-                        fontWeight: "600",
-                        color: "#FFFFFF",
-                        letterSpacing: "-0.02em",
-                      }}
-                    >
-                      Loading...
-                    </h1>
-                    <p
-                      className="mb-2"
-                      style={{
-                        fontSize: "16px",
-                        color: "rgba(255, 255, 255, 0.7)",
-                        fontWeight: "400",
-                        lineHeight: "1.5",
-                      }}
-                    >
-                      View and manage customer details, equipment, and history
-                    </p>
-                  </div>
-
-                  <nav
-                    style={{
-                      fontSize: "14px",
-                      fontWeight: "500",
-                    }}
-                  >
-                    <div className="d-flex align-items-center">
-                      <i
-                        className="fe fe-home"
-                        style={{ color: "rgba(255, 255, 255, 0.7)" }}
-                      ></i>
-                      <Link
-                        href="/"
-                        className="text-decoration-none ms-2"
-                        style={{ color: "rgba(255, 255, 255, 0.7)" }}
-                      >
-                        Dashboard
-                      </Link>
-                      <span
-                        className="mx-2"
-                        style={{ color: "rgba(255, 255, 255, 0.7)" }}
-                      >
-                        /
-                      </span>
-                      <Link
-                        href="/customers"
-                        className="text-decoration-none"
-                        style={{ color: "rgba(255, 255, 255, 0.7)" }}
-                      >
-                        Loading...
-                      </Link>
-                      <span
-                        className="mx-2"
-                        style={{ color: "rgba(255, 255, 255, 0.7)" }}
-                      >
-                        /
-                      </span>
-                      <span style={{ color: "#FFFFFF" }}>Loading...</span>
-                    </div>
-                  </nav>
-                </div>
+              <div className="placeholder-glow">
+                <span className="placeholder col-4 bg-light rounded mb-2 d-block" style={{ height: '2rem' }} />
+                <span className="placeholder col-6 bg-light opacity-75 rounded mb-3 d-block" style={{ height: '1rem' }} />
+                <span className="placeholder col-3 bg-light opacity-50 rounded d-block" style={{ height: '0.875rem' }} />
               </div>
             </div>
           </Col>
         </Row>
         <Row>
           <Col>
-            <Card className="text-center shadow-sm">
+            <Card className="shadow-sm">
               <Card.Body>
-                <Spinner animation="border" role="status" variant="primary" style={{ width: '3rem', height: '3rem' }}>
-                  <span className="visually-hidden">Loading...</span>
-                </Spinner>
-                <p className="mt-3">Loading customer data...</p>
+                <div className="placeholder-glow mb-3 d-flex gap-2">
+                  {['Account', 'Address', 'Notes', 'Equipment', 'History'].map((label) => (
+                    <span
+                      key={label}
+                      className="placeholder bg-secondary opacity-25 rounded"
+                      style={{ width: '5.5rem', height: '2rem' }}
+                    />
+                  ))}
+                </div>
+                <div className="placeholder-glow">
+                  <span className="placeholder col-12 bg-light rounded mb-2 d-block" style={{ height: '1rem' }} />
+                  <span className="placeholder col-10 bg-light rounded mb-2 d-block" style={{ height: '1rem' }} />
+                  <span className="placeholder col-8 bg-light rounded d-block" style={{ height: '1rem' }} />
+                </div>
+                <div className="text-center mt-4">
+                  <Spinner animation="border" role="status" variant="primary" size="sm">
+                    <span className="visually-hidden">Loading...</span>
+                  </Spinner>
+                  <p className="mt-2 mb-0 text-muted small">Loading customer data...</p>
+                </div>
               </Card.Body>
             </Card>
           </Col>
@@ -547,7 +465,7 @@ const ViewCustomer = () => {
         mode="customer"
         code={resolvedCustomerId}
         customerData={customerData}
-        onSaved={loadCustomerDetail}
+        onSaved={refreshCustomerDetail}
       />
 
       <Row>
@@ -562,7 +480,7 @@ const ViewCustomer = () => {
                 <Tab eventKey="accountInfo" title="Account Info">
                   <AccountInfoTab customerData={customerData} />
                 </Tab>
-                <Tab eventKey="serviceLocation" title="Address">
+                <Tab eventKey="serviceLocation" title="Address" mountOnEnter>
                   <ServiceLocationTab
                     customerData={customerData}
                     addressDetails={addressDetails}
@@ -571,24 +489,32 @@ const ViewCustomer = () => {
                         ? { kind: 'customer', code: resolvedCustomerId }
                         : null
                     }
-                    onMasterlistContactSaved={loadCustomerDetail}
-                    onLocationDeleted={loadCustomerDetail}
+                    onMasterlistContactSaved={refreshCustomerDetail}
+                    onLocationDeleted={refreshCustomerDetail}
                   />
                 </Tab>
-                <Tab eventKey="notes" title="Notes">
-                  <NotesTab customerId={resolvedCustomerId} />
+                <Tab eventKey="notes" title="Notes" mountOnEnter>
+                  <NotesTab customerId={resolvedCustomerId} customerUuid={customerUuid} />
                 </Tab>
-                <Tab eventKey="equipments" title="Equipments">
-                    <EquipmentsTab customerData={customerData} equipments={equipments} />
+                <Tab eventKey="equipments" title="Equipments" mountOnEnter>
+                  <EquipmentsTab
+                    customerData={customerData}
+                    equipments={equipments}
+                    onEquipmentsLoaded={handleEquipmentsLoaded}
+                  />
                 </Tab>
-                <Tab eventKey="history" title="Job History">
-                  <HistoryTab customerData={customerData} customerID={resolvedCustomerId} />
-                </Tab>
-                <Tab eventKey="quotations" title="Quotations">
+                <Tab eventKey="history" title="Job History" mountOnEnter>
+                  <HistoryTab
+                    customerData={customerData}
+                    customerID={resolvedCustomerId}
+                    hasVisited={visitedTabs.has('history')}
+                  />
+                </Tab>
+                <Tab eventKey="quotations" title="Quotations" mountOnEnter>
                   <QuotationsTab customerId={resolvedCustomerId} />
                 </Tab>
                 
-                <Tab eventKey="documents" title="Documents">
+                <Tab eventKey="documents" title="Documents" mountOnEnter>
                   <DocumentsTab customerData={customerData} />
                 </Tab>
               </Tabs>

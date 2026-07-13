@@ -67,3 +67,65 @@
   margin: 0;
   padding: 0;
 }
+
+/* Memo read surfaces — What's New, sign-in modal, header ticker detail */
+.memoReadContent img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.375rem;
+  display: block;
+  margin: 0.5rem 0;
+}
+
+.memoReadContent ul,
+.memoReadContent ol {
+  margin: 0 0 0.55rem;
+  padding-left: 1.25rem;
+}
+
+.memoReadContent li {
+  margin: 0 0 0.25rem;
+}
+
+.memoReadContent blockquote {
+  border-left: 3px solid var(--bs-border-color, #dee2e6);
+  margin: 0.5rem 0;
+  padding-left: 0.75rem;
+  color: inherit;
+}
+
+.memoReadContent :global(.ql-indent-1) {
+  padding-left: 3em;
+}
+
+.memoReadContent :global(.ql-indent-2) {
+  padding-left: 6em;
+}
+
+.memoReadContent :global(.ql-indent-3) {
+  padding-left: 9em;
+}
+
+.memoReadContent :global(.ql-indent-4) {
+  padding-left: 12em;
+}
+
+.memoReadContent :global(.ql-indent-5) {
+  padding-left: 15em;
+}
+
+.memoReadContent :global(.ql-indent-6) {
+  padding-left: 18em;
+}
+
+.memoReadContent :global(.ql-indent-7) {
+  padding-left: 21em;
+}
+
+.memoReadContent :global(.ql-indent-8) {
+  padding-left: 24em;
+}
+
+.memoReadContent :global(.ql-indent-9) {
+  padding-left: 27em;
+}

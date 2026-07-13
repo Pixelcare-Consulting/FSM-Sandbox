@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { getLeadJobsByServiceDate } from '../lib/leads/getLeadJobsByServiceDate.js';
+import { normalizeServiceDateYmd } from '../lib/leads/normalizeServiceDateYmd.js';
 import { buildSingaporeDateTimeUtc } from '../lib/utils/singaporeDateTime.js';
 
 function makeQueryChain(resultPromise) {
@@ -29,6 +30,33 @@ function createMockSupabase(jobs) {
     from(table) {
       if (table === 'jobs') {
         return makeQueryChain(Promise.resolve({ data: jobs, error: null }));
+      }
+      return {
+        select() {
+          return this;
+        },
+        eq() {
+          return this;
+        },
+        is() {
+          return this;
+        },
+        maybeSingle() {
+          return Promise.resolve({ data: { id: 'loc-1' }, error: null });
+        },
+      };
+    },
+  };
+}
+
+function createMockSupabaseWithLocationFallback(locationJobs, customerJobs) {
+  let jobsQueryCount = 0;
+  return {
+    from(table) {
+      if (table === 'jobs') {
+        jobsQueryCount += 1;
+        const data = jobsQueryCount === 1 ? locationJobs : customerJobs;
+        return makeQueryChain(Promise.resolve({ data, error: null }));
       }
       return {
         select() {
@@ -110,5 +138,39 @@ const isoLeadResult = await getLeadJobsByServiceDate(isoLead, {
 });
 
 assert.deepEqual(isoLeadResult.first, { id: 'job-iso', job_number: '2026-000003' });
+
+// Slash-formatted lead dates (M/D/YYYY) should match jobs
+const slashLead = {
+  ...lead,
+  first_service_date: '7/2/2026',
+};
+
+assert.equal(normalizeServiceDateYmd('7/2/2026'), '2026-07-02');
+
+const slashLeadResult = await getLeadJobsByServiceDate(slashLead, {
+  supabase: createMockSupabase([
+    { id: 'job-slash', job_number: '2026-000004', scheduled_start: morningJobStart },
+  ]),
+  customerId: 'cust-1',
+  locationId: 'loc-1',
+});
+
+assert.deepEqual(slashLeadResult.first, { id: 'job-slash', job_number: '2026-000004' });
+
+// Location-filter mismatch: retry without location_id when location-scoped query finds no date matches
+const fallbackResult = await getLeadJobsByServiceDate(lead, {
+  supabase: createMockSupabaseWithLocationFallback(
+    [{ id: 'wrong-loc', job_number: '2026-000099', scheduled_start: '2026-08-01T01:00:00.000Z' }],
+    [{ id: 'job-fallback', job_number: '2026-000005', scheduled_start: morningJobStart }]
+  ),
+  customerId: 'cust-1',
+  locationId: 'loc-1',
+});
+
+assert.deepEqual(
+  fallbackResult.first,
+  { id: 'job-fallback', job_number: '2026-000005' },
+  'falls back to customer-wide job lookup when location filter misses service dates'
+);
 
 console.log('getLeadJobsByServiceDate tests passed');

@@ -4,6 +4,9 @@ import { renderToBuffer } from '@react-pdf/renderer';
 import React from 'react';
 import QRCode from 'qrcode';
 import JobSheetPDF from '../../../../components/JobSheetPDF';
+import { requireSession } from '../../../../lib/auth/requireSession';
+import { resolveJobMediaCreatedBy } from '../../../../lib/jobs/jobMedia';
+import { matchCustomerLocation } from '../../../../lib/jobs/resolveJobDisplayAddress';
 import {
   writeAuditLogFromRequest,
   AUDIT_ACTIONS,
@@ -55,6 +58,64 @@ async function fetchPdfBytesFromStorageUrl(imageUrl, adminClient) {
 const STORAGE_DOWNLOAD_CACHE_MS = 120000;
 const storageDownloadCache = new Map();
 
+const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+function detectImageMimeType(buffer, contentTypeHeader) {
+  if (contentTypeHeader) {
+    const contentType = contentTypeHeader.split(';')[0].trim().toLowerCase();
+    if (ALLOWED_IMAGE_MIME_TYPES.includes(contentType)) {
+      return contentType;
+    }
+  }
+
+  if (!buffer || buffer.length < 3) {
+    return 'image/png';
+  }
+
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return 'image/jpeg';
+  }
+
+  // PNG: 89 50 4E 47
+  if (
+    buffer.length >= 4 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return 'image/png';
+  }
+
+  // GIF: GIF87a / GIF89a
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+    return 'image/gif';
+  }
+
+  // WebP: RIFF....WEBP
+  if (
+    buffer.length >= 12 &&
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46 &&
+    buffer[8] === 0x57 &&
+    buffer[9] === 0x45 &&
+    buffer[10] === 0x42 &&
+    buffer[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+
+  return 'image/png';
+}
+
+function bufferToDataUrl(buffer, contentType) {
+  const base64 = Buffer.from(buffer).toString('base64');
+  return `data:${contentType};base64,${base64}`;
+}
+
 function sendPdfDownload(res, pdfBuffer, filename, { cached = false } = {}) {
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
@@ -64,54 +125,121 @@ function sendPdfDownload(res, pdfBuffer, filename, { cached = false } = {}) {
   return res.status(200).send(pdfBuffer);
 }
 
-// Helper function to convert image URL to base64
+// Helper function to convert image URL to base64 data URL
 async function imageUrlToBase64(imageUrl, adminClient) {
   if (!imageUrl) return null;
-  
+
   try {
-    // Check if it's a Supabase storage URL
     const storageMatch = imageUrl.match(/\/storage\/v1\/object\/public\/([^/]+)\/(.+)$/);
-    if (storageMatch && adminClient) {
-      const [, bucket, path] = storageMatch;
-      const cacheKey = `${bucket}:${path}`;
+    const cacheKey = storageMatch ? `${storageMatch[1]}:${storageMatch[2]}` : null;
+
+    if (cacheKey) {
       const cached = storageDownloadCache.get(cacheKey);
       if (cached && Date.now() < cached.expiresAt && cached.base64) {
         return cached.base64;
       }
+    }
 
-      const { data, error } = await adminClient.storage.from(bucket).download(path);
-      if (!error && data) {
-        const arrayBuffer = await data.arrayBuffer();
-        const base64 = Buffer.from(arrayBuffer).toString('base64');
-        const contentType = imageUrl.toLowerCase().includes('.jpg') || imageUrl.toLowerCase().includes('.jpeg') 
-          ? 'image/jpeg' 
-          : 'image/png';
-        const dataUrl = `data:${contentType};base64,${base64}`;
-        storageDownloadCache.set(cacheKey, {
-          base64: dataUrl,
-          expiresAt: Date.now() + STORAGE_DOWNLOAD_CACHE_MS,
-        });
-        return dataUrl;
+    let buffer = null;
+    let contentTypeHint = null;
+
+    if (storageMatch && adminClient) {
+      const cached = cacheKey ? storageDownloadCache.get(cacheKey) : null;
+      if (cached && Date.now() < cached.expiresAt && cached.buffer) {
+        buffer = cached.buffer;
+      } else {
+        buffer = await fetchPdfBytesFromStorageUrl(imageUrl, adminClient);
       }
     }
-    
-    // Fallback to HTTP fetch
-    const response = await fetch(imageUrl);
-    if (!response.ok) return null;
-    const arrayBuffer = await response.arrayBuffer();
-    const base64 = Buffer.from(arrayBuffer).toString('base64');
-    const contentType = response.headers.get('content-type') || 'image/png';
-    return `data:${contentType};base64,${base64}`;
+
+    if (!buffer) {
+      const response = await fetch(imageUrl);
+      if (!response.ok) return null;
+      const arrayBuffer = await response.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+      contentTypeHint = response.headers.get('content-type');
+    }
+
+    const contentType = detectImageMimeType(buffer, contentTypeHint);
+    const dataUrl = bufferToDataUrl(buffer, contentType);
+
+    if (cacheKey) {
+      const existing = storageDownloadCache.get(cacheKey) || {};
+      storageDownloadCache.set(cacheKey, {
+        ...existing,
+        buffer,
+        base64: dataUrl,
+        expiresAt: Date.now() + STORAGE_DOWNLOAD_CACHE_MS,
+      });
+    }
+
+    return dataUrl;
   } catch (error) {
     console.warn('Error converting image to base64:', error);
     return null;
   }
 }
 
+async function enrichJobImagesForPdf(jobImages, adminClient, jobId) {
+  if (!jobImages || jobImages.length === 0) {
+    return [];
+  }
+
+  const imageCandidates = jobImages.filter(
+    (img) => img.media_type !== 'pdf' && img.image_url
+  );
+
+  if (imageCandidates.length === 0) {
+    return jobImages;
+  }
+
+  const conversions = await Promise.all(
+    imageCandidates.map(async (img) => {
+      const dataUrl = await imageUrlToBase64(img.image_url, adminClient);
+      return { img, dataUrl };
+    })
+  );
+
+  const failedCount = conversions.filter((result) => !result.dataUrl).length;
+  if (failedCount > 0) {
+    console.warn(
+      `[PDF Generation] Job ${jobId}: ${failedCount}/${imageCandidates.length} service image(s) could not be converted to base64`
+    );
+  }
+
+  const convertedByKey = new Map();
+  conversions.forEach(({ img, dataUrl }) => {
+    if (dataUrl) {
+      convertedByKey.set(img.id || img.image_url, dataUrl);
+    }
+  });
+
+  return jobImages
+    .map((img) => {
+      if (img.media_type === 'pdf' || !img.image_url) {
+        return img;
+      }
+
+      const dataUrl = convertedByKey.get(img.id || img.image_url);
+      if (!dataUrl) {
+        return null;
+      }
+
+      return {
+        ...img,
+        image_src: dataUrl,
+      };
+    })
+    .filter(Boolean);
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Method not allowed' });
   }
+
+  const session = await requireSession(req, res);
+  if (!session) return;
 
   try {
     const { jobId } = req.query;
@@ -342,6 +470,9 @@ export default async function handler(req, res) {
 
     // Fetch customer contact details for Attention / Tel / Email section
     let contactDetails = null;
+    // customer_location rows — same source job view uses for address resolution
+    let customerLocations = [];
+    let customerLocation = null;
     if (jobData.customer_id) {
       try {
         if (jobData.contact) {
@@ -397,6 +528,23 @@ export default async function handler(req, res) {
         }
       } catch (contactError) {
         console.warn('Error fetching contact details:', contactError);
+      }
+
+      try {
+        const { data: locRows } = await admin
+          .from('customer_location')
+          .select('*')
+          .eq('customer_id', jobData.customer_id)
+          .order('site_id', { ascending: true });
+
+        customerLocations = locRows || [];
+        customerLocation = matchCustomerLocation(
+          customerLocations,
+          jobData.location?.id || jobData.location_id,
+          jobData.location?.location_name || jobData.location?.locationName
+        );
+      } catch (locationError) {
+        console.warn('Error fetching customer locations for PDF:', locationError);
       }
     }
 
@@ -458,9 +606,12 @@ export default async function handler(req, res) {
       }
     }
 
+    // Convert service images to base64 for React-PDF (raw storage URLs lack file extensions)
+    const pdfJobImages = await enrichJobImagesForPdf(jobImages, admin, jobId);
+
     const enrichedJobData = {
       ...jobData,
-      job_images: jobImages || [],
+      job_images: pdfJobImages,
       signature: {
         signature_image_url: signatureBase64 || (jobSignatures && jobSignatures.length > 0 ? jobSignatures[0].signature_image_url : null)
       },
@@ -469,6 +620,8 @@ export default async function handler(req, res) {
       createdByFullName: finalCreatedByName,
       createdBy: createdByObject,
       contactDetails: contactDetails,
+      customerLocations,
+      customerLocation: customerLocation || jobData.customerLocation || null,
       payNowDetails: payNowDetails,
       followups: followUps.reduce((acc, fu) => {
         acc[fu.id] = fu;
@@ -585,19 +738,17 @@ export default async function handler(req, res) {
           .update(updateData)
           .eq('id', existingRecord.id);
       } else {
-        // Insert new record - try with filename first
-        // Ensure media_type is lowercase to match constraint
+        const createdBy = resolveJobMediaCreatedBy(req, jobData);
         const insertData = {
           job_id: jobId,
           image_url: urlData.publicUrl,
           media_type: 'pdf'.toLowerCase(),
           created_at: new Date().toISOString(),
-          filename: filename
+          filename: filename,
         };
 
-        // Add created_by if available (required by database constraint)
-        if (jobData.created_by) {
-          insertData.created_by = jobData.created_by;
+        if (createdBy) {
+          insertData.created_by = createdBy;
         }
 
         const { error: mediaError } = await admin
@@ -605,37 +756,31 @@ export default async function handler(req, res) {
           .insert(insertData);
 
         if (mediaError) {
-          // If error is about missing filename column, try without it
           if (mediaError.message && (mediaError.message.includes('filename') || mediaError.code === 'PGRST204')) {
             delete insertData.filename;
             const { error: retryError } = await admin
               .from('job_media')
               .insert(insertData);
-            
+
             if (retryError) {
               console.warn('Failed to store PDF reference in job_media (retry without filename):', retryError);
             } else {
               console.info('PDF reference stored without filename column (migration needed)');
             }
           } else if (mediaError.code === '23502' && mediaError.message.includes('created_by')) {
-            // If created_by is missing and required, try to get it from job or use a default
-            // First try to get from job
-            if (!insertData.created_by && jobData.created_by) {
-              insertData.created_by = jobData.created_by;
-              const { error: retryError } = await admin
-                .from('job_media')
-                .insert(insertData);
-              
-              if (retryError) {
-                console.warn('Failed to store PDF reference in job_media (retry with created_by):', retryError);
-              }
-            } else {
-              console.warn('Failed to store PDF reference in job_media - created_by is required but not available:', mediaError);
-            }
+            console.warn('Failed to store PDF reference in job_media - created_by is required but not available:', mediaError);
+          } else if (
+            mediaError.code === '23514' &&
+            (mediaError.message?.includes('media_type') || mediaError.message?.includes('job_media_media_type_check'))
+          ) {
+            console.warn(
+              'Failed to store PDF reference in job_media: media_type CHECK constraint violation. ' +
+              'Run lib/supabase/migrations/fix_job_media_media_type_constraint.sql on production Supabase ' +
+              '(or apply via Supabase SQL editor) to allow media_type=pdf.'
+            );
           } else {
             console.warn('Failed to store PDF reference in job_media:', mediaError);
           }
-          // Don't fail the request if this fails
         }
       }
     } catch (mediaErr) {

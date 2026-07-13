@@ -5,6 +5,10 @@ import {
   formatSingaporeDateWithTime,
 } from '../lib/utils/singaporeDateTime';
 import { htmlToPlainText } from '../lib/utils/htmlToPlainText';
+import {
+  formatLocationRecordAsSingleLine,
+  resolveJobDisplayAddress,
+} from '../lib/jobs/resolveJobDisplayAddress';
 
 // Styles matching the accurate design
 const styles = StyleSheet.create({
@@ -313,19 +317,22 @@ const JobSheetPDF = ({ jobData }) => {
     arrangedBy = '';
   }
 
-  const location = jobData.location || jobData.customerLocation || {};
+  const location = jobData.location || {};
+  const customerLocation = jobData.customerLocation || null;
+  const customerLocations = jobData.customerLocations || [];
+  const scheduleAddress = jobData.scheduleAddress || '';
   const customerName = jobData.customer?.customer_name || jobData.customerName || 'N/A';
-  
-  // Build address lines
-  const addressLines = [];
-  if (location.street || location.address || location.location_name) {
-    addressLines.push(location.street || location.address || location.location_name);
-  }
-  if (location.building) {
-    addressLines.push(location.building);
-  }
-  const cityZip = [location.city, location.zip_code].filter(Boolean).join(' ');
-  if (cityZip) addressLines.push(cityZip);
+
+  // Same order as JobDetailsPage Location subtitle — single address line under Job Location
+  const addressLine =
+    resolveJobDisplayAddress(jobData, {
+      customerLocations,
+      scheduleAddress,
+    }) ||
+    formatLocationRecordAsSingleLine(customerLocation) ||
+    formatLocationRecordAsSingleLine(location) ||
+    '';
+  const addressLines = addressLine ? [addressLine] : [];
 
   const contactDetails = jobData.contactDetails || jobData.contact || {};
   const attentionName =
@@ -549,17 +556,18 @@ const JobSheetPDF = ({ jobData }) => {
         {/* Service Documentation Images */}
         {(() => {
           const images = (jobData.job_images || []).filter(img =>
-            img.media_type !== 'pdf' && img.image_url
+            img.media_type !== 'pdf' && (img.image_src || img.image_url)
           );
 
           return images.length > 0 ? (
             <View style={[styles.imageGrid, { marginTop: 10 }]}>
               {images.map((img, idx) => {
+                const imageSrc = img.image_src || img.image_url;
                 const caption = (img.description || img.filename || '').toString().trim();
                 const timestampStr = formatSingaporeDateWithTime(img.created_at);
                 return (
                   <View key={img.id || idx} style={styles.imageContainer} wrap={false}>
-                    <Image src={img.image_url} style={styles.serviceImage} alt="" />
+                    <Image src={imageSrc} style={styles.serviceImage} alt="" />
                     {(caption || timestampStr) && (
                       <View style={styles.imageCaption}>
                         {caption ? (

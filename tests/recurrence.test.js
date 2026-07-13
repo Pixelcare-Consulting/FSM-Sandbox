@@ -205,6 +205,24 @@ function ymd(date) {
   assert.strictEqual(list.length, generateOccurrenceDates(rule).length);
 }
 
+// Monthly every 3 months on first Sunday, 3 occurrences
+{
+  const rule = {
+    isRepeat: true,
+    frequency: "monthly",
+    interval: 3,
+    startDate: "2024-09-04",
+    weekDays: [0],
+    monthlyMode: "dayOfWeek",
+    monthDay: 4,
+    monthOrdinal: 1,
+    monthWeekday: 0,
+    endCount: 3,
+  };
+  const dates = generateOccurrenceDates(rule, { maxOccurrences: 3 });
+  assert.strictEqual(dates.length, 3);
+}
+
 // Validation rejects invalid weekly rule
 {
   const result = validateRecurrenceRule({
@@ -219,6 +237,50 @@ function ymd(date) {
     monthWeekday: 0,
   });
   assert.strictEqual(result.valid, false);
+}
+
+// Validation rejects empty start date
+{
+  const result = validateRecurrenceRule({
+    isRepeat: true,
+    frequency: "monthly",
+    interval: 1,
+    startDate: "",
+    weekDays: [],
+    monthlyMode: "dayOfMonth",
+    monthDay: 15,
+    monthOrdinal: 1,
+    monthWeekday: 0,
+    endCount: 3,
+  });
+  assert.strictEqual(result.valid, false);
+  assert.ok(result.errors.some((e) => /start date/i.test(e)));
+}
+
+// Invalid rule yields zero occurrence dates (submit guard scenario)
+{
+  const invalidRule = {
+    isRepeat: true,
+    frequency: "weekly",
+    interval: 1,
+    startDate: "2026-01-01",
+    weekDays: [],
+    monthlyMode: "dayOfMonth",
+    monthDay: 1,
+    monthOrdinal: 1,
+    monthWeekday: 0,
+    endCount: 3,
+  };
+  assert.strictEqual(validateRecurrenceRule(invalidRule).valid, false);
+  assert.strictEqual(generateOccurrenceDates(invalidRule).length, 0);
+}
+
+// Non-repeat single job date from startDate string
+{
+  const startDate = "2026-08-06";
+  const jobDates = [new Date(`${startDate}T00:00:00`)];
+  assert.strictEqual(jobDates.length, 1);
+  assert.strictEqual(ymd(jobDates[0]), startDate);
 }
 
 assert.ok(parseRecurrenceStartDate("2026-01-01"));

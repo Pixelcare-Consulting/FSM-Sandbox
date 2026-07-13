@@ -1,7 +1,9 @@
 import { useRouter } from "next/router";
 import { useEffect, useState, Fragment, useRef, useCallback, useMemo } from "react";
+import { useQueryClient } from "react-query";
 import { getSupabaseClient } from "../../../../lib/supabase/client";
 import { pickMasterlistContactRow } from "../../../../lib/jobs/pickMasterlistSiteContact";
+import { sanitizeJobTaskFields } from '../../../../lib/jobs/sanitizeJobTaskFields';
 import { jobService, followUpService, jobMediaService } from "../../../../lib/supabase/database";
 import { emitFollowUpStakeholderNotifications } from "../../../../lib/notifications/jobStakeholderNotificationsClient";
 import { uploadFile, getDownloadURL, deleteFile } from "../../../../lib/supabase/storage";
@@ -97,12 +99,23 @@ import {
   getSingaporeCalendarParts,
   toSingaporeYmd,
 } from "../../../../lib/utils/singaporeDateTime";
+import {
+  formatPaymentQrCentsForInput,
+  getDefaultPaymentQrExpiryYmd,
+  parsePaymentQrDollarInput,
+  paymentQrCentsToPaynowAmount,
+  paymentQrDollarsToCents,
+} from "../../../../lib/jobs/paymentQrDefaults";
+import PaymentConfirmationWelcomeModal, {
+  shouldAutoOpenWelcome,
+} from "./PaymentConfirmationWelcomeModal";
 
 // Default avatar path
 const defaultAvatar = "/images/avatar/NoProfile.png";
 import Link from "next/link"; // Add this import
 import NextImage from "next/image";
 import Cookies from "js-cookie";
+import { useCurrentUser, resolveCurrentUserInfo } from "@/hooks/useCurrentUser";
 import formatDistanceToNow from "date-fns/formatDistanceToNow";
 import isToday from "date-fns/isToday";
 import isYesterday from "date-fns/isYesterday";
@@ -123,8 +136,20 @@ import {
 import { DragDropContext, Droppable, Draggable } from 'react-beautiful-dnd';
 import format from "date-fns/format";
 // Removed Firebase auth import - using Supabase
-import { fetchFollowUpTypes } from '../../../../utils/followUpSettings';
-import { fetchJobStatuses, getDefaultJobStatuses, getJobStatusColorFromList, getJobStatusLabelFromList } from '../../../../utils/jobStatusSettings';
+import { getDefaultJobStatuses, getJobStatusColorFromList, getJobStatusLabelFromList } from '../../../../utils/jobStatusSettings';
+import { useJobDetailQuery } from '../../../../hooks/queries/useJobDetailQuery';
+import { useJobChatQuery } from '../../../../hooks/queries/useJobChatQuery';
+import { useJobSignaturesQuery } from '../../../../hooks/queries/useJobSignaturesQuery';
+import { useJobMediaQuery } from '../../../../hooks/queries/useJobMediaQuery';
+import { useCustomerAddressQuery } from '../../../../hooks/queries/useCustomerAddressQuery';
+import { useJobStatusesQuery } from '../../../../hooks/queries/useJobStatusesQuery';
+import { useFollowUpTypesQuery } from '../../../../hooks/queries/useFollowUpTypesQuery';
+import { invalidateJobDetailSatellites } from '../../../../lib/jobs/jobDetailSatelliteInvalidation';
+import {
+  invalidateJobCachesAfterMutation,
+  patchJobsListDescriptionCaches,
+} from '../../../../lib/jobs/invalidateJobMutationCaches';
+import { queryKeys } from '../../../../lib/cache/queryKeys';
 import { emitJobCompletedEmail, emitSendTemplateEmail, emitDispatchEventEmail } from '../../../../lib/notifications/transactionalJobEmailClient';
 import { showJobCompletedEmailToast } from '../../../../lib/email/jobEmailToastMessages';
 import { getTechnicianStatusLabel, getTechnicianStatusColor } from '../../../../lib/scheduler/technicianSchedulerUtils';
@@ -288,7 +313,8 @@ const mapJobTasksToTaskList = (jobTasks) =>
     completionDate: null,
   }));
 
-const JOB_REALTIME_DEBOUNCE_MS = 400;
+const JOB_REALTIME_DEBOUNCE_MS = 2500;
+const JOB_REALTIME_FULL_REFETCH_MIN_MS = 30_000;
 
 /** Merge flat jobs-row realtime payload without dropping nested relations. */
 const mergeJobHeaderFromRow = (prevJob, row) => {
@@ -307,10 +333,11 @@ const mergeJobHeaderFromRow = (prevJob, row) => {
     job_equipments: prevJob.job_equipments,
     taskList: prevJob.taskList,
     customer: prevJob.customer,
-    location: prevJob.location,
+    // Clear nested objects when FKs were nulled so Job View does not re-show removed location/contact
+    location: row.location_id === null ? null : prevJob.location,
     service_call: prevJob.service_call,
     sales_order: prevJob.sales_order,
-    contact: prevJob.contact,
+    contact: row.contact_id === null ? null : prevJob.contact,
     payment_profile: prevJob.payment_profile,
     created_by_user: prevJob.created_by_user,
   };
@@ -533,64 +560,15 @@ const mapMasterlistContactToJobContact = (contact) => {
   };
 };
 
-/**
- * One-line address from customer_location, locations row, or SAP-style nested `address` object.
- * Mirrors the "Location" info block (customerLocation || job.location).
- */
-const formatLocationRecordAsSingleLine = (loc) => {
-  if (!loc || typeof loc !== "object") return "";
-  const building = sanitizeAddressPart(loc.building);
-  const block = sanitizeAddressPart(loc.block);
-  const countryName = sanitizeAddressPart(loc.country_name || loc.country);
-  const countryCode = getCountryCode(countryName);
-  const zipCode = sanitizeAddressPart(loc.zip_code);
-  const city = sanitizeAddressPart(loc.city);
-  const state = sanitizeAddressPart(loc.state || loc.state_province);
-
-  const numberedStreet = [loc.street_number, loc.street]
-    .map((p) => sanitizeAddressPart(p))
-    .filter(Boolean)
-    .join(" ");
-
-  let streetAddress = "";
-  const rawAddr = loc.street ?? loc.address ?? loc.location_name ?? loc.locationName;
-  if (typeof rawAddr === "string") {
-    streetAddress = sanitizeAddressPart(rawAddr);
-  } else if (rawAddr && typeof rawAddr === "object") {
-    const a = rawAddr;
-    const nested = [
-      a.streetNo || a.street_number,
-      a.streetAddress || a.street,
-      a.block,
-      a.buildingNo || a.building,
-      a.city,
-      a.stateProvince || a.state,
-      a.postalCode || a.zip_code,
-      a.country,
-    ]
-      .map((p) => sanitizeAddressPart(p))
-      .filter(Boolean);
-    streetAddress = nested.join(", ");
-  }
-
-  if (!streetAddress && numberedStreet) {
-    streetAddress = numberedStreet;
-  }
-
-  const formattedCountry = countryCode === "SG" ? "Singapore" : (countryName || "");
-  const fullAddressParts = [streetAddress, building, block, city, state, formattedCountry, zipCode].filter(Boolean);
-  return fullAddressParts.join(", ");
-};
-
 /** Same strings the map can geocode: schedule row, then customer site, then job-linked location. */
 const buildGeocodableAddressForJob = (normalizedJob) => {
   if (!normalizedJob || typeof normalizedJob !== "object") return "";
   if (normalizedJob.scheduleAddress && String(normalizedJob.scheduleAddress).trim()) {
     return String(normalizedJob.scheduleAddress).trim();
   }
-  const fromCustomer = formatLocationRecordAsSingleLine(normalizedJob.customerLocation);
+  const fromCustomer = formatJobLocationLine(normalizedJob.customerLocation);
   if (fromCustomer) return fromCustomer;
-  return formatLocationRecordAsSingleLine(normalizedJob.location);
+  return formatJobLocationLine(normalizedJob.location);
 };
 
 // Add this helper function near the top with other helpers
@@ -639,12 +617,32 @@ const JOB_MEDIA_BUCKET = 'job_service_media';
 const JobDetails = () => {
   // Move all useState declarations to the top
   const router = useRouter();
+  const { user: bootstrapUser } = useCurrentUser();
+  const bootstrapUserRef = useRef(bootstrapUser);
+  bootstrapUserRef.current = bootstrapUser;
+
+  const getCurrentUserInfo = useCallback(async () => {
+    return resolveCurrentUserInfo(bootstrapUserRef.current);
+  }, []);
   const rawJobId = router.query?.jobId;
   const jobId = router.isReady
     ? (Array.isArray(rawJobId) ? rawJobId[0] : rawJobId)
     : undefined;
+  const queryClient = useQueryClient();
+  const {
+    data: jobDetailBundle,
+    isLoading: jobDetailQueryLoading,
+    isError: jobDetailQueryError,
+  } = useJobDetailQuery(jobId, {
+    enabled: router.isReady && Boolean(jobId) && typeof jobId === 'string',
+  });
+
+  const jobFetchLoading =
+    !router.isReady ||
+    (Boolean(jobId && typeof jobId === 'string') &&
+      jobDetailQueryLoading &&
+      !jobDetailBundle);
   const [job, setJob] = useState(null);
-  const [jobFetchLoading, setJobFetchLoading] = useState(true);
   const [jobUuid, setJobUuid] = useState(null); // Store the actual UUID for queries
   const [sendingCompletionEmail, setSendingCompletionEmail] = useState(false);
   const [showSendCompletionEmailConfirm, setShowSendCompletionEmailConfirm] = useState(false);
@@ -687,6 +685,8 @@ const JobDetails = () => {
   const [newTag, setNewTag] = useState("");
   const [isEditingDescription, setIsEditingDescription] = useState(false);
   const [editedDescription, setEditedDescription] = useState("");
+  const editedDescriptionRef = useRef("");
+  const isEditingDescriptionRef = useRef(false);
   const [descriptionEditorKey, setDescriptionEditorKey] = useState(0);
   const [isSavingDescription, setIsSavingDescription] = useState(false);
   const [newTask, setNewTask] = useState({
@@ -740,6 +740,8 @@ const JobDetails = () => {
   const [markPaidLoading, setMarkPaidLoading] = useState(false);
   const [markPaidBankRef, setMarkPaidBankRef] = useState('');
   const [showMarkPaidModal, setShowMarkPaidModal] = useState(false);
+  const [showPaymentWelcomeModal, setShowPaymentWelcomeModal] = useState(false);
+  const welcomeAutoOpenRef = useRef(false);
   const paymentQrAutosaveRef = useRef(null);
   const paymentQrAutosaveSkipRef = useRef(true);
   const [qrCodeValue, setQrCodeValue] = useState('');
@@ -747,6 +749,7 @@ const JobDetails = () => {
   const [isUploadingImages, setIsUploadingImages] = useState(false);
   const fileInputRef = useRef(null);
   const jobRealtimeDebounceRef = useRef(null);
+  const jobRealtimeLastFullRefetchRef = useRef(0);
   const [pendingImageFiles, setPendingImageFiles] = useState([]);
   const [imageDescriptions, setImageDescriptions] = useState({});
   const [showImageUploadModal, setShowImageUploadModal] = useState(false);
@@ -814,7 +817,7 @@ const JobDetails = () => {
       Cookies.get("workerId") ||
       null
     );
-  }, [currentUserId, job]);
+  }, [currentUserId, job, getCurrentUserInfo]);
 
   useEffect(() => {
     return () => {
@@ -852,32 +855,76 @@ const JobDetails = () => {
   const [addressDetailsMap, setAddressDetailsMap] = useState({});
   const [addressDetailsByLocationId, setAddressDetailsByLocationId] = useState({});
 
+  const effectiveJobId = jobUuid || job?.id;
+  const { data: followUpTypesData = [] } = useFollowUpTypesQuery();
+  const { data: jobStatusesData = getDefaultJobStatuses() } = useJobStatusesQuery();
+  const { data: addressDetailsPayload } = useCustomerAddressQuery(job?.customerCode, {
+    enabled: Boolean(job?.customerCode),
+  });
+  const { data: cachedJobImages, isLoading: isJobMediaLoading } = useJobMediaQuery(effectiveJobId, {
+    enabled: Boolean(effectiveJobId),
+  });
+  const { data: cachedSignatures, isLoading: isSignaturesQueryLoading } = useJobSignaturesQuery(jobUuid, {
+    enabled: Boolean(jobUuid),
+  });
+  const {
+    data: cachedChatMessages,
+    isLoading: isChatQueryLoading,
+    error: chatQueryError,
+  } = useJobChatQuery(jobUuid, {
+    enabled: Boolean(jobUuid),
+  });
+
   useEffect(() => {
     if (!job?.customerCode) {
       setAddressDetailsMap({});
       setAddressDetailsByLocationId({});
       return;
     }
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch(
-          `/api/customers/address-details/${encodeURIComponent(job.customerCode)}`
-        );
-        if (!res.ok) return;
-        const json = await res.json();
-        if (!cancelled && json?.success && json?.data) {
-          setAddressDetailsMap(json.data);
-          setAddressDetailsByLocationId(json.dataByCustomerLocationId || {});
-        }
-      } catch (err) {
-        console.error("Error loading address details for job view:", err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [job?.customerCode]);
+    if (addressDetailsPayload) {
+      setAddressDetailsMap(addressDetailsPayload.data || {});
+      setAddressDetailsByLocationId(addressDetailsPayload.dataByCustomerLocationId || {});
+    }
+  }, [job?.customerCode, addressDetailsPayload]);
+
+  useEffect(() => {
+    if (Array.isArray(followUpTypesData) && followUpTypesData.length > 0) {
+      setFollowUpTypes(followUpTypesData);
+    }
+  }, [followUpTypesData]);
+
+  useEffect(() => {
+    if (Array.isArray(jobStatusesData) && jobStatusesData.length > 0) {
+      setJobStatuses(jobStatusesData);
+    }
+  }, [jobStatusesData]);
+
+  useEffect(() => {
+    if (cachedJobImages) {
+      setJobImages(cachedJobImages);
+    }
+    setIsLoadingImages(isJobMediaLoading && !cachedJobImages);
+  }, [cachedJobImages, isJobMediaLoading]);
+
+  useEffect(() => {
+    if (cachedSignatures) {
+      setSignatures(cachedSignatures);
+    }
+    setIsLoadingSignatures(isSignaturesQueryLoading && cachedSignatures == null);
+  }, [cachedSignatures, isSignaturesQueryLoading]);
+
+  useEffect(() => {
+    if (cachedChatMessages) {
+      setChatMessages(cachedChatMessages);
+    }
+    setIsLoadingChat(isChatQueryLoading && !cachedChatMessages);
+  }, [cachedChatMessages, isChatQueryLoading]);
+
+  useEffect(() => {
+    if (chatQueryError) {
+      toast.error(`Failed to load messages: ${chatQueryError.message}`);
+    }
+  }, [chatQueryError]);
 
   // Helper function to format date as DD/MM/YYYY
   const formatDateDDMMYYYY = (timestamp) => {
@@ -940,31 +987,6 @@ const JobDetails = () => {
     'Cancelled'
   ];
 
-    // Add this useEffect to fetch follow-up types
-    useEffect(() => {
-      const loadFollowUpTypes = async () => {
-        const types = await fetchFollowUpTypes();
-        setFollowUpTypes(types);
-      };
-  
-      loadFollowUpTypes();
-    }, []);
-
-  useEffect(() => {
-    let mounted = true;
-    const load = async () => {
-      const statuses = await fetchJobStatuses();
-      if (mounted && Array.isArray(statuses) && statuses.length > 0) {
-        setJobStatuses(statuses);
-      }
-    };
-    load();
-    return () => { mounted = false; };
-  }, []);
-  
-
-
-
   useEffect(() => {
     // Retrieve email from cookies
     const emailFromCookie = Cookies.get("email");
@@ -974,676 +996,117 @@ const JobDetails = () => {
   useEffect(() => {
     if (!router.isReady) return;
 
-    if (!jobId || typeof jobId !== "string") {
-      setJobFetchLoading(false);
+    if (!jobId || typeof jobId !== 'string') {
       setJob(null);
       setJobUuid(null);
+      setLocation(null);
+      setJobAttendance([]);
+      return;
+    }
+
+    if (jobDetailQueryLoading) return;
+
+    if (jobDetailQueryError || !jobDetailBundle?.job) {
+      setJob(null);
+      setJobUuid(null);
+      setLocation(null);
+      setJobAttendance([]);
       return;
     }
 
     let cancelled = false;
-    setJobFetchLoading(true);
-    setJob(null);
-    setJobUuid(null);
 
-    const fetchJob = async () => {
-      try {
-        setLocation(null);
-        setJobAttendance([]);
-        // Check if jobId is a UUID (contains hyphens and is 36 chars) or job_number
-        const isUUID = jobId.includes('-') && jobId.length === 36;
-        let jobData;
+    const applyPayload = async () => {
+      const {
+        job: normalizedJob,
+        jobUuid: uuid,
+        workers: workerData,
+        technicianLocations: technicianLocationsMap,
+        jobAttendance: attendanceRows,
+        paymentProfiles: profiles,
+        paymentState,
+        expandedEquipments,
+        technicianNotes: notes,
+        workerComments: comments,
+        images: jobImages,
+      } = jobDetailBundle;
 
-        if (isUUID) {
-          jobData = await jobService.findById(jobId);
-        } else {
-          // Try to find by job_number
-          jobData = await jobService.findByJobNumber(jobId);
+      setLocation(null);
+      setJobAttendance([]);
+      setJobUuid(uuid);
+      setJob(normalizedJob);
+      // Do not clobber in-progress inline description edits with a stale refetch.
+      if (!isEditingDescriptionRef.current) {
+        const nextDescription =
+          normalizedJob?.jobDescription || normalizedJob?.description || '';
+        editedDescriptionRef.current = nextDescription;
+        setEditedDescription(nextDescription);
+      }
+      setExpandedEquipments(expandedEquipments || {});
+      setWorkers(workerData || []);
+      setTechnicianLocations(technicianLocationsMap || {});
+      setJobAttendance(attendanceRows || []);
+      setTechnicianNotes(notes || []);
+      setWorkerComments(comments || []);
+      setImages(jobImages || []);
+      setPaymentProfiles(profiles || []);
+
+      if (paymentState) {
+        setSelectedPaymentProfileId(paymentState.selectedPaymentProfileId);
+        setPaymentStatus(paymentState.paymentStatus);
+        paymentQrAutosaveSkipRef.current = paymentState.paymentQrAutosaveSkip;
+        setPaymentDetails(paymentState.paymentDetails);
+        if (paymentState.qrCodeValue) {
+          setQrCodeValue(paymentState.qrCodeValue);
         }
+      }
 
-        if (cancelled) return;
-
-        if (jobData) {
-            // Store the job's UUID for use in subsequent queries
-            setJobUuid(jobData.id);
-            
-            // Normalize job data to match component expectations
-            const normalizedJob = {
-              ...jobData,
-              // Map job fields
-              jobNo: jobData.job_number || jobData.jobNo,
-              jobName: jobData.title || jobData.jobName,
-              jobStatus: jobData.status || jobData.jobStatus,
-              jobType: jobData.category || jobData.jobType || 'Maintenance',
-              
-              // Map description to jobDescription (component expects jobDescription)
-              jobDescription: jobData.description || '',
-              description: jobData.description || '',
-              
-              // Map customer data
-              customerID: jobData.customer_id || jobData.customer?.id || jobData.customerID,
-              customerName: jobData.customer?.customer_name || jobData.customerName,
-              customerCode: jobData.customer?.customer_code || jobData.customerCode,
-              customerPhone: jobData.customer?.phone_number || '',
-              customerEmail: jobData.customer?.email || '',
-
-              serviceCallNumber: jobData.service_call?.call_number ?? null,
-              salesOrderNumber: jobData.sales_order?.document_number ?? null,
-              
-              // Map location data (embed is usually an object; guard array edge case)
-              location: (() => {
-                const loc = jobData.location;
-                if (!loc) return {};
-                if (Array.isArray(loc)) return loc[0] && typeof loc[0] === "object" ? loc[0] : {};
-                return typeof loc === "object" ? loc : {};
-              })(),
-              
-              // Extract time from scheduled dates (Asia/Singapore wall clock)
-              startTime: jobData.scheduled_start
-                ? formatSingaporeTimeHm(jobData.scheduled_start) || jobData.startTime
-                : jobData.startTime,
-              endTime: jobData.scheduled_end
-                ? formatSingaporeTimeHm(jobData.scheduled_end) || jobData.endTime
-                : jobData.endTime,
-              startDate: jobData.scheduled_start
-                ? toSingaporeYmd(jobData.scheduled_start) || jobData.startDate
-                : jobData.startDate,
-              endDate: jobData.scheduled_end
-                ? toSingaporeYmd(jobData.scheduled_end) || jobData.endDate
-                : jobData.endDate,
-              
-              // Map assigned workers from technician_jobs - only non-deleted, deduplicate by technician_id
-              assignedWorkers: (() => {
-                const technicianMap = new Map();
-                (jobData.technician_jobs || [])
-                  .filter((tj) => tj.deleted_at == null)
-                  .forEach(tj => {
-                  const techId = tj.technician_id || tj.technician?.id;
-                  if (techId && !technicianMap.has(techId)) {
-                    technicianMap.set(techId, {
-                      workerId: techId,
-                      technician_id: techId,
-                      ...tj.technician,
-                      ...tj
-                    });
-                  }
-                });
-                return Array.from(technicianMap.values());
-              })(),
-              
-              // Map tasks from job_tasks (is_completed may be set by field app; task_completions refines below)
-              taskList: mapJobTasksToTaskList(jobData.job_tasks),
-              
-              // Map equipments from job_equipments
-              equipments: (jobData.job_equipments || []).map(je => {
-                const eq = je.equipment || {};
-                return {
-                  id: eq.id || je.equipment_id,
-                  itemName: eq.item_name || 'Unnamed Equipment',
-                  itemCode: eq.item_code || '',
-                  modelSeries: eq.model_series || '',
-                  itemGroup: eq.item_group || '',
-                  serialNo: eq.serial_number || '',
-                  equipmentLocation: eq.equipment_location || '',
-                  equipmentType: eq.equipment_type || '',
-                  warrantyStartDate: eq.warranty_start_date || '',
-                  warrantyEndDate: eq.warranty_end_date || '',
-                  notes: eq.notes || je.notes || ''
-                };
-              }),
-              
-              // Keep original fields
-              createdAt: jobData.created_at || jobData.createdAt,
-              updatedAt: jobData.updated_at || jobData.updatedAt,
-              scheduled_start: jobData.scheduled_start,
-              scheduled_end: jobData.scheduled_end,
-              
-              // Payment QR code fields
-              payment_qr_uen: jobData.payment_qr_uen,
-              payment_qr_amount: jobData.payment_qr_amount,
-              payment_qr_editable: jobData.payment_qr_editable,
-              payment_qr_expiry: jobData.payment_qr_expiry,
-              payment_qr_ref_number: jobData.payment_qr_ref_number,
-              payment_qr_company: jobData.payment_qr_company,
-              payment_qr_inv_number: jobData.payment_qr_inv_number,
-              payment_qr_code_string: jobData.payment_qr_code_string,
-              payment_status: jobData.payment_status || 'pending',
-              sap_cm_number: jobData.sap_cm_number,
-              sap_cm_status: jobData.sap_cm_status,
-              sap_job_income: jobData.sap_job_income,
-            };
-
-            // Fetch job_schedule to get saved duration
-            try {
-              const supabase = getSupabaseClient();
-              if (supabase) {
-                const { data: jobSchedule } = await supabase
-                  .from('job_schedule')
-                  .select('*')
-                  .eq('job_id', jobData.id)
-                  .maybeSingle();
-                
-                if (jobSchedule && jobSchedule.dur && jobSchedule.dur_type === 'hours') {
-                  // Parse duration from job_schedule (stored as decimal hours like "5.00")
-                  const durDecimal = parseFloat(jobSchedule.dur);
-                  if (!isNaN(durDecimal)) {
-                    const hours = Math.floor(durDecimal);
-                    const minutes = Math.round((durDecimal - hours) * 60);
-                    normalizedJob.estimatedDurationHours = hours;
-                    normalizedJob.estimatedDurationMinutes = minutes;
-                    normalizedJob.manualDuration = true; // Mark as manually set
-                  }
-                }
-                if (jobSchedule?.address && String(jobSchedule.address).trim()) {
-                  normalizedJob.scheduleAddress = String(jobSchedule.address).trim();
-                }
-              }
-            } catch (scheduleError) {
-              console.error('Error fetching job_schedule:', scheduleError);
+      let mapCenter = getLatLngFromLocationRecord(normalizedJob.location);
+      if (!mapCenter && technicianLocationsMap && typeof technicianLocationsMap === 'object') {
+        for (const row of Object.values(technicianLocationsMap)) {
+          mapCenter = getLatLngFromLocationRecord(row);
+          if (mapCenter) break;
+        }
+      }
+      let mapCenterFromGeocode = false;
+      if (!mapCenter) {
+        const query = buildGeocodableAddressForJob(normalizedJob);
+        if (query) {
+          try {
+            const geo = await geocodeAddress(query);
+            if (!cancelled && geo) {
+              mapCenter = geo;
+              mapCenterFromGeocode = true;
             }
-
-            // Fetch customer_location first so masterlist contacts can match site (customer_location_id)
-            if (normalizedJob.customerID) {
-              try {
-                const supabase = getSupabaseClient();
-                if (supabase) {
-                  let matchedCustLoc = null;
-                  let customerLocations = [];
-
-                  const { data: locRows } = await supabase
-                    .from('customer_location')
-                    .select('*')
-                    .eq('customer_id', normalizedJob.customerID)
-                    .order('site_id', { ascending: true });
-
-                  customerLocations = locRows || [];
-                  if (customerLocations.length > 0) {
-                    const jobLocationId = normalizedJob.location?.id;
-
-                    if (jobLocationId) {
-                      matchedCustLoc = customerLocations.find((cl) => cl.location_id === jobLocationId);
-                    }
-
-                    if (!matchedCustLoc && normalizedJob.location?.location_name) {
-                      const locName = String(normalizedJob.location.location_name).trim().toLowerCase();
-                      matchedCustLoc = customerLocations.find((cl) => {
-                        const sid = String(cl.site_id || '').trim().toLowerCase();
-                        const bld = String(cl.building || '').trim().toLowerCase();
-                        return (sid && locName.includes(sid)) || (bld && locName.includes(bld));
-                      });
-                    }
-
-                    normalizedJob.customerLocation = matchedCustLoc || null;
-                    normalizedJob.customerLocations = customerLocations;
-                  }
-
-                  const { data: contactsRows } = await supabase
-                    .from('contacts')
-                    .select('*')
-                    .eq('customer_id', normalizedJob.customerID);
-
-                  const siteContactOrder = [];
-                  if (matchedCustLoc?.id) {
-                    siteContactOrder.push(matchedCustLoc.id);
-                  }
-                  for (const cl of customerLocations) {
-                    if (cl?.id && (!matchedCustLoc?.id || String(cl.id) !== String(matchedCustLoc.id))) {
-                      siteContactOrder.push(cl.id);
-                    }
-                  }
-
-                  let picked = null;
-                  const savedContactId = jobData.contact_id || normalizedJob.contact_id;
-                  if (savedContactId) {
-                    if (jobData.contact && String(jobData.contact.id) === String(savedContactId)) {
-                      picked = jobData.contact;
-                    } else {
-                      picked = (contactsRows || []).find(
-                        (r) => String(r.id) === String(savedContactId),
-                      );
-                    }
-                  }
-                  if (!picked) {
-                    picked = pickMasterlistContactRow(contactsRows || [], siteContactOrder);
-                  }
-                  if (picked) {
-                    normalizedJob.contact = mapMasterlistContactToJobContact(picked);
-                  }
-
-                  if (normalizedJob.contact) {
-                    if (!normalizedJob.contact.phoneNumber && normalizedJob.customerPhone) {
-                      normalizedJob.contact.phoneNumber = String(normalizedJob.customerPhone).trim();
-                    }
-                    if (!normalizedJob.contact.email && normalizedJob.customerEmail) {
-                      normalizedJob.contact.email = String(normalizedJob.customerEmail).trim();
-                    }
-                  } else if (normalizedJob.customerPhone || normalizedJob.customerEmail) {
-                    normalizedJob.contact = {
-                      contactID: 'portal-primary',
-                      contactFullname: '',
-                      firstName: '',
-                      middleName: '',
-                      lastName: '',
-                      phoneNumber: normalizedJob.customerPhone ? String(normalizedJob.customerPhone).trim() : '',
-                      mobilePhone: '',
-                      email: normalizedJob.customerEmail ? String(normalizedJob.customerEmail).trim() : '',
-                    };
-                  }
-                }
-              } catch (contactError) {
-                console.error('Error fetching contacts or location:', contactError);
-              }
-            }
-
-            if (
-              !normalizedJob.scheduleAddress &&
-              !normalizedJob.customerLocation &&
-              !(normalizedJob.location?.location_name || normalizedJob.location?.locationName) &&
-              /\[AIFM:[^\]]+\]/.test(normalizedJob.description || '')
-            ) {
-              try {
-                const resolveRes = await fetch('/api/jobs/resolve-addresses', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  credentials: 'same-origin',
-                  body: JSON.stringify({ jobIds: [jobData.id] }),
-                });
-                if (resolveRes.ok) {
-                  const resolveJson = await resolveRes.json();
-                  const resolvedAddr = resolveJson.addresses?.[jobData.id];
-                  if (resolvedAddr) {
-                    normalizedJob.scheduleAddress = resolvedAddr;
-                  }
-                }
-              } catch (resolveErr) {
-                console.warn('Job address resolve from AIFM failed:', resolveErr);
-              }
-            }
-
-            // Fetch follow-ups separately from followups table
-            try {
-              const followUps = await followUpService.getByJobId(jobData.id);
-              if (followUps && followUps.length > 0) {
-                // Fetch creator/status updater details from users and technicians.
-                const actorUserIds = [...new Set(followUps
-                  .flatMap(fu => [fu.user_id, fu.status_updated_by])
-                  .filter(Boolean))];
-
-                let userMapById = {};
-                if (actorUserIds.length > 0) {
-                  try {
-                    const supabase = getSupabaseClient();
-                    if (supabase) {
-                      const { data: users } = await supabase
-                        .from('users')
-                        .select('id, username, role')
-                        .in('id', actorUserIds)
-                        .is('deleted_at', null);
-
-                      if (users) {
-                        users.forEach(user => {
-                          userMapById[user.id] = user;
-                        });
-                      }
-                    }
-                  } catch (userError) {
-                    console.error('Error fetching users for follow-ups:', userError);
-                  }
-                }
-
-                let technicianMapByUserId = {};
-                if (actorUserIds.length > 0) {
-                  try {
-                    const supabase = getSupabaseClient();
-                    if (supabase) {
-                      const { data: technicians } = await supabase
-                        .from('technicians')
-                        .select('user_id, full_name, email')
-                        .in('user_id', actorUserIds)
-                        .is('deleted_at', null);
-                      
-                      if (technicians) {
-                        technicians.forEach(tech => {
-                          technicianMapByUserId[tech.user_id] = {
-                            full_name: tech.full_name,
-                            email: tech.email
-                          };
-                        });
-                      }
-                    }
-                  } catch (techError) {
-                    console.error('Error fetching technicians for follow-ups (by user_id):', techError);
-                  }
-                }
-
-                // Convert follow-ups array to object format expected by UI
-                const followUpsObj = {};
-                followUps.forEach(fu => {
-                  const createdByUserInfo = fu.user_id ? (userMapById[fu.user_id] || fu.user) : null;
-                  const createdByTechInfo = fu.user_id ? technicianMapByUserId[fu.user_id] : null;
-                  const statusUpdatedByUserInfo = fu.status_updated_by ? userMapById[fu.status_updated_by] : null;
-                  const statusUpdatedByTechInfo = fu.status_updated_by ? technicianMapByUserId[fu.status_updated_by] : null;
-                  
-                  followUpsObj[fu.id] = {
-                    id: fu.id,
-                    jobID: fu.job_id,
-                    jobName: normalizedJob.jobName,
-                    customerID: normalizedJob.customerID,
-                    customerName: normalizedJob.customerName,
-                    type: fu.type,
-                    status: fu.status,
-                    priority: fu.priority,
-                    notes: fu.notes || '',
-                    dueDate: fu.due_date,
-                    createdAt: fu.created_at,
-                    updatedAt: fu.updated_at,
-                    createdBy: buildActorInfo(createdByUserInfo, createdByTechInfo),
-                    updatedBy: buildActorInfo(
-                      statusUpdatedByUserInfo,
-                      statusUpdatedByTechInfo,
-                      fu.status_updated_by_account || null
-                    ),
-                    statusUpdatedBy: fu.status_updated_by || null,
-                    statusUpdatedByAccount: fu.status_updated_by_account || null
-                  };
-                });
-                normalizedJob.followUps = followUpsObj;
-                normalizedJob.followUpCount = followUps.length;
-              } else {
-                normalizedJob.followUps = {};
-                normalizedJob.followUpCount = 0;
-              }
-            } catch (followUpError) {
-              console.error('Error fetching follow-ups:', followUpError);
-              normalizedJob.followUps = {};
-              normalizedJob.followUpCount = 0;
-            }
-
-            // Fetch task completions (audit rows per technician_job + job_task)
-            try {
-              const supabase = getSupabaseClient();
-              if (supabase && normalizedJob.taskList && normalizedJob.taskList.length > 0) {
-                const taskIds = normalizedJob.taskList.map(t => t.taskID).filter(Boolean);
-                if (taskIds.length > 0) {
-                  const { data: completions } = await supabase
-                    .from('task_completions')
-                    .select('*')
-                    .in('job_task_id', taskIds);
-
-                  if (completions && completions.length > 0) {
-                    normalizedJob.taskList = normalizedJob.taskList.map(task => {
-                      const taskCompletions = completions.filter(c => c.job_task_id === task.taskID);
-                      const hasCompletionRows = taskCompletions.length > 0;
-                      const isCompletedFromRows = taskCompletions.some(c => c.is_completed);
-                      const isDone = hasCompletionRows ? isCompletedFromRows : Boolean(task.isDone);
-                      const completedRow = taskCompletions.find(c => c.is_completed);
-                      return {
-                        ...task,
-                        isDone,
-                        completionDate: isDone ? (completedRow?.completed_at || null) : null,
-                        completions: taskCompletions.map(c => ({
-                          technicianJobId: c.technician_job_id,
-                          isCompleted: c.is_completed,
-                          completedAt: c.completed_at,
-                          notes: c.completion_notes
-                        }))
-                      };
-                    });
-                  }
-                }
-              }
-            } catch (taskError) {
-              console.error('Error fetching task completions:', taskError);
-            }
-
-            // Set createdBy - fetch from users and technicians tables
-            if (jobData.created_by) {
-              try {
-                const supabase = getSupabaseClient();
-                if (supabase) {
-                  // Get username from users table
-                  const { data: user, error: userError } = await supabase
-                    .from('users')
-                    .select('id, username')
-                    .eq('id', jobData.created_by)
-                    .is('deleted_at', null)
-                    .single();
-                  
-                  // Get full_name from technicians table (if the user is a technician)
-                  const { data: technician, error: techError } = await supabase
-                    .from('technicians')
-                    .select('user_id, full_name')
-                    .eq('user_id', jobData.created_by)
-                    .is('deleted_at', null)
-                    .single();
-                  
-                  normalizedJob.createdBy = {
-                    fullName: technician?.full_name || user?.username || 'Unknown',
-                    email: technician?.email || user?.username || 'Unknown',
-                    username: user?.username || 'Unknown'
-                  };
-                } else {
-                  // Fallback if supabase not available
-                  normalizedJob.createdBy = {
-                    fullName: jobData.created_by_user?.username || 'Unknown',
-                    email: jobData.created_by_user?.username || 'Unknown',
-                    username: jobData.created_by_user?.username || 'Unknown'
-                  };
-                }
-              } catch (error) {
-                console.error('Error fetching created_by user info:', error);
-                // Fallback to username from relationship if available
-                normalizedJob.createdBy = {
-                  fullName: jobData.created_by_user?.username || 'Unknown',
-                  email: jobData.created_by_user?.username || 'Unknown',
-                  username: jobData.created_by_user?.username || 'Unknown'
-                };
-              }
-            } else {
-              normalizedJob.createdBy = null;
-            }
-
-            if (cancelled) return;
-            setJob(normalizedJob);
-            setEditedDescription(normalizedJob.jobDescription || normalizedJob.description || '');
-
-            // Expand all equipment cards by default
-            if (normalizedJob.equipments && normalizedJob.equipments.length > 0) {
-              const expandedState = {};
-              normalizedJob.equipments.forEach((_, index) => {
-                expandedState[index] = true;
-              });
-              setExpandedEquipments(expandedState);
-            }
-
-            let technicianLocationsMap = null;
-            // Extract worker IDs and fetch worker details
-            const assignedWorkers = normalizedJob.assignedWorkers || [];
-            if (Array.isArray(assignedWorkers) && assignedWorkers.length > 0) {
-              const workerIds = assignedWorkers.map(w => w.workerId || w.technician_id).filter(Boolean);
-              if (workerIds.length > 0) {
-                const workerData = await fetchWorkerDetails(workerIds);
-                setWorkers(workerData);
-                
-                // Fetch technician locations from location_technicians table
-                try {
-                  const supabase = getSupabaseClient();
-                  if (supabase) {
-                    // Get technician IDs (not user IDs)
-                    const technicianIds = assignedWorkers
-                      .map(w => w.technician_id || w.id)
-                      .filter(Boolean);
-                    
-                    if (technicianIds.length > 0) {
-                      // Fetch latest location for each technician
-                      const { data: locationData, error: locationError } = await supabase
-                        .from('location_technicians')
-                        .select('*')
-                        .in('technician_id', technicianIds)
-                        .order('tracked_at', { ascending: false });
-                      
-                      if (!locationError && locationData) {
-                        // Group by technician_id and get the latest location for each
-                        const locationsMap = {};
-                        locationData.forEach(loc => {
-                          const techId = loc.technician_id;
-                          if (!locationsMap[techId] || new Date(loc.tracked_at) > new Date(locationsMap[techId].tracked_at)) {
-                            locationsMap[techId] = loc;
-                          }
-                        });
-                        technicianLocationsMap = locationsMap;
-                        setTechnicianLocations(locationsMap);
-                      }
-                    }
-                  }
-                } catch (locationErr) {
-                  console.warn('Error fetching technician locations:', locationErr);
-                }
-              }
-            }
-
-            // Attendance: prefer rows linked to technician_job_id; also include punches with null assignment if technician is on this job
-            try {
-              const supabaseAtt = getSupabaseClient();
-              if (supabaseAtt && jobData?.id) {
-                const activeTj = (jobData.technician_jobs || []).filter((tj) => tj.deleted_at == null);
-                const tjIds = activeTj.map((tj) => tj.id).filter(Boolean);
-                const techIds = [...new Set(activeTj.map((tj) => tj.technician_id).filter(Boolean))];
-                if (tjIds.length > 0 || techIds.length > 0) {
-                  let attQuery = supabaseAtt
-                    .from("attendance")
-                    .select(
-                      `
-                      id,
-                      clock_in,
-                      clock_out,
-                      duration_minutes,
-                      notes,
-                      technician_job_id,
-                      technician_id,
-                      technician:technician_id(full_name)
-                    `
-                    )
-                    .order("clock_in", { ascending: false });
-                  if (tjIds.length > 0 && techIds.length > 0) {
-                    attQuery = attQuery.or(
-                      `technician_job_id.in.(${tjIds.join(",")}),and(technician_id.in.(${techIds.join(",")}),technician_job_id.is.null)`
-                    );
-                  } else if (tjIds.length > 0) {
-                    attQuery = attQuery.in("technician_job_id", tjIds);
-                  } else {
-                    attQuery = attQuery
-                      .in("technician_id", techIds)
-                      .is("technician_job_id", null);
-                  }
-                  const { data: attRows, error: attErr } = await attQuery;
-                  if (attErr) {
-                    console.warn("Error fetching job attendance:", attErr);
-                    setJobAttendance([]);
-                  } else {
-                    setJobAttendance(attRows || []);
-                  }
-                } else {
-                  setJobAttendance([]);
-                }
-              } else {
-                setJobAttendance([]);
-              }
-            } catch (attCatch) {
-              console.warn("Error fetching job attendance:", attCatch);
-              setJobAttendance([]);
-            }
-
-            let mapCenter = getLatLngFromLocationRecord(normalizedJob.location);
-            if (!mapCenter && technicianLocationsMap && typeof technicianLocationsMap === "object") {
-              for (const row of Object.values(technicianLocationsMap)) {
-                mapCenter = getLatLngFromLocationRecord(row);
-                if (mapCenter) break;
-              }
-            }
-            let mapCenterFromGeocode = false;
-            if (!mapCenter) {
-              const query = buildGeocodableAddressForJob(normalizedJob);
-              if (query) {
-                try {
-                  const geo = await geocodeAddress(query);
-                  if (geo) {
-                    mapCenter = geo;
-                    mapCenterFromGeocode = true;
-                  }
-                } catch (geoErr) {
-                  console.warn("Geocode for job map failed:", geoErr);
-                }
-              }
-            }
-            setLocation(mapCenter);
-            if (mapCenter && mapCenterFromGeocode) {
-              setMapKey((k) => k + 1);
-            }
-
-            // Notes and comments - you may need to fetch these separately or add to job query
-            setTechnicianNotes(jobData.technicianNotes || []);
-            setWorkerComments(jobData.workerComments || []);
-            setImages(jobData.images || []);
-            
-            // Payment Confirmation: use payment profile (job's or default)
-            const jobNo = jobData.job_number || jobData.jobNo || '';
-            const jobEnd = jobData.scheduled_end || jobData.endDate;
-            const expiryFromJob = jobEnd
-              ? new Date(jobEnd).toISOString().slice(0, 10).replace(/-/g, '')
-              : '';
-            // Fetch payment profiles to resolve effective profile
-            let profiles = [];
-            try {
-              const { data: profileData } = await getSupabaseClient()
-                .from('payment_profiles')
-                .select('*')
-                .is('deleted_at', null)
-                .order('sort_order', { ascending: true });
-              profiles = profileData || [];
-              setPaymentProfiles(profiles);
-            } catch (e) {
-              console.warn('Could not fetch payment profiles:', e);
-            }
-            const effectiveProfile = jobData.payment_profile_id && profiles.find(p => p.id === jobData.payment_profile_id)
-              ? profiles.find(p => p.id === jobData.payment_profile_id)
-              : profiles.find(p => p.is_default) || profiles[0];
-            const uenForQr = effectiveProfile?.paynow_uen_qr || effectiveProfile?.paynow_uen || jobData.payment_qr_uen || '201019107ZDBS';
-            const companyName = effectiveProfile?.pay_to || jobData.payment_qr_company || 'SAS M&E PTE LTD';
-            setSelectedPaymentProfileId(effectiveProfile?.id || null);
-            setPaymentStatus(jobData.payment_status || 'pending');
-            paymentQrAutosaveSkipRef.current = true;
-            setPaymentDetails({
-              uen: uenForQr,
-              company: companyName,
-              invNumber: jobData.payment_qr_inv_number || jobNo,
-              expiry: jobData.payment_qr_expiry || expiryFromJob,
-              amount: jobData.payment_qr_amount != null ? String(jobData.payment_qr_amount) : '',
-              editable: jobData.payment_qr_editable !== undefined ? jobData.payment_qr_editable : true,
-            });
-            if (jobData.payment_qr_code_string) {
-              setQrCodeValue(jobData.payment_qr_code_string);
-            }
-          } else {
-            setJob(null);
-            setJobUuid(null);
-          }
-        } catch (error) {
-          console.error("Error fetching job:", error);
-          setJob(null);
-          setJobUuid(null);
-        } finally {
-          if (!cancelled) {
-            setJobFetchLoading(false);
+          } catch (geoErr) {
+            console.warn('Geocode for job map failed:', geoErr);
           }
         }
-      };
+      }
+      if (!cancelled) {
+        setLocation(mapCenter);
+        if (mapCenter && mapCenterFromGeocode) {
+          setMapKey((k) => k + 1);
+        }
+      }
+    };
 
-    fetchJob();
+    void applyPayload();
+
     return () => {
       cancelled = true;
     };
-  }, [jobId, router.isReady]);
+  }, [jobId, router.isReady, jobDetailBundle, jobDetailQueryLoading, jobDetailQueryError]);
+
+  useEffect(() => {
+    if (!job) return;
+    if (welcomeAutoOpenRef.current || !shouldAutoOpenWelcome()) return;
+    const status = job.jobStatus || job.status;
+    if (getJobStatusName(status) !== "Completed") return;
+    welcomeAutoOpenRef.current = true;
+    const timer = window.setTimeout(() => setShowPaymentWelcomeModal(true), 300);
+    return () => window.clearTimeout(timer);
+  }, [job]);
 
   const resolvePaymentQrRefNumber = useCallback((invNumber, jobNumber) => {
     const trimmed = String(invNumber || '').trim();
@@ -1669,9 +1132,8 @@ const JobDetails = () => {
       if (!supabase) return;
 
       const expiryValue = paymentDetails.expiry || null;
-      const amountValue = paymentDetails.amount !== '' && paymentDetails.amount != null
-        ? parseInt(paymentDetails.amount, 10)
-        : null;
+      const dollars = parsePaymentQrDollarInput(paymentDetails.amount);
+      const amountValue = dollars != null ? paymentQrDollarsToCents(dollars) : null;
       const invValue = String(paymentDetails.invNumber || '').trim() || null;
 
       const payload = {
@@ -1709,8 +1171,9 @@ const JobDetails = () => {
     const jobIdForUpdate = jobUuid || job?.id;
     if (!jobIdForUpdate) return;
 
-    const amountCents = paymentDetails.amount !== '' && paymentDetails.amount != null
-      ? parseInt(paymentDetails.amount, 10)
+    const dollars = parsePaymentQrDollarInput(paymentDetails.amount);
+    const amountCents = dollars != null
+      ? paymentQrDollarsToCents(dollars)
       : job?.payment_qr_amount;
 
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
@@ -1789,6 +1252,12 @@ const JobDetails = () => {
         return;
       }
 
+      const now = Date.now();
+      if (now - jobRealtimeLastFullRefetchRef.current < JOB_REALTIME_FULL_REFETCH_MIN_MS) {
+        return;
+      }
+      jobRealtimeLastFullRefetchRef.current = now;
+
       try {
         const jobData = await jobService.findHeaderById(jobUuid);
         if (jobData) {
@@ -1826,7 +1295,6 @@ const JobDetails = () => {
           filter: `id=eq.${jobUuid}`
         },
         (payload) => {
-          console.log('Job update received:', payload.eventType);
           if (jobRealtimeDebounceRef.current) {
             clearTimeout(jobRealtimeDebounceRef.current);
           }
@@ -1852,16 +1320,24 @@ const JobDetails = () => {
     }
   }, [chatMessages, isChatOpen, isChatMinimized]);
 
-  // Fetch current user info for admin messages
+  // Resolve current user for admin messages (bootstrap — no extra getUserInfo poll)
   useEffect(() => {
+    const userInfo = bootstrapUser
+      ? {
+          id: bootstrapUser.id || bootstrapUser.uid,
+          uid: bootstrapUser.uid || bootstrapUser.id,
+          workerId: bootstrapUser.workerId,
+          email: bootstrapUser.email,
+          name: bootstrapUser.name || bootstrapUser.fullName,
+        }
+      : null;
+
     const fetchCurrentUser = async () => {
       try {
-        const userInfo = await getCurrentUserInfo();
         const resolvedId = userInfo?.id || userInfo?.uid || userInfo?.workerId;
         if (resolvedId) {
           setCurrentUserId(resolvedId);
-          
-          // Fetch full_name from technicians table
+
           const supabase = getSupabaseClient();
           if (supabase) {
             const { data: user } = await supabase
@@ -1893,9 +1369,9 @@ const JobDetails = () => {
         console.warn('Error fetching current user info:', error);
       }
     };
-    
-    fetchCurrentUser();
-  }, []);
+
+    void fetchCurrentUser();
+  }, [bootstrapUser]);
 
   const resolveStatusUpdater = useCallback(async () => {
     const userInfo = await getCurrentUserInfo().catch(() => null);
@@ -1955,7 +1431,7 @@ const JobDetails = () => {
       statusUpdatedBy: resolvedId,
       actor,
     };
-  }, [currentUserActor, currentUserFullName, currentUserId]);
+  }, [currentUserActor, currentUserFullName, currentUserId, getCurrentUserInfo]);
 
   const handleSendCompletionEmail = useCallback(async () => {
     if (!jobUuid || sendingCompletionEmail) return;
@@ -2029,284 +1505,13 @@ const JobDetails = () => {
     };
   }, [showSendCompletionEmailConfirm]);
 
-  useEffect(() => {
-    const fetchData = async () => {
-      const effectiveJobId = jobUuid || job?.id;
-      if (!effectiveJobId) {
-        setIsLoadingImages(false);
-        return;
-      }
-
-      setIsLoadingImages(true);
-      try {
-        const supabase = getSupabaseClient();
-        if (!supabase) {
-          setIsLoadingImages(false);
-          setJobImages([]);
-          return;
-        }
-
-        const allMedia = await jobMediaService.getByJobId(effectiveJobId, supabase);
-        const mediaRecords = (allMedia || []).filter(
-          (r) => (r.media_type || 'image') !== 'pdf'
-        );
-
-        const userIds = [...new Set(mediaRecords.map((r) => r.created_by).filter(Boolean))];
-        let technicianMap = {};
-        if (userIds.length > 0) {
-          const { data: technicians } = await supabase
-            .from('technicians')
-            .select('user_id, full_name')
-            .in('user_id', userIds);
-          if (technicians) {
-            technicians.forEach((tech) => {
-              technicianMap[tech.user_id] = tech.full_name;
-            });
-          }
-        }
-
-        const imagesData = mediaRecords.map((record) => {
-          const urlParts = record.image_url?.split('/') || [];
-          const filename = record.filename || urlParts[urlParts.length - 1] || `file-${record.id?.substring(0, 8) || 'img'}`;
-          const createdByFullName = record.created_by
-            ? (technicianMap[record.created_by] || record.created_by_user?.username || record.created_by)
-            : null;
-          return {
-            id: record.id,
-            name: filename,
-            url: record.image_url,
-            description: record.description || '',
-            timestamp: record.created_at ? formatDateDDMMYYYYWithTime(record.created_at) : '',
-            media_type: record.media_type || 'image',
-            technician_job_id: record.technician_job_id,
-            job_id: record.job_id,
-            created_by: record.created_by,
-            created_by_full_name: createdByFullName
-          };
-        });
-        setJobImages(imagesData);
-      } catch (error) {
-        console.error('Error fetching images from job_media:', error);
-        setJobImages([]);
-      } finally {
-        setIsLoadingImages(false);
-      }
-    };
-
-    fetchData();
-  }, [jobUuid, job?.id]);
-  
-  // Fetch chat messages from job_technician_admin_messages table
+  // Real-time chat subscription (initial load via useJobChatQuery)
   useEffect(() => {
     if (!jobUuid) return;
     
     let channel = null;
     const supabase = getSupabaseClient();
     
-    const fetchChatMessages = async () => {
-      if (!supabase) {
-        console.warn('Supabase client not available, skipping chat message fetch');
-        setIsLoadingChat(false);
-        return; // Don't clear messages if supabase is not available
-      }
-      
-      // Validate jobUuid before querying
-      if (!jobUuid || typeof jobUuid !== 'string') {
-        console.warn('Invalid jobUuid, skipping chat message fetch:', jobUuid);
-        setIsLoadingChat(false);
-        return; // Don't clear messages if jobUuid is invalid
-      }
-      
-      setIsLoadingChat(true);
-      try {
-          // First, try a simple query to check if messages exist (without relationships)
-          // This helps us determine if the issue is with relationships or the query itself
-          const { data: simpleMessages, error: simpleError } = await supabase
-            .from('job_technician_admin_messages')
-            .select('id, job_id, created_at')
-            .eq('job_id', jobUuid)
-            .is('deleted_at', null)
-            .order('created_at', { ascending: true })
-            .limit(1);
-          
-          // If simple query fails, don't proceed with the full query
-          if (simpleError) {
-            console.error('Error checking for messages existence:', simpleError);
-            console.error('Error details:', {
-              message: simpleError.message,
-              details: simpleError.details,
-              hint: simpleError.hint,
-              code: simpleError.code
-            });
-            toast.error(`Failed to load messages: ${simpleError.message}`);
-            setIsLoadingChat(false);
-            return; // Don't clear existing messages on error
-          }
-          
-          // Now try the full query with relationships
-          // If this fails, we'll fall back to the simple query
-          let messages = null;
-          let error = null;
-          
-          // Use select('*') only to avoid PostgREST embed ambiguity (technicians vs users); we enrich with separate queries
-          const result = await supabase
-            .from('job_technician_admin_messages')
-            .select('*')
-            .eq('job_id', jobUuid)
-            .is('deleted_at', null)
-            .order('created_at', { ascending: true });
-          
-          messages = result.data;
-          error = result.error;
-
-          if (error) {
-            console.error('Error fetching chat messages:', error);
-            console.error('Error details:', {
-              message: error.message,
-              details: error.details,
-              hint: error.hint,
-              code: error.code
-            });
-            toast.error(`Failed to load messages: ${error.message}`);
-            setIsLoadingChat(false);
-            return; // Don't clear existing messages on error - keep what we have
-          }
-          
-          // Defensive check: only proceed if messages is explicitly an array
-          // null or undefined means the query failed, so don't clear existing messages
-          if (messages === null || messages === undefined) {
-            console.warn('Messages query returned null/undefined, preserving existing messages');
-            setIsLoadingChat(false);
-            return; // Don't clear existing messages
-          }
-          
-          console.log('Fetched messages (raw):', messages);
-          console.log('Messages type:', Array.isArray(messages) ? 'array' : typeof messages);
-          console.log('Messages length:', Array.isArray(messages) ? messages.length : 'N/A');
-          
-            // Always set messages, even if empty array (no messages is valid)
-            // If we have messages, enrich them with names
-            if (Array.isArray(messages) && messages.length > 0) {
-              // Get all unique technician_job_ids
-              const technicianJobIds = [...new Set(messages
-                .map(msg => msg.technician_job_id)
-                .filter(Boolean))];
-              
-              // Fetch technician_jobs with technicians
-              let technicianMap = {};
-              if (technicianJobIds.length > 0) {
-                try {
-                  const { data: technicianJobs, error: techJobError } = await supabase
-                    .from('technician_jobs')
-                    .select(`
-                      id,
-                      technician_id,
-                      technician:technician_id(
-                        id,
-                        full_name
-                      )
-                    `)
-                    .in('id', technicianJobIds)
-                    .is('deleted_at', null);
-                  
-                  if (!techJobError && technicianJobs) {
-                    technicianJobs.forEach(tj => {
-                      if (tj.technician?.full_name) {
-                        technicianMap[tj.id] = tj.technician.full_name;
-                      }
-                    });
-                    console.log('Technician map:', technicianMap);
-                  } else if (techJobError) {
-                    console.error('Error fetching technician jobs:', techJobError);
-                    // Continue without technician names - don't fail the whole fetch
-                  }
-                } catch (techError) {
-                  console.error('Exception fetching technician jobs:', techError);
-                  // Continue without technician names
-                }
-              }
-              
-              // Fetch admin usernames by admin_id (separate query to avoid PostgREST embed ambiguity with technicians)
-              const adminIds = [...new Set(messages.map(m => m.admin_id).filter(Boolean))];
-              let adminUserMap = {};
-              if (adminIds.length > 0) {
-                try {
-                  const { data: adminUsers, error: adminErr } = await supabase
-                    .from('users')
-                    .select('id, username')
-                    .in('id', adminIds)
-                    .is('deleted_at', null);
-                  if (!adminErr && adminUsers) {
-                    adminUsers.forEach(u => { adminUserMap[u.id] = u; });
-                  }
-                } catch (e) {
-                  console.warn('Error fetching admin users for messages:', e);
-                }
-              }
-              
-              // Enrich messages with technician and admin names
-              const enrichedMessages = messages.map(msg => {
-                const enriched = { ...msg };
-                
-                // For technician messages, ensure we have full_name
-                if (msg.sender_type === 'TECHNICIAN' && msg.technician_job_id) {
-                  if (!enriched.technician_job) {
-                    enriched.technician_job = {};
-                  }
-                  if (!enriched.technician_job.technician) {
-                    enriched.technician_job.technician = {};
-                  }
-                  
-                  if (technicianMap[msg.technician_job_id]) {
-                    enriched.technician_job.technician.full_name = technicianMap[msg.technician_job_id];
-                  } else if (enriched.technician_job?.technician?.full_name) {
-                    // keep existing
-                  }
-                }
-                
-                // For admin messages: use admin_id + adminUserMap (who actually chatted)
-                if (msg.sender_type === 'ADMIN' && msg.job_id) {
-                  if (!enriched.job) enriched.job = {};
-                  if (!enriched.job.created_by_user) enriched.job.created_by_user = {};
-                  const adminUser = msg.admin_id ? adminUserMap[msg.admin_id] : null;
-                  if (msg.admin_id && adminUser) {
-                    enriched.job.created_by_user.id = msg.admin_id;
-                    enriched.job.created_by_user.full_name = adminUser.username || 'Admin';
-                    enriched.job.created_by_user.username = adminUser.username;
-                  } else {
-                    enriched.job.created_by_user.full_name = 'Admin';
-                    enriched.job.created_by_user.username = 'Admin';
-                  }
-                }
-                
-                return enriched;
-              });
-              
-              console.log('Enriched messages:', enrichedMessages);
-              setChatMessages(enrichedMessages);
-            } else if (Array.isArray(messages) && messages.length === 0) {
-              // Explicitly got an empty array from successful query - no messages exist
-              console.log('No messages found in database for this job');
-              setChatMessages([]);
-            } else {
-              // messages is not an array or has unexpected format
-              console.warn('Unexpected messages format, preserving existing messages:', messages);
-              // Don't clear existing messages if we can't parse the result
-            }
-        } catch (error) {
-          console.error('Error fetching chat messages:', error);
-          console.error('Error stack:', error.stack);
-          // Don't clear existing messages on exception - keep what we have
-          // This ensures messages persist even if there's a temporary error
-          toast.error('Failed to refresh messages, showing cached messages');
-        } finally {
-          setIsLoadingChat(false);
-        }
-    };
-    
-    fetchChatMessages();
-    
-    // Set up real-time subscription for new messages
     if (supabase) {
       channel = supabase
         .channel(`job_messages_${jobUuid}`)
@@ -2495,81 +1700,6 @@ const JobDetails = () => {
     };
   }, [jobUuid, currentUserFullName, currentUserId]);
 
-  // Add this useEffect to fetch signatures
-  useEffect(() => {
-    const fetchSignatures = async () => {
-      if (!jobUuid) return;
-
-      try {
-        setIsLoadingSignatures(true);
-        console.log('Fetching signatures for job:', jobUuid);
-        
-        const supabase = getSupabaseClient();
-        if (!supabase) {
-          setIsLoadingSignatures(false);
-          return;
-        }
-
-        // Get technician_jobs for this job first
-        const { data: technicianJobs, error: tjError } = await supabase
-          .from('technician_jobs')
-          .select('id')
-          .eq('job_id', jobUuid)
-          .is('deleted_at', null);
-
-        if (tjError) {
-          console.error('Error fetching technician jobs:', tjError);
-          setIsLoadingSignatures(false);
-          return;
-        }
-
-        if (!technicianJobs || technicianJobs.length === 0) {
-          setIsLoadingSignatures(false);
-          return;
-        }
-
-        // Fetch signatures for all technician_jobs
-        const technicianJobIds = technicianJobs.map(tj => tj.id);
-        const { data: signaturesData, error: sigError } = await supabase
-          .from('job_signatures')
-          .select('*')
-          .in('technician_job_id', technicianJobIds);
-
-        if (sigError) {
-          console.error('Error fetching signatures:', sigError);
-        } else {
-          // Transform to match expected format (array with type property)
-          const signaturesArray = [];
-          
-          if (signaturesData && signaturesData.length > 0) {
-            // Map signatures data to array format with type property
-            signaturesData.forEach((sig, index) => {
-              // Determine type based on signature_type field or position
-              const signatureType = sig.signature_type || (index === 0 ? 'technician' : 'customer');
-              
-              signaturesArray.push({
-                id: sig.id,
-                type: signatureType,
-                signatureURL: sig.signature_image_url,
-                signedBy: sig.signed_by || sig.customer_name || 'Unknown',
-                timestamp: sig.signed_at || sig.created_at
-              });
-            });
-          }
-          
-          console.log('Fetched signatures:', signaturesArray);
-          setSignatures(signaturesArray);
-        }
-      } catch (error) {
-        console.error('Error fetching signatures:', error);
-      } finally {
-        setIsLoadingSignatures(false);
-      }
-    };
-
-    fetchSignatures();
-  }, [jobUuid]);
-
   const formatDate = (dateString) => {
     if (!dateString) return "N/A";
     const date = new Date(dateString);
@@ -2616,8 +1746,10 @@ const JobDetails = () => {
       
       const tasksToInsert = validTasks.map((task, index) => ({
         job_id: jobId,
-        task_name: task.taskName,
-        task_description: task.taskDescription || '',
+        ...sanitizeJobTaskFields({
+          taskName: task.taskName,
+          taskDescription: task.taskDescription || '',
+        }),
         task_order: (job.taskList?.length || 0) + index,
         is_required: task.isPriority || false
       }));
@@ -3502,6 +2634,7 @@ const JobDetails = () => {
           });
         }
         toast.success('Message sent!');
+        void queryClient.invalidateQueries(queryKeys.jobChat(jobIdForApi));
       }
     } catch (error) {
       console.error('Error sending message:', error);
@@ -3886,6 +3019,9 @@ const JobDetails = () => {
       );
       setShowImageUploadModal(false);
       resetPendingUploads();
+      invalidateJobDetailSatellites(queryClient, jobUuid || job?.id || jobId, {
+        customerCode: job?.customerCode,
+      });
     } catch (error) {
       console.error("Error uploading job images:", error);
       toast.error("Failed to upload images");
@@ -3980,6 +3116,9 @@ const JobDetails = () => {
       });
 
       toast.success('Image deleted successfully');
+      invalidateJobDetailSatellites(queryClient, jobUuid || job?.id || jobId, {
+        customerCode: job?.customerCode,
+      });
     } catch (error) {
       console.error('Error deleting image:', error);
       toast.error(`Failed to delete image: ${error.message || 'Unknown error'}`);
@@ -4867,38 +4006,44 @@ const JobDetails = () => {
     );
   };
 
+  const handleDescriptionEditorChange = useCallback((html) => {
+    editedDescriptionRef.current = html;
+    setEditedDescription(html);
+  }, []);
+
   const handleEditDescription = async () => {
     try {
       setIsSavingDescription(true);
-      const supabase = getSupabaseClient();
-      if (!supabase) {
-        throw new Error('Supabase client not available');
+
+      const persistId = jobUuid || job?.id;
+      if (!persistId) {
+        throw new Error('Job id not available');
       }
 
       const previousDescription = job?.jobDescription || job?.description || '';
+      const previousNormalized = DOMPurify.sanitize(
+        normalizeRichTextHtml(previousDescription || ''),
+        { USE_PROFILES: { html: true } }
+      );
+      // Prefer the ref so the last Quill keystroke is not lost to a stale render.
       const sanitizedDescription = DOMPurify.sanitize(
-        normalizeRichTextHtml(editedDescription || ''),
-        {
-        USE_PROFILES: { html: true },
-      });
+        normalizeRichTextHtml(editedDescriptionRef.current || editedDescription || ''),
+        { USE_PROFILES: { html: true } }
+      );
       const updatedAt = new Date().toISOString();
 
-      if (previousDescription === sanitizedDescription) {
+      if (previousNormalized === sanitizedDescription) {
+        isEditingDescriptionRef.current = false;
         setIsEditingDescription(false);
+        toast('No changes to save');
         return;
       }
 
-      const { error } = await supabase
-        .from('jobs')
-        .update({
-          description: sanitizedDescription,
-          updated_at: updatedAt,
-        })
-        .eq('id', jobUuid || job?.id);
-
-      if (error) {
-        throw error;
-      }
+      // jobService.update uses .select().single() so a no-op/RLS miss throws.
+      await jobService.update(persistId, {
+        description: sanitizedDescription,
+        updated_at: updatedAt,
+      });
 
       setJob((prevJob) => ({
         ...prevJob,
@@ -4907,14 +4052,33 @@ const JobDetails = () => {
         updatedAt,
         updated_at: updatedAt,
       }));
+      editedDescriptionRef.current = sanitizedDescription;
       setEditedDescription(sanitizedDescription);
+      isEditingDescriptionRef.current = false;
       setIsEditingDescription(false);
+
+      // Patch React Query cache for the route key so applyPayload cannot restore stale HTML.
+      const routeDetailKey = queryKeys.jobDetail(jobId);
+      queryClient.setQueryData(routeDetailKey, (old) => {
+        if (!old?.job) return old;
+        return {
+          ...old,
+          job: {
+            ...old.job,
+            jobDescription: sanitizedDescription,
+            description: sanitizedDescription,
+            updatedAt,
+            updated_at: updatedAt,
+          },
+        };
+      });
+
       void clientAuditLog({
         action: 'JOB_UPDATE',
         category: 'job',
         entityType: 'job',
-        entityId: jobUuid || job?.id,
-        entityLabel: job?.job_number || jobUuid || job?.id,
+        entityId: persistId,
+        entityLabel: job?.job_number || job?.jobNo || persistId,
         description: 'Job description updated',
         changes: {
           description: {
@@ -4922,6 +4086,19 @@ const JobDetails = () => {
             after: sanitizedDescription || null,
           },
         },
+      });
+
+      const aliasIds = [jobUuid, job?.id, job?.job_number, job?.jobNo].filter(
+        (id) => id && id !== jobId
+      );
+      patchJobsListDescriptionCaches(queryClient, {
+        matchIds: [persistId, jobUuid, job?.id, job?.job_number, job?.jobNo, jobId],
+        description: sanitizedDescription,
+      });
+      await invalidateJobCachesAfterMutation(queryClient, jobId || persistId, {
+        aliasIds,
+        customerCode: job?.customerCode,
+        customerId: job?.customerId || job?.customer_id,
       });
       toast.success("Job description updated successfully!");
     } catch (error) {
@@ -4933,15 +4110,21 @@ const JobDetails = () => {
   };
 
   const startDescriptionEdit = (initialHtml = "") => {
-    setEditedDescription(normalizeRichTextHtml(initialHtml));
+    const normalized = normalizeRichTextHtml(initialHtml);
+    editedDescriptionRef.current = normalized;
+    setEditedDescription(normalized);
     setDescriptionEditorKey((prev) => prev + 1);
+    isEditingDescriptionRef.current = true;
     setIsEditingDescription(true);
   };
 
   const cancelDescriptionEdit = () => {
-    setEditedDescription(
-      normalizeRichTextHtml(job?.jobDescription || job?.description || ''),
+    const normalized = normalizeRichTextHtml(
+      job?.jobDescription || job?.description || ''
     );
+    editedDescriptionRef.current = normalized;
+    setEditedDescription(normalized);
+    isEditingDescriptionRef.current = false;
     setIsEditingDescription(false);
   };
 
@@ -5209,7 +4392,7 @@ const JobDetails = () => {
               <ReactQuillEditor
                 key={descriptionEditorKey}
                 initialValue={editedDescription}
-                onDescriptionChange={setEditedDescription}
+                onDescriptionChange={handleDescriptionEditorChange}
               />
             </div>
             <div className={styles.editActions}>
@@ -5303,49 +4486,6 @@ const JobDetails = () => {
     );
   }
 
-  async function getCurrentUserInfo() {
-    try {
-      // Try to get user info from API endpoint first (more reliable)
-      const response = await fetch("/api/getUserInfo", {
-        method: 'GET',
-        credentials: 'include',
-        cache: 'no-store',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (response.ok) {
-        const responseData = await response.json();
-        const { user } = responseData;
-        if (user) {
-          return {
-            email: user.email || user.username || Cookies.get('email'),
-            name: user.name || user.fullName || user.full_name || user.email || user.username || Cookies.get('email'),
-            workerId: user.workerId || user.id || Cookies.get('workerId'),
-            uid: user.uid || user.id || Cookies.get('uid'),
-            id: user.id || user.uid || user.workerId || Cookies.get('uid')
-          };
-        }
-      }
-    } catch (error) {
-      console.warn('Failed to fetch user info from API:', error);
-    }
-
-    // Fallback to cookies
-    const email = Cookies.get('email');
-    const workerId = Cookies.get('workerId');
-    const uid = Cookies.get('uid');
-    
-    return {
-      email: email || 'unknown@email.com',
-      name: email || 'unknown@email.com',
-      workerId: workerId || uid || 'UNKNOWN',
-      uid: uid || workerId,
-      id: uid || workerId
-    };
-  }
-
   const handleCreateFollowUp = async (followUpData) => {
     try {
       const supabase = getSupabaseClient();
@@ -5354,88 +4494,32 @@ const JobDetails = () => {
         throw new Error('Supabase client not available');
       }
 
-      // Get user_id - use API endpoint first (most reliable, server-side)
+      // Resolve user from dashboard bootstrap (no extra getUserInfo request)
       let userId = null;
       let user = null;
 
-      // Method 0: Use API endpoint to get user info (server-side, bypasses RLS)
-      try {
-        const response = await fetch("/api/getUserInfo", {
-          method: 'GET',
-          credentials: 'include',
-          cache: 'no-store',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
+      const bootstrapInfo = resolveCurrentUserInfo(bootstrapUserRef.current);
+      const potentialUserId = bootstrapInfo.uid || bootstrapInfo.workerId || bootstrapInfo.id;
 
-        if (response.ok) {
-          const responseData = await response.json();
-          if (responseData.success && responseData.user) {
-            // The API returns user.uid or user.workerId - try both
-            const potentialUserId = responseData.user.uid || responseData.user.workerId || responseData.user.id;
-            console.log('✅ Found user via API endpoint, trying ID:', potentialUserId);
-            
-            if (potentialUserId) {
-              // Verify the user exists in database by fetching full details
-              const { data: userData, error: verifyError } = await supabase
-                .from('users')
-                .select('id, username, role')
-                .eq('id', potentialUserId)
-                .is('deleted_at', null)
-                .maybeSingle();
-              
-              if (userData) {
-                user = userData;
-                userId = userData.id;
-                console.log('✅ Verified user in database:', userId);
-              } else {
-                console.warn('⚠️ User ID from API not found in database, using API ID directly:', verifyError);
-                // If verification fails but API returned a valid ID, use it anyway
-                // The API is server-side and more reliable than client-side queries
-                if (potentialUserId && potentialUserId !== 'UNKNOWN') {
-                  userId = potentialUserId;
-                  console.log('✅ Using user ID from API response (database verification failed):', userId);
-                } else {
-                  // Try workerId if uid didn't work
-                  if (responseData.user.workerId && responseData.user.workerId !== potentialUserId) {
-                    const { data: userByWorkerId, error: workerError } = await supabase
-                      .from('users')
-                      .select('id, username, role')
-                      .eq('id', responseData.user.workerId)
-                      .is('deleted_at', null)
-                      .maybeSingle();
-                    
-                    if (userByWorkerId) {
-                      user = userByWorkerId;
-                      userId = userByWorkerId.id;
-                      console.log('✅ Found user by workerId from API:', userId);
-                    } else {
-                      // Use workerId from API if database lookup fails
-                      if (responseData.user.workerId && responseData.user.workerId !== 'UNKNOWN') {
-                        userId = responseData.user.workerId;
-                        console.log('✅ Using workerId from API response (database verification failed):', userId);
-                      } else {
-                        console.warn('⚠️ WorkerId from API also not found, will try other methods');
-                        userId = null; // Reset to try other methods
-                      }
-                    }
-                  } else {
-                    userId = null; // Reset to try other methods
-                  }
-                }
-              }
-            }
-          }
+      if (potentialUserId) {
+        const { data: userData, error: verifyError } = await supabase
+          .from('users')
+          .select('id, username, role')
+          .eq('id', potentialUserId)
+          .is('deleted_at', null)
+          .maybeSingle();
+
+        if (userData) {
+          user = userData;
+          userId = userData.id;
+        } else if (verifyError) {
+          userId = potentialUserId;
         } else {
-          const errorData = await response.json().catch(() => ({}));
-          console.warn('⚠️ API endpoint returned error:', response.status, errorData);
+          userId = potentialUserId;
         }
-      } catch (apiError) {
-        console.warn('⚠️ Failed to fetch user from API endpoint:', apiError);
       }
 
-      // Method 1: Try to get user from Supabase auth session (if API didn't work)
+      // Method 1: Try to get user from Supabase auth session (if bootstrap did not resolve)
       if (!userId) {
         try {
           const { data: { session }, error: sessionError } = await supabase.auth.getSession();
@@ -6714,7 +5798,7 @@ const JobDetails = () => {
                                 <div>
                                   <div className="d-flex align-items-center mb-2">
                                     <GeoAltFill className="me-2 text-primary" size={14} />
-                                    <span className="fw-bold text-primary text-uppercase">
+                                    <span className="fw-bold text-primary">
                                       {displayAddress}
                                     </span>
                                     <Badge bg="primary" className="ms-2">
@@ -7114,6 +6198,14 @@ const JobDetails = () => {
                       Payment Confirmation
                     </h6>
                     <div className="ms-auto d-flex align-items-center gap-3">
+                      <Button
+                        variant="link"
+                        size="sm"
+                        className="p-0 text-decoration-none"
+                        onClick={() => setShowPaymentWelcomeModal(true)}
+                      >
+                        How it works
+                      </Button>
                       <Badge
                         bg={
                           paymentStatus === 'paid'
@@ -7242,7 +6334,7 @@ const JobDetails = () => {
                           }}
                         />
                         <Form.Text className="text-muted">
-                          Optional. Default: job end date. Autosaved before generating QR.
+                          Optional. Default: 15 days from today. Autosaved before generating QR.
                         </Form.Text>
                       </Form.Group>
 
@@ -7269,10 +6361,18 @@ const JobDetails = () => {
                         <Form.Label>Amount</Form.Label>
                         <Form.Control
                           type="number"
+                          step="0.01"
+                          min="0"
                           placeholder="Enter amount"
                           value={paymentDetails.amount}
                           onChange={(e) => setPaymentDetails({ ...paymentDetails, amount: e.target.value })}
                         />
+                         <Form.Text className="text-muted d-block mt-1">
+                         Note: if you want to set a fixed amount enter the Amount. 
+                         </Form.Text>
+                         <Form.Text className="text-muted">
+                         Default: 0. Leave blank to enter amount inside PayNow App.
+                         </Form.Text>
                       </Form.Group>
 
                       {/* <Form.Group className="mb-3">
@@ -7303,10 +6403,12 @@ const JobDetails = () => {
                             // Dynamic import for PaynowQR
                             const PaynowQRModule = await import('paynowqr');
                             const PaynowQRClass = PaynowQRModule.default || PaynowQRModule;
-                            const expiryValue = paymentDetails.expiry || (job?.scheduled_end ? new Date(job.scheduled_end).toISOString().slice(0, 10).replace(/-/g, '') : undefined);
+                            const expiryValue = paymentDetails.expiry || getDefaultPaymentQrExpiryYmd();
+                            const qrDollars = parsePaymentQrDollarInput(paymentDetails.amount);
+                            const qrCents = qrDollars != null ? paymentQrDollarsToCents(qrDollars) : null;
                             const qrcode = new PaynowQRClass({
                               uen: paymentDetails.uen,
-                              amount: paymentDetails.amount ? parseInt(paymentDetails.amount) : undefined,
+                              amount: qrCents != null ? paymentQrCentsToPaynowAmount(qrCents) : undefined,
                               editable: paymentDetails.editable,
                               expiry: expiryValue,
                               refNumber: qrRefNumber || undefined,
@@ -7323,7 +6425,7 @@ const JobDetails = () => {
                                   .from('jobs')
                                   .update({
                                     payment_qr_uen: paymentDetails.uen,
-                                    payment_qr_amount: paymentDetails.amount ? parseInt(paymentDetails.amount) : null,
+                                    payment_qr_amount: qrCents,
                                     payment_qr_editable: paymentDetails.editable,
                                     payment_qr_expiry: expiryValue || null,
                                     payment_qr_inv_number: invNumberToSave,
@@ -7430,6 +6532,11 @@ const JobDetails = () => {
                     </Button>
                   </Modal.Footer>
                 </Modal>
+
+                <PaymentConfirmationWelcomeModal
+                  show={showPaymentWelcomeModal}
+                  onHide={() => setShowPaymentWelcomeModal(false)}
+                />
 
 
                    {/* Task List Section */}

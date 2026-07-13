@@ -13,6 +13,8 @@ import {
   AUDIT_STATUS,
   buildChanges,
 } from '../../../../lib/services/auditLog';
+import { invalidateListCache } from '../../../../lib/supabase/listQueryHelpers';
+import { PORTAL_LIST_CACHE_PREFIX } from '../../../../lib/leads/portalListCache';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Credentials', true);
@@ -73,6 +75,7 @@ export default async function handler(req, res) {
 
     try {
       const customer = await customerService.update(id, updates, supabase);
+      invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
       await writeAuditLogFromRequest(req, {
         action: AUDIT_ACTIONS.CUSTOMER_UPDATE,
         category: AUDIT_CATEGORIES.CUSTOMER,
@@ -107,6 +110,7 @@ export default async function handler(req, res) {
   if (req.method === 'DELETE') {
     try {
       await customerService.delete(id, supabase);
+      invalidateListCache(PORTAL_LIST_CACHE_PREFIX);
       await writeAuditLogFromRequest(req, {
         action: AUDIT_ACTIONS.CUSTOMER_DELETE,
         category: AUDIT_CATEGORIES.CUSTOMER,

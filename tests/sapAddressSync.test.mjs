@@ -8,7 +8,10 @@ import {
   shouldPreferExistingLocationField,
 } from '../lib/integrations/sapAddressLocationHelpers.js';
 import { computeAddressChangesForEntity } from '../lib/integrations/sapDeltaSyncAddressPreview.js';
-import { formatPortalBpAddressSubtitle } from '../lib/utils/formatPortalBpAddress.js';
+import {
+  formatPortalBpAddressSubtitle,
+  sanitizeAddressPart,
+} from '../lib/utils/formatPortalBpAddress.js';
 
 // HILLION RESIDENCES — unit in AddressName, empty Building
 const hillionSap = {
@@ -101,6 +104,162 @@ const sapShipSuffix = {
 };
 assert.equal(findExistingLocationRow([portalShipBase], sapShipSuffix), portalShipBase);
 
+// content+type match — portal deriveSiteId vs SAP AddressName (same street)
+const portalDerivedBill = {
+  id: 'loc-bill-derived',
+  site_id: '123#01',
+  address_type: 'bo_BillTo',
+  street: '1 HILLTOPS ROAD',
+  building: '#01-01',
+  address: '1 HILLTOPS ROAD, #01-01, Singapore',
+  zip_code: '123456',
+  city: 'SG',
+};
+const sapBillNamed = {
+  site_id: 'HILLTOPS',
+  address_type: 'bo_BillTo',
+  street: '1 HILLTOPS ROAD',
+  building: '#01-01',
+  address: '1 HILLTOPS ROAD, #01-01, Singapore, 123456',
+  zip_code: '123456',
+  city: 'SG',
+};
+assert.equal(findExistingLocationRow([portalDerivedBill], sapBillNamed), portalDerivedBill);
+
+// same site_id for bill+ship (no invented " - 1") still matches by type
+const portalShipSameSite = {
+  id: 'loc-ship-same',
+  site_id: 'HILLTOPS',
+  address_type: 'bo_ShipTo',
+  street: '1 HILLTOPS ROAD',
+  building: '#01-01',
+  address: '1 HILLTOPS ROAD, #01-01, Singapore',
+  zip_code: '123456',
+  city: 'SG',
+};
+const sapShipNamed = {
+  site_id: 'HILLTOPS',
+  address_type: 'bo_ShipTo',
+  street: '1 HILLTOPS ROAD',
+  building: '#01-01',
+  address: '1 HILLTOPS ROAD, #01-01, Singapore, 123456',
+  zip_code: '123456',
+  city: 'SG',
+};
+assert.equal(findExistingLocationRow([portalShipSameSite], sapShipNamed), portalShipSameSite);
+assert.equal(
+  findExistingLocationRow([portalDerivedBill, portalShipSameSite], sapBillNamed),
+  portalDerivedBill
+);
+
+// masterlist zip-tail site_id matches SAP AddressName (no second insert)
+const portalZipTailBill = {
+  id: 'loc-zip-tail',
+  site_id: 'A2 (SERVER ROOM), 403032',
+  address_type: 'bo_BillTo',
+  street: '202 BEDOK SOUTH AVE 1',
+  building: 'A2 (SERVER ROOM)',
+  address: '202 BEDOK SOUTH AVE 1, A2 (SERVER ROOM), Singapore, 403032',
+  zip_code: '403032',
+  city: 'SG',
+};
+const sapServerRoomBill = {
+  site_id: 'A2 (SERVER ROOM)',
+  address_type: 'bo_BillTo',
+  street: '202 BEDOK SOUTH AVE 1',
+  building: 'A2 (SERVER ROOM)',
+  address: '202 BEDOK SOUTH AVE 1, A2 (SERVER ROOM), Singapore, 403032',
+  zip_code: '403032',
+  city: 'SG',
+};
+assert.equal(findExistingLocationRow([portalZipTailBill], sapServerRoomBill), portalZipTailBill);
+
+// middot postal tail also matches SAP AddressName
+const portalMiddotTailBill = {
+  id: 'loc-middot-tail',
+  site_id: 'A2 (SERVER ROOM) · 403032',
+  address_type: 'bo_BillTo',
+  street: '202 BEDOK SOUTH AVE 1',
+  building: 'A2 (SERVER ROOM)',
+  zip_code: '403032',
+};
+assert.equal(findExistingLocationRow([portalMiddotTailBill], sapServerRoomBill), portalMiddotTailBill);
+
+// unrelated nick with different content stays unmatched (ghost cleanup can remove when safe)
+const portalUnrelatedNick = {
+  id: 'loc-blr30',
+  site_id: 'BLR 30 (HQ CONTRACT), 403032',
+  address_type: 'bo_BillTo',
+  street: '99 UNRELATED ROAD',
+  building: 'BLR 30',
+  address: '99 UNRELATED ROAD, BLR 30, Singapore, 403032',
+  zip_code: '403032',
+  city: 'SG',
+};
+const sapStreetOnlyBill = {
+  site_id: '202 BEDOK SOUTH AVE 1',
+  address_type: 'bo_BillTo',
+  street: '202 BEDOK SOUTH AVE 1',
+  building: null,
+  address: '202 BEDOK SOUTH AVE 1, Singapore, 403032',
+  zip_code: '403032',
+  city: 'SG',
+};
+assert.equal(findExistingLocationRow([portalUnrelatedNick], sapStreetOnlyBill), null);
+
+// preview — zip-tail twin shows update/unchanged (not add); unrelated portal-only shows remove
+const zipTailPreviewExisting = [
+  {
+    id: 'zip-bill',
+    site_id: 'A2 (SERVER ROOM), 403032',
+    address_type: 'bo_BillTo',
+    address: '202 BEDOK SOUTH AVE 1, A2 (SERVER ROOM), Singapore, 403032',
+    street: '202 BEDOK SOUTH AVE 1',
+    building: 'A2 (SERVER ROOM)',
+    block: null,
+    city: null,
+    country_name: 'Singapore',
+    zip_code: '403032',
+  },
+  {
+    id: 'ghost-bill',
+    site_id: 'BLR 30 (HQ CONTRACT), 403032',
+    address_type: 'bo_BillTo',
+    address: '99 UNRELATED ROAD, BLR 30, Singapore, 403032',
+    street: '99 UNRELATED ROAD',
+    building: 'BLR 30',
+    block: null,
+    city: null,
+    country_name: 'Singapore',
+    zip_code: '403032',
+  },
+];
+const zipTailPreviewSap = [
+  {
+    AddressName: 'A2 (SERVER ROOM)',
+    AddressType: 'bo_BillTo',
+    Street: '202 BEDOK SOUTH AVE 1',
+    Building: 'A2 (SERVER ROOM)',
+    ZipCode: '403032',
+    Country: 'SG',
+  },
+];
+const zipTailPreviewChanges = computeAddressChangesForEntity(
+  zipTailPreviewExisting,
+  zipTailPreviewSap
+);
+const zipTailUpdate = zipTailPreviewChanges.find((c) =>
+  String(c.label || '').includes('A2 (SERVER ROOM)')
+);
+assert.ok(zipTailUpdate);
+assert.ok(zipTailUpdate.action === 'unchanged' || zipTailUpdate.action === 'update');
+assert.notEqual(zipTailUpdate.action, 'add');
+const ghostRemove = zipTailPreviewChanges.find((c) =>
+  String(c.label || '').includes('BLR 30')
+);
+assert.ok(ghostRemove);
+assert.equal(ghostRemove.action, 'remove');
+
 // display fallback for truncated row shape
 const truncatedUi = {
   AddressName: '#16-24 HILLION RESIDENCES',
@@ -169,5 +328,90 @@ assert.equal(shipAdd.before, null);
 const shipRemove = previewChanges.find((c) => c.label.startsWith('OLD SHIP SITE'));
 assert.equal(shipRemove.action, 'remove');
 assert.equal(shipRemove.after, null);
+
+// HTML ampersand entities in address parts (SAP/portal)
+assert.equal(sanitizeAddressPart('POLLEN &amp; BLEU'), 'POLLEN & BLEU');
+assert.equal(sanitizeAddressPart('POLLEN &AMP; BLEU'), 'POLLEN & BLEU');
+assert.equal(sanitizeAddressPart('POLLEN &#38; BLEU'), 'POLLEN & BLEU');
+assert.equal(sanitizeAddressPart('POLLEN &#x26; BLEU'), 'POLLEN & BLEU');
+
+// Objects must never stringify to "[object Object]" (jobsheet PDF regression)
+assert.equal(sanitizeAddressPart({ street: '1 THE KNOLLS' }), '');
+assert.equal(sanitizeAddressPart(['1 THE KNOLLS']), '');
+assert.equal(sanitizeAddressPart('[object Object]'), '');
+assert.equal(sanitizeAddressPart(42), '42');
+assert.equal(sanitizeAddressPart(true), '');
+
+const { formatLocationRecordAsSingleLine } = await import('../lib/jobs/resolveJobDisplayAddress.js');
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    address: { streetNo: { n: 1 }, streetAddress: '1 THE KNOLLS', city: 'SENTOSA ISLAND', country: 'Singapore', postalCode: '098297' },
+  }),
+  '1 THE KNOLLS, SENTOSA ISLAND, Singapore, 098297'
+);
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    street: '1 THE KNOLLS',
+    building: { name: 'Capella' },
+    city: 'SENTOSA ISLAND',
+    country: 'SG',
+    zip_code: '098297',
+  }),
+  '1 THE KNOLLS, SENTOSA ISLAND, Singapore, 098297'
+);
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    street: {},
+    address: { Street: '1 THE KNOLLS', City: 'SENTOSA ISLAND', Country: 'SG', ZipCode: '098297' },
+  }),
+  '1 THE KNOLLS, SENTOSA ISLAND, Singapore, 098297'
+);
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    street: {},
+    address: '1 THE KNOLLS',
+    city: 'SENTOSA ISLAND',
+    country: 'SG',
+    zip_code: '098297',
+  }),
+  '1 THE KNOLLS, SENTOSA ISLAND, Singapore, 098297'
+);
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    address: { Street: '1 THE KNOLLS', City: 'SENTOSA ISLAND', Country: 'SG', ZipCode: '098297' },
+    city: 'SENTOSA ISLAND',
+    country: 'SG',
+    zip_code: '098297',
+  }),
+  '1 THE KNOLLS, SENTOSA ISLAND, Singapore, 098297'
+);
+
+// Duplicate-address regressions: composed building/block must not append a second full line
+const CAPELLA_LINE = '1 THE KNOLLS, SENTOSA ISLAND, Singapore, 098297';
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    street: CAPELLA_LINE,
+    building: CAPELLA_LINE,
+  }),
+  CAPELLA_LINE
+);
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    street: CAPELLA_LINE,
+    block: CAPELLA_LINE,
+  }),
+  CAPELLA_LINE
+);
+// Capella-like: short street + richer portal address + city/country/zip → one line
+assert.equal(
+  formatLocationRecordAsSingleLine({
+    street: '1 THE KNOLLS',
+    address: CAPELLA_LINE,
+    city: 'SENTOSA ISLAND',
+    country: 'Singapore',
+    zip_code: '098297',
+  }),
+  CAPELLA_LINE
+);
 
 console.log('sapAddressSync tests passed');

@@ -1,6 +1,7 @@
 // pages/api/getJobStatus.js
 // Fetches job statuses from SAP U_API_JOB_STATUS (same pattern as getJobCategory).
 import { getSupabaseAdmin } from '../../lib/supabase/server';
+import { invalidateReferenceCaches } from '../../lib/supabase/referenceCacheKeys';
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
@@ -34,6 +35,8 @@ async function cacheSapStatusSnapshot(jobStatuses) {
 
     if (error) {
       console.warn('getJobStatus sapSnapshot cache failed:', error.message);
+    } else {
+      invalidateReferenceCaches();
     }
   } catch (e) {
     console.warn('getJobStatus sapSnapshot cache failed:', e?.message);

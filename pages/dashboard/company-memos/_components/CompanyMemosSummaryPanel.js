@@ -2,6 +2,13 @@ import React, { useMemo } from 'react';
 import Link from 'next/link';
 import { ListGroup, Badge, Spinner } from 'react-bootstrap';
 import { useQuery } from 'react-query';
+import {
+  COMPANY_MEMOS_LIST_STALE_MS,
+  COMPANY_MEMOS_QUERY_OPTIONS,
+  COMPANY_MEMOS_SUMMARY_LIST_PARAMS,
+  companyMemosListQueryKey,
+  fetchCompanyMemosListSummary,
+} from '../../../../lib/companyMemos/companyMemosQueryKeys';
 
 function priorityVariant(p) {
   if (p === 'high') return 'danger';
@@ -10,24 +17,20 @@ function priorityVariant(p) {
 }
 
 /**
- * Sidebar list of memos for admin edit context (shares React Query cache with full list page).
+ * Sidebar list of memos for admin edit context (shares React Query cache with matching list params).
  * @param {{ currentId?: string, enabled: boolean }} props
  */
 export default function CompanyMemosSummaryPanel({ currentId, enabled }) {
+  const summaryQueryKey = companyMemosListQueryKey(COMPANY_MEMOS_SUMMARY_LIST_PARAMS);
+
   const { data: payload, isLoading } = useQuery(
-    ['company-memos', 'admin', 'list', '', 'all', 'all'],
-    async () => {
-      const params = new URLSearchParams({ page: '1', limit: '100' });
-      const res = await fetch(`/api/company-memos/list-summary?${params.toString()}`, {
-        credentials: 'same-origin',
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || `Failed to load memos (${res.status})`);
-      }
-      return res.json();
-    },
-    { enabled, staleTime: 30 * 1000 }
+    summaryQueryKey,
+    () => fetchCompanyMemosListSummary(COMPANY_MEMOS_SUMMARY_LIST_PARAMS),
+    {
+      enabled,
+      staleTime: COMPANY_MEMOS_LIST_STALE_MS,
+      ...COMPANY_MEMOS_QUERY_OPTIONS,
+    }
   );
 
   const rows = payload?.memos || [];

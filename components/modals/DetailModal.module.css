@@ -14,12 +14,14 @@
 }
 
 .modalContent {
+  display: flex;
+  flex-direction: column;
   background: #fff;
   border-radius: 12px;
   max-width: 480px;
   width: 100%;
   max-height: 90vh;
-  overflow-y: auto;
+  overflow: hidden;
   box-shadow: 0 25px 50px rgba(0, 0, 0, 0.25);
 }
 
@@ -63,6 +65,9 @@
 
 .modalBody {
   padding: 20px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .modalFooter {
@@ -71,6 +76,70 @@
   gap: 12px;
   padding: 16px 20px;
   border-top: 1px solid #e5e7eb;
+  flex-shrink: 0;
+}
+
+.footerStack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+
+.footerStatus {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.footerActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+@media (max-width: 640px) {
+  .modalOverlay {
+    padding: 12px;
+    align-items: center;
+  }
+
+  .modalContent {
+    max-height: 92vh;
+  }
+
+  .modalHeader,
+  .modalBody,
+  .modalFooter {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}
+
+@media (max-width: 576px) {
+  .cardRow {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .cardLabel {
+    width: auto;
+  }
+
+  .footerActions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .footerActions .actionBtn,
+  .footerActions button,
+  .footerActions a {
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 .detailRow {

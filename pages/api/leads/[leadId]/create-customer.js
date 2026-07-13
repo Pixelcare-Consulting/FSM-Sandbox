@@ -18,6 +18,7 @@ import { verifyCustomerSapStatus } from '../../../../lib/customers/verifySapCust
 import { syncCustomerToSapCore } from '../../../../lib/customers/syncCustomerToSapCore';
 import { ensurePortalCustomerAddressFromLead } from '../../../../lib/customers/ensurePortalCustomerAddressFromLead';
 import { getEffectiveLeadName } from '../../../../lib/leads/getEffectiveLeadName';
+import { resolveLeadOrPortalCustomer } from '../../../../lib/leads/resolveLeadOrPortalCustomer';
 
 function buildSapApiPayload(syncResult) {
   if (!syncResult) return { success: false };
@@ -94,11 +95,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    const lead = await leadService.findById(leadId);
-
-    if (!lead) {
+    const resolved = await resolveLeadOrPortalCustomer(leadId);
+    if (!resolved) {
       return res.status(404).json({ error: 'Lead not found' });
     }
+
+    const { lead, customer: resolvedCustomer, hasLinkedLead } = resolved;
+    const realLeadId = hasLinkedLead ? lead.id : null;
 
     const sessionCookies = sapService.getSessionCookies(req);
     if (!sessionCookies) {
@@ -111,14 +114,18 @@ export default async function handler(req, res) {
 
     if (lead.customer_id) {
       const supabase = getSupabaseAdmin();
-      const { data: existingCustomerRow } = await supabase
-        .from('customer')
-        .select(
-          'id, customer_code, customer_name, email, phone_number, synced_to_sap_at, sap_card_code, sap_sync_environment'
-        )
-        .eq('id', lead.customer_id)
-        .is('deleted_at', null)
-        .maybeSingle();
+      let existingCustomerRow = resolvedCustomer;
+      if (!existingCustomerRow && lead.customer_id) {
+        const { data } = await supabase
+          .from('customer')
+          .select(
+            'id, customer_code, customer_name, email, phone_number, synced_to_sap_at, sap_card_code, sap_sync_environment'
+          )
+          .eq('id', lead.customer_id)
+          .is('deleted_at', null)
+          .maybeSingle();
+        existingCustomerRow = data;
+      }
 
       if (existingCustomerRow && lead.status === 'CONVERTED' && existingCustomerRow.synced_to_sap_at) {
         const sapStatus = await verifyCustomerSapStatus(existingCustomerRow, sessionCookies, { supabase });
@@ -164,8 +171,10 @@ export default async function handler(req, res) {
           }
 
           const sapCardCode = syncResult.sapCardCode;
-          await leadService.convertToCustomer(leadId, lead.customer_id);
-          const updatedLead = await leadService.findById(leadId);
+          if (realLeadId) {
+            await leadService.convertToCustomer(realLeadId, lead.customer_id);
+          }
+          const updatedLead = realLeadId ? await leadService.findById(realLeadId) : lead;
 
           await writeAuditLogFromRequest(req, {
             action: AUDIT_ACTIONS.LEAD_CONVERT,
@@ -307,9 +316,9 @@ export default async function handler(req, res) {
       });
     }
 
-    if (!lead.customer_id) {
-      await leadService.convertToCustomer(leadId, customerId);
-      console.log(`✅ Linked lead ${leadId} to customer ${customerId}`);
+    if (!lead.customer_id && realLeadId) {
+      await leadService.convertToCustomer(realLeadId, customerId);
+      console.log(`✅ Linked lead ${realLeadId} to customer ${customerId}`);
       await writeAuditLogFromRequest(req, {
         action: AUDIT_ACTIONS.LEAD_CONVERT,
         category: AUDIT_CATEGORIES.LEAD,
@@ -322,7 +331,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const updatedLead = await leadService.findById(leadId);
+    const updatedLead = realLeadId ? await leadService.findById(realLeadId) : lead;
     try {
       await ensurePortalCustomerAddressFromLead({
         supabase,

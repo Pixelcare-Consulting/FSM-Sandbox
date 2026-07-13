@@ -1,5 +1,5 @@
 /**
- * Validates session on dashboard mount and polls every 30s.
+ * Validates session on dashboard mount and polls every 60s (leader tab only).
  * Redirects to sign-in only after confirmed session invalidation (not transient 401s).
  */
 import { useEffect, useRef, useCallback } from 'react';
@@ -9,11 +9,18 @@ import {
   shouldLogoutOnAuthError,
   coordinatedSessionLogout,
   subscribeToSessionLogout,
+  subscribeToSessionPoll,
   isLogoutInProgress,
   isWithinPostLoginGrace,
+  tryAcquireSessionProbe,
+  tryBecomeSessionPollLeader,
+  refreshSessionPollLeaderHeartbeat,
+  releaseSessionPollLeader,
+  broadcastSessionPollOk,
+  broadcastSessionPollExpired,
 } from '../lib/auth/sessionTabSync';
 
-const POLL_INTERVAL_MS = 30 * 1000;
+const POLL_INTERVAL_MS = 60 * 1000;
 
 function fetchUserInfo() {
   return fetch('/api/getUserInfo', {
@@ -24,9 +31,15 @@ function fetchUserInfo() {
   });
 }
 
+function isDocumentVisible() {
+  return typeof document === 'undefined' || document.visibilityState === 'visible';
+}
+
 export function useSessionCheck() {
   const router = useRouter();
   const redirecting = useRef(false);
+  const pathnameRef = useRef(router.pathname);
+  pathnameRef.current = router.pathname;
 
   const redirectToSignIn = useCallback(
     (message) => {
@@ -36,57 +49,101 @@ export function useSessionCheck() {
         '/sign-in?toast=' + encodeURIComponent(message || 'Session expired. Please log in again.')
       );
     },
-    [router]
+    [router.replace]
   );
 
-  const handleAuthFailure = useCallback(
-    async (errData) => {
-      if (redirecting.current || isLogoutInProgress()) return;
-      if (isWithinPostLoginGrace(Cookies.get)) return;
+  const redirectToSignInRef = useRef(redirectToSignIn);
+  redirectToSignInRef.current = redirectToSignIn;
 
-      const decision = await shouldLogoutOnAuthError(
-        errData,
-        Cookies.get,
-        fetchUserInfo
-      );
+  const handleAuthFailure = useCallback(async (errData) => {
+    if (redirecting.current || isLogoutInProgress()) return;
+    if (isWithinPostLoginGrace(Cookies.get)) return;
 
-      if (!decision.logout) return;
+    const decision = await shouldLogoutOnAuthError(
+      errData,
+      Cookies.get,
+      fetchUserInfo
+    );
 
-      await coordinatedSessionLogout({
-        message: decision.message,
-        reason: errData?.code || 'session_check',
-        redirect: redirectToSignIn,
-      });
-    },
-    [redirectToSignIn]
-  );
+    if (!decision.logout) return;
+
+    broadcastSessionPollExpired(errData);
+
+    await coordinatedSessionLogout({
+      message: decision.message,
+      reason: errData?.code || 'session_check',
+      redirect: (msg) => redirectToSignInRef.current(msg),
+    });
+  }, []);
+
+  const handleAuthFailureRef = useRef(handleAuthFailure);
+  handleAuthFailureRef.current = handleAuthFailure;
 
   const checkSession = useCallback(async () => {
     if (redirecting.current || isLogoutInProgress()) return;
-    if (!router.pathname.includes('/dashboard')) return;
+    if (!pathnameRef.current.includes('/dashboard')) return;
     if (isWithinPostLoginGrace(Cookies.get)) return;
+    if (!isDocumentVisible()) return;
+    if (!tryBecomeSessionPollLeader()) return;
+    if (!tryAcquireSessionProbe()) return;
 
     try {
       const res = await fetchUserInfo();
+      if (res.ok) {
+        refreshSessionPollLeaderHeartbeat();
+        broadcastSessionPollOk();
+        return;
+      }
       if (res.status === 401) {
         const errData = await res.json().catch(() => ({}));
-        await handleAuthFailure(errData);
+        await handleAuthFailureRef.current(errData);
       }
     } catch {
       // network blip — do not logout
     }
-  }, [router.pathname, handleAuthFailure]);
+  }, []);
+
+  const checkSessionRef = useRef(checkSession);
+  checkSessionRef.current = checkSession;
 
   useEffect(() => {
     const unsubscribe = subscribeToSessionLogout((message) => {
-      redirectToSignIn(message);
+      redirectToSignInRef.current(message);
     });
     return unsubscribe;
-  }, [redirectToSignIn]);
+  }, []);
 
   useEffect(() => {
-    checkSession();
-    const interval = setInterval(checkSession, POLL_INTERVAL_MS);
+    const unsubscribePoll = subscribeToSessionPoll({
+      onExpired: (errData) => {
+        void handleAuthFailureRef.current(errData);
+      },
+    });
+    return unsubscribePoll;
+  }, []);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!isDocumentVisible()) {
+        releaseSessionPollLeader();
+        return;
+      }
+      tryBecomeSessionPollLeader();
+      void checkSessionRef.current();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      releaseSessionPollLeader();
+    };
+  }, []);
+
+  useEffect(() => {
+    void checkSessionRef.current();
+    const interval = setInterval(() => {
+      void checkSessionRef.current();
+    }, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [checkSession]);
+  }, []);
 }

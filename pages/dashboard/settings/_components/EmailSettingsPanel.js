@@ -25,6 +25,7 @@ import {
   EMAIL_TEMPLATE_KEYS,
 } from '@/lib/email/emailTemplatesShared';
 import EmailTemplateBodyEditor from './EmailTemplateBodyEditor';
+import { useCurrentUser } from '@/hooks/useCurrentUser';
 import layoutStyles from '../../settings.module.css';
 
 const SETTINGS_ID = 'emailSettings';
@@ -542,28 +543,12 @@ const EmailSettingsPanel = () => {
     }
   };
 
+  const { user: currentUser } = useCurrentUser();
+
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch('/api/getUserInfo', {
-          method: 'GET',
-          credentials: 'include',
-          cache: 'no-store',
-          headers: { 'Content-Type': 'application/json' },
-        });
-        if (!res.ok || cancelled) return;
-        const data = await res.json();
-        const addr = (data?.user?.email || '').trim();
-        if (addr && !cancelled) setTestTo((prev) => prev || addr);
-      } catch {
-        /* ignore */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    const addr = (currentUser?.email || '').trim();
+    if (addr) setTestTo((prev) => prev || addr);
+  }, [currentUser?.email]);
 
   const update = (field, value) => {
     setPrefs((p) => ({ ...p, [field]: value }));
@@ -747,14 +732,17 @@ const EmailSettingsPanel = () => {
               <div className="fw-semibold fs-6">Outgoing mail</div>
               <small className="text-muted d-block lh-base">
                 Configure SMTP and message templates. One save updates everything below.
+                Note: Do not touch the settings if you are not sure what you are doing. Contact the Pixelcare Admin if you need help.
               </small>
             </div>
             <Nav variant="underline" className="flex-nowrap gap-3 border-0 small fw-semibold">
-             <Nav.Item>
+              {/* DO NOT REMOVE THIS NAVIGATION ITEMS, THEY ARE USED FOR FUTURE FEATURES
+              <Nav.Item>
                 <Nav.Link eventKey="smtp" className="px-2 py-2">
                   SMTP &amp; sender
                 </Nav.Link>
               </Nav.Item> 
+              */}
               <Nav.Item>
                 <Nav.Link eventKey="templates" className="px-2 py-2">
                   Email templates
@@ -789,11 +777,10 @@ const EmailSettingsPanel = () => {
             <div className={layoutStyles.emailSettingsContentWell}>
               <Tab.Content>
                 <Tab.Pane eventKey="smtp" className="" mountOnEnter>
-                  <Alert variant="light" className="py-2 small mb-4 rounded-3 border border-warning border-opacity-50">
-                    <strong className="text-dark">Security:</strong> SMTP passwords are stored in the{' '}
-                    <code>settings</code> table. Use RLS or env-based secrets in production.
+                <Alert variant="warning" className="py-2 small mb-4 rounded-3 border border-warning border-opacity-50">
+                    <strong className="text-dark">NOTE:</strong> Do not touch this settings if you are not sure what you are doing. Contact the Pixelcare Admin if you need help.
                   </Alert>
-
+                 
                   <SectionLabel isFirst>Server connection</SectionLabel>
                   <Row className="g-3 mb-2">
                   <Col md={6}>

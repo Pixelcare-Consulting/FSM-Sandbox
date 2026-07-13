@@ -13,7 +13,8 @@ const ADDRESS_ACTION_LABELS = {
   add: { label: 'Add', variant: 'success' },
   update: { label: 'Update', variant: 'primary' },
   unchanged: { label: 'Unchanged', variant: 'secondary' },
-  remove: { label: 'Remove', variant: 'danger' },
+  remove: { label: 'Remove from FSM', variant: 'danger' },
+  keep: { label: 'Keep in FSM', variant: 'warning' },
 };
 
 function actionBadge(action) {
@@ -25,8 +26,17 @@ function actionBadge(action) {
   );
 }
 
-function addressActionBadge(action) {
-  const meta = ADDRESS_ACTION_LABELS[action] || ADDRESS_ACTION_LABELS.unchanged;
+function addressActionBadge(row) {
+  if (row.action === 'remove' && row.willSkip) {
+    const meta = ADDRESS_ACTION_LABELS.keep;
+    const jobs = Number(row.jobCount) || 0;
+    return (
+      <Badge bg={meta.variant} className="fw-normal" style={{ fontSize: '0.7rem' }}>
+        {`${meta.label} (${jobs} job${jobs === 1 ? '' : 's'})`}
+      </Badge>
+    );
+  }
+  const meta = ADDRESS_ACTION_LABELS[row.action] || ADDRESS_ACTION_LABELS.unchanged;
   return (
     <Badge bg={meta.variant} className="fw-normal" style={{ fontSize: '0.7rem' }}>
       {meta.label}
@@ -58,6 +68,27 @@ function countAddressChanges(addressChanges) {
   return { total: addressChanges.length, changed };
 }
 
+function collectFsmAddressImpact(items) {
+  let removeCount = 0;
+  let skipCount = 0;
+  const skipSamples = [];
+  for (const item of items || []) {
+    for (const row of item.addressChanges || []) {
+      if (row.action !== 'remove') continue;
+      if (row.willSkip) {
+        skipCount += 1;
+        if (skipSamples.length < 5) {
+          const jobs = Number(row.jobCount) || 0;
+          skipSamples.push(`${row.label} (${jobs} job${jobs === 1 ? '' : 's'})`);
+        }
+      } else {
+        removeCount += 1;
+      }
+    }
+  }
+  return { removeCount, skipCount, skipSamples };
+}
+
 function AddressValue({ value, muted = false }) {
   if (!value) {
     return <span className="text-muted fst-italic">—</span>;
@@ -84,16 +115,24 @@ function AddressChangesPanel({ addressChanges }) {
         <thead>
           <tr className="text-muted text-uppercase" style={{ fontSize: '0.68rem', letterSpacing: '0.04em' }}>
             <th style={{ width: '18%' }}>Site</th>
-            <th style={{ width: '10%' }}>Change</th>
-            <th style={{ width: '36%' }}>Before (portal)</th>
-            <th style={{ width: '36%' }}>After (SAP sync)</th>
+            <th style={{ width: '14%' }}>Change</th>
+            <th style={{ width: '34%' }}>Before (portal)</th>
+            <th style={{ width: '34%' }}>After (SAP sync)</th>
           </tr>
         </thead>
         <tbody>
           {addressChanges.map((row) => (
-            <tr key={`${row.label}-${row.action}`}>
-              <td className="align-top fw-medium">{row.label}</td>
-              <td className="align-top">{addressActionBadge(row.action)}</td>
+            <tr key={`${row.label}-${row.action}-${row.willSkip ? 'skip' : 'go'}`}>
+              <td className="align-top fw-medium">
+                {row.label}
+                {row.willSkip && Array.isArray(row.jobNumbers) && row.jobNumbers.length > 0 ? (
+                  <div className="text-muted fw-normal" style={{ fontSize: '0.72rem' }}>
+                    Jobs: {row.jobNumbers.join(', ')}
+                    {(row.jobCount || 0) > row.jobNumbers.length ? '…' : ''}
+                  </div>
+                ) : null}
+              </td>
+              <td className="align-top">{addressActionBadge(row)}</td>
               <td className="align-top">
                 <AddressValue value={row.before} muted={row.action === 'add'} />
               </td>
@@ -181,6 +220,33 @@ export default function SapDeltaSyncPreviewModal({
     (counts.leadsToUpdate || 0);
   const hasBlockingError = Boolean(error) || (preview?.errors?.length > 0 && !preview?.counts?.sapHits);
   const canConfirm = !loading && !confirming && !hasBlockingError && totalPlannedChanges > 0;
+  const { removeCount, skipCount, skipSamples } = collectFsmAddressImpact(visibleItems);
+  const hasFsmAddressImpact = removeCount > 0 || skipCount > 0;
+
+  const handleConfirm = () => {
+    if (!onConfirm) return;
+    if (hasFsmAddressImpact) {
+      const lines = [
+        'Address removals apply to the FSM portal only. SAP Business Partner addresses are not modified.',
+      ];
+      if (removeCount > 0) {
+        lines.push(
+          `${removeCount} portal service location${removeCount === 1 ? '' : 's'} will be removed from FSM.`
+        );
+      }
+      if (skipCount > 0) {
+        lines.push(
+          `${skipCount} portal location${skipCount === 1 ? '' : 's'} will be kept in FSM because of linked jobs` +
+            (skipSamples.length ? `: ${skipSamples.join('; ')}` : '.')
+        );
+      }
+      lines.push('Proceed with sync?');
+      if (typeof window !== 'undefined' && !window.confirm(lines.join('\n\n'))) {
+        return;
+      }
+    }
+    onConfirm();
+  };
 
   return (
     <PortalModal
@@ -196,7 +262,7 @@ export default function SapDeltaSyncPreviewModal({
           <Button variant="outline-secondary" onClick={onHide} disabled={confirming}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={onConfirm} disabled={!canConfirm || confirming}>
+          <Button variant="primary" onClick={handleConfirm} disabled={!canConfirm || confirming}>
             {confirming ? (
               <>
                 <Spinner animation="border" size="sm" className="me-2" />
@@ -237,6 +303,29 @@ export default function SapDeltaSyncPreviewModal({
               value={`${counts.leadsToInsert || 0} create · ${counts.leadsToUpdate || 0} update`}
             />
           </PortalConfirmPanel>
+
+          <Alert variant="info" className="small">
+            Address removals apply to the <strong>FSM portal only</strong>. SAP Business Partner
+            addresses are never deleted or modified by this sync.
+          </Alert>
+
+          {hasFsmAddressImpact ? (
+            <Alert variant="warning" className="small">
+              {removeCount > 0 ? (
+                <div>
+                  {removeCount} portal service location{removeCount === 1 ? '' : 's'} will be{' '}
+                  <strong>removed from FSM</strong> (already gone in SAP).
+                </div>
+              ) : null}
+              {skipCount > 0 ? (
+                <div>
+                  {skipCount} portal location{skipCount === 1 ? '' : 's'} will be{' '}
+                  <strong>kept in FSM</strong> because active jobs still reference them
+                  {skipSamples.length ? ` — ${skipSamples.join('; ')}` : ''}.
+                </div>
+              ) : null}
+            </Alert>
+          ) : null}
 
           {Array.isArray(preview.errors) && preview.errors.length > 0 && (
             <Alert variant="warning" className="small">

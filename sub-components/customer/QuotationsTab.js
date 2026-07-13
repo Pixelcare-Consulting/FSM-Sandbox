@@ -11,9 +11,9 @@ const QuotationsTab = ({ customerId }) => {
   const [error, setError] = useState(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [quotationsPerPage] = useState(10);
+  const [totalCount, setTotalCount] = useState(0);
   const [retryCount, setRetryCount] = useState(0);
   const [maxRetries] = useState(2);
-  const [hasAttemptedFetch, setHasAttemptedFetch] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
@@ -26,18 +26,21 @@ const QuotationsTab = ({ customerId }) => {
       if (!customerId) {
         setError('Customer ID is required');
         setLoading(false);
-        setHasAttemptedFetch(true);
         return;
       }
 
       try {
-        console.log(`Fetching quotations for cardCode: ${customerId}`);
+        setLoading(true);
         const response = await fetch('/api/getQuotations', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ cardCode: customerId }),
+          body: JSON.stringify({
+            cardCode: customerId,
+            page: currentPage,
+            limit: quotationsPerPage,
+          }),
         });
 
         const data = await response.json().catch(() => null);
@@ -49,78 +52,55 @@ const QuotationsTab = ({ customerId }) => {
             `HTTP ${response.status}`;
           setError(typeof apiMessage === 'string' ? apiMessage : 'Failed to load quotations');
           setQuotations([]);
-          setHasAttemptedFetch(true);
           return;
         }
 
-        if (data == null) {
+        if (!data) {
           setError('Invalid response from quotations API');
           setQuotations([]);
-          setHasAttemptedFetch(true);
           return;
         }
 
-        // Handle different response formats
-        if (data === null || data === undefined) {
-          console.log('No quotations data received - setting empty array');
-          setQuotations([]);
-          setError(null);
-          setHasAttemptedFetch(true);
-          return;
-        }
+        const rows = Array.isArray(data)
+          ? data
+          : Array.isArray(data.quotations)
+            ? data.quotations
+            : Array.isArray(data.data)
+              ? data.data
+              : [];
 
-        if (!Array.isArray(data)) {
-          // If data is an object with a property containing the array
-          if (data.quotations && Array.isArray(data.quotations)) {
-            setQuotations(data.quotations);
-          } else if (data.data && Array.isArray(data.data)) {
-            setQuotations(data.data);
-          } else {
-            console.log('No quotations found - setting empty array');
-            setQuotations([]);
-          }
-        } else {
-          setQuotations(data);
-        }
-
-        console.log('Fetched quotations:', data);
+        setQuotations(rows);
+        setTotalCount(
+          typeof data.totalCount === 'number' ? data.totalCount : rows.length
+        );
         setError(null);
-        setRetryCount(0); // Reset retry count on success
-        setHasAttemptedFetch(true);
+        setRetryCount(0);
       } catch (err) {
         console.error('Error fetching quotations:', err);
         setError(err.message);
 
-        // Only retry if we haven't exceeded max retries
         if (retryCount < maxRetries) {
-          console.log(`Retrying... Attempt ${retryCount + 1} of ${maxRetries}`);
           setTimeout(() => {
-            setRetryCount(prev => prev + 1);
-          }, 1000 * (retryCount + 1)); // Exponential backoff
+            setRetryCount((prev) => prev + 1);
+          }, 1000 * (retryCount + 1));
         } else {
-          console.log('Max retries exceeded, showing fallback');
-          setQuotations([]); // Set empty array as fallback
-          setHasAttemptedFetch(true);
+          setQuotations([]);
         }
       } finally {
         setLoading(false);
       }
     };
 
-    // Reset states when customerId changes
-    if (!hasAttemptedFetch || retryCount > 0) {
-      fetchQuotations();
-    }
-  }, [customerId, retryCount, maxRetries, hasAttemptedFetch]);
+    fetchQuotations();
+  }, [customerId, currentPage, quotationsPerPage, retryCount, maxRetries]);
 
-  // Reset all states when customerId changes
   useEffect(() => {
     setQuotations([]);
     setError(null);
     setRetryCount(0);
-    setHasAttemptedFetch(false);
     setLoading(true);
     setCurrentPage(1);
+    setTotalCount(0);
     setSearchTerm('');
     setDateFrom('');
     setDateTo('');
@@ -193,10 +173,6 @@ const QuotationsTab = ({ customerId }) => {
     return matchesSearch && matchesStatus && matchesDateRange;
   });
 
-  const indexOfLastQuotation = currentPage * quotationsPerPage;
-  const indexOfFirstQuotation = indexOfLastQuotation - quotationsPerPage;
-  const totalPages = Math.ceil(filteredQuotations.length / quotationsPerPage);
-
   const handleSearch = (e) => {
     setSearchTerm(e.target.value);
     setCurrentPage(1);
@@ -245,6 +221,10 @@ const QuotationsTab = ({ customerId }) => {
     });
   };
 
+  // API already returns the current page; only sort/filter the fetched rows (no client page slice).
+  const currentQuotations = sortQuotations(filteredQuotations);
+  const totalPages = Math.max(1, Math.ceil(totalCount / quotationsPerPage));
+
   const handleSort = (field) => {
     setSortDirection(sortField === field && sortDirection === 'asc' ? 'desc' : 'asc');
     setSortField(field);
@@ -287,7 +267,6 @@ const QuotationsTab = ({ customerId }) => {
             onClick={() => {
               setRetryCount(0);
               setError(null);
-              setHasAttemptedFetch(false);
               setLoading(true);
             }}
           >
@@ -309,7 +288,7 @@ const QuotationsTab = ({ customerId }) => {
     );
   }
 
-  if (!quotations.length && hasAttemptedFetch && !loading) {
+  if (!quotations.length && !loading && !error) {
     return (
       <Alert variant="info">
         <Alert.Heading>No Quotations Found</Alert.Heading>
@@ -327,7 +306,6 @@ const QuotationsTab = ({ customerId }) => {
             onClick={() => {
               setRetryCount(0);
               setError(null);
-              setHasAttemptedFetch(false);
               setLoading(true);
             }}
           >
@@ -431,9 +409,7 @@ const QuotationsTab = ({ customerId }) => {
                 </tr>
               </thead>
               <tbody>
-                {sortQuotations(filteredQuotations)
-                  .slice(indexOfFirstQuotation, indexOfLastQuotation)
-                  .map((quote) => (
+                {currentQuotations.map((quote) => (
                     <tr key={quote.DocNum} className="align-middle">
                       <td className="fw-bold text-primary">{quote.DocNum}</td>
                       <td>{formatDate(quote.DocDate)}</td>
@@ -456,7 +432,7 @@ const QuotationsTab = ({ customerId }) => {
       <TablePagination
         currentPage={currentPage}
         totalPages={totalPages}
-        totalItems={filteredQuotations.length}
+        totalItems={totalCount}
         onPageChange={(newPage) => setCurrentPage(newPage)}
         disabled={loading}
       />

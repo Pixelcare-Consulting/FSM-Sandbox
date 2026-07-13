@@ -1,4 +1,5 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
+import { withSession } from '../../../lib/api/withSession';
 import {
   SUPABASE_SAP_LEAD_LIST_SUMMARY_SELECT,
   listRowFromSupabaseSapLead,
@@ -40,7 +41,7 @@ function leadSearchBlob(lead) {
     .toLowerCase();
 }
 
-export default async function handler(req, res) {
+export default withSession(async function handler(req, res) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -77,8 +78,9 @@ export default async function handler(req, res) {
         limit,
         order: { column: sort === 'lead_name' ? 'lead_name' : 'lead_code', ascending: sortAsc },
         filters: (query) => {
-          if (tokens.length === 0) return query;
-          return applyMultiTokenIlikeFilters(query, tokens, LEAD_SEARCH_FIELDS);
+          let q = query.not('lead_code', 'ilike', 'CP%');
+          if (tokens.length === 0) return q;
+          return applyMultiTokenIlikeFilters(q, tokens, LEAD_SEARCH_FIELDS);
         },
       }
     );
@@ -108,4 +110,4 @@ export default async function handler(req, res) {
       error: error.message || 'Unable to load leads summary.',
     });
   }
-}
+});

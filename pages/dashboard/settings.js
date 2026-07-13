@@ -12,7 +12,6 @@ import {
   Badge,
 } from "react-bootstrap";
 import { useRouter } from "next/router";
-import Cookies from "js-cookie";
 import { FaCog, FaUser, FaTools, FaTasks, FaEdit, FaTrash, FaBuilding, FaInfo, FaBriefcase, FaClock, FaEnvelope, FaBell, FaBullhorn, FaPlus, FaCamera, FaUpload, FaTimes, FaPhone, FaGlobe, FaMapMarkerAlt, FaCheck, FaAddressCard, FaFileAlt, FaExternalLinkAlt, FaCreditCard, FaChevronRight } from "react-icons/fa";
 import { DashboardHeader } from "sub-components";
 import Image from "next/image";
@@ -28,6 +27,8 @@ import EmailSettingsPanel from "./settings/_components/EmailSettingsPanel";
 import JobIncentiveSettings from "./settings/incentives";
 import SessionDevicesPanel from "./settings/_components/SessionDevicesPanel";
 import { useSettings } from "../../contexts/SettingsContext";
+import { useCurrentUser } from "@/hooks/useCurrentUser";
+import { invalidateSettingsCachesClient } from "../../utils/invalidateSettingsCachesClient";
 
 const Settings = () => {
   const router = useRouter();
@@ -568,50 +569,24 @@ const Settings = () => {
   };
 
 
-  // Fetch user details
+  const { user: currentUser } = useCurrentUser();
+
   useEffect(() => {
-    const fetchUserDetails = async () => {
-      try {
-        const response = await fetch("/api/getUserInfo", {
-          method: 'GET',
-          credentials: 'include',
-          cache: 'no-store',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-
-        if (response.ok) {
-          const responseData = await response.json();
-          const { user } = responseData;
-          if (user) {
-            setUserDetails({
-              workerId: user.workerId || user.id || Cookies.get('workerId') || Cookies.get('uid'),
-              id: user.id || user.uid || Cookies.get('uid'),
-              email: user.email || user.username || Cookies.get('email'),
-            });
-          }
-        }
-      } catch (error) {
-        console.error("Error fetching user details:", error);
-        // Fallback to cookies
-        const workerId = Cookies.get('workerId') || Cookies.get('uid');
-        if (workerId) {
-          setUserDetails({ workerId, id: workerId });
-        }
-      }
-    };
-
-    fetchUserDetails();
-  }, []);
+    if (!currentUser) return;
+    setUserDetails({
+      workerId: currentUser.workerId || currentUser.id,
+      id: currentUser.id || currentUser.uid,
+      email: currentUser.email,
+    });
+  }, [currentUser]);
 
   const [isUploading, setIsUploading] = useState(false);
 
   const handleCompanyInfoSave = async () => {
     try {
       let logoUrl = companyInfo.logo;
-      // Use workerId from userDetails, or fallback to cookies, or use 'company' prefix
-      const workerId = userDetails?.workerId || Cookies.get('workerId') || Cookies.get('uid') || 'company';
+      // Use workerId from userDetails/currentUser, or 'company' prefix for shared logo path
+      const workerId = userDetails?.workerId || currentUser?.workerId || 'company';
 
       if (file) {
         try {
@@ -698,6 +673,7 @@ const Settings = () => {
       localStorage.removeItem('companyDetails');
 
       toast.success('Company Information updated successfully!');
+      void invalidateSettingsCachesClient();
       void clientAuditLog({
         action: 'SETTINGS_UPDATE',
         category: 'settings',
@@ -1427,7 +1403,7 @@ const Settings = () => {
                             timeStart: document.getElementById("timeStart").value,
                             timeEnd: document.getElementById("timeEnd").value,
                             isPublic: document.getElementById("isPublic").value === "yes",
-                            userId: Cookies.get("workerId"),
+                            userId: currentUser?.workerId || userDetails?.workerId,
                           };
 
                           try {
@@ -2110,6 +2086,7 @@ const Settings = () => {
 
       toast.dismiss(loadingToast);
       toast.success('Follow-up type added successfully');
+      void invalidateSettingsCachesClient();
       void clientAuditLog({
         action: 'SETTINGS_UPDATE',
         category: 'settings',
@@ -2178,6 +2155,7 @@ const Settings = () => {
 
       toast.dismiss(loadingToast);
       toast.success('Type deleted successfully');
+      void invalidateSettingsCachesClient();
       
     } catch (error) {
       console.error('Error deleting type:', error);
@@ -2277,6 +2255,7 @@ const Settings = () => {
 
       toast.dismiss(loadingToast);
       toast.success('Status added successfully');
+      void invalidateSettingsCachesClient();
     } catch (error) {
       console.error('Error adding status:', error);
       toast.error('Failed to add status');
@@ -2349,6 +2328,7 @@ const Settings = () => {
 
       toast.dismiss(loadingToast);
       toast.success('Follow-up type updated successfully');
+      void invalidateSettingsCachesClient();
       void clientAuditLog({
         action: 'SETTINGS_UPDATE',
         category: 'settings',
@@ -2394,6 +2374,7 @@ const Settings = () => {
       setNewJobStatusType({ name: '', color: '#3b82f6', value: '' });
       toast.dismiss(loadingToast);
       toast.success('Job status added successfully');
+      void invalidateSettingsCachesClient();
       void clientAuditLog({
         action: 'SETTINGS_UPDATE',
         category: 'settings',
@@ -2426,6 +2407,7 @@ const Settings = () => {
       setJobStatusSettings((prev) => ({ ...prev, types: updatedTypes }));
       toast.dismiss(loadingToast);
       toast.success('Job status deleted successfully');
+      void invalidateSettingsCachesClient();
     } catch (error) {
       console.error('Error deleting job status:', error);
       toast.error(`Failed to delete job status: ${error.message}`);
@@ -2467,6 +2449,7 @@ const Settings = () => {
       setEditingJobStatusType(null);
       toast.dismiss(loadingToast);
       toast.success('Job status updated successfully');
+      void invalidateSettingsCachesClient();
       void clientAuditLog({
         action: 'SETTINGS_UPDATE',
         category: 'settings',
@@ -2507,7 +2490,7 @@ const Settings = () => {
                 </div>
                 <div className={styles.navSectionItems}>
                   {category.items
-                    .filter((item) => !item.adminOnly || Cookies.get("isAdmin") === "true")
+                    .filter((item) => !item.adminOnly || currentUser?.role === 'ADMIN')
                     .map((item) => {
                       const isActive =
                         item.action !== "company-memos" && activeTab === item.action;

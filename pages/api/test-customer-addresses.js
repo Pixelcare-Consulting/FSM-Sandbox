@@ -1,9 +1,12 @@
 // pages/api/test-customer-addresses.js
 // Test endpoint to verify customer address data
 
+import { blockIfProduction } from '../../lib/api/blockInProduction';
 import customerService from '../../lib/services/customerService.js';
 
 export default async function handler(req, res) {
+  if (blockIfProduction(req, res)) return;
+
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
   }

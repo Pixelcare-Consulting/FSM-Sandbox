@@ -2,11 +2,15 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Button, Badge } from 'react-bootstrap';
 import { useQuery } from 'react-query';
-import { getSupabaseClient } from '../../../lib/supabase/client';
-import { companyMemoService } from '../../../lib/supabase/database';
 import { memoCreatorDisplayName } from '../../../lib/utils/memoCreatorDisplayName';
 import { memoHtmlForDisplay } from '../../../lib/utils/memoHtml';
+import richTextStyles from '../../../styles/richTextContent.module.css';
 import PortalModal from '../../../components/portal/PortalModal';
+import {
+  DASHBOARD_BOOTSTRAP_QUERY_KEY,
+  fetchDashboardBootstrapFromApi,
+  readCachedDashboardBootstrap,
+} from '../../../utils/dashboardBootstrapCache';
 
 const SEEN_MEMO_IDS_KEY = 'fsm_company_memos_seen_ids';
 const SESSION_DISMISSED_KEY = 'fsm_company_memos_session_dismissed';
@@ -60,15 +64,17 @@ export default function CompanyMemosSignInModal() {
   const [open, setOpen] = useState(false);
   const hasTriggeredRef = useRef(false);
 
-  const { data: memos = [] } = useQuery(
-    ['company-memos', 'sign-in-modal'],
+  const { data: bootstrap } = useQuery(
+    DASHBOARD_BOOTSTRAP_QUERY_KEY,
     async () => {
-      const client = getSupabaseClient();
-      if (!client) return [];
-      return companyMemoService.listForSignIn(client);
+      const cached = readCachedDashboardBootstrap();
+      if (cached) return cached;
+      return fetchDashboardBootstrapFromApi();
     },
     { staleTime: 60 * 1000, refetchOnWindowFocus: false }
   );
+
+  const memos = bootstrap?.companyMemos ?? bootstrap?.signInMemos ?? [];
 
   const unseenMemos = useMemo(() => {
     const seenIds = new Set(readSeenMemoIds());
@@ -159,7 +165,7 @@ export default function CompanyMemosSignInModal() {
             ) : null}
             {m.body ? (
               <div
-                className="portal-memo-html"
+                className={`portal-memo-html ${richTextStyles.memoReadContent}`}
                 dangerouslySetInnerHTML={{
                   __html: memoHtmlForDisplay(m.body),
                 }}

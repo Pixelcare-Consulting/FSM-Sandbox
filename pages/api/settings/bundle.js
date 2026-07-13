@@ -1,9 +1,10 @@
 import { getSupabaseAdmin } from '../../../lib/supabase/server';
 import { fetchSettingsBundle } from '../../../lib/settings/settingsBundle';
 import { getListCache, logResponseSize, setListCache } from '../../../lib/supabase/listQueryHelpers';
+import { SETTINGS_BUNDLE_CACHE_KEY } from '../../../lib/supabase/referenceCacheKeys';
 
-const CACHE_TTL_MS = 120000;
-const CACHE_KEY = 'settings-bundle';
+const CACHE_TTL_MS = 600000;
+const CACHE_KEY = SETTINGS_BUNDLE_CACHE_KEY;
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {

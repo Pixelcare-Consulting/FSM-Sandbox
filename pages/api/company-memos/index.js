@@ -10,6 +10,7 @@ import {
 import { memoAuditSnapshot } from '../../../lib/utils/companyMemoAudit';
 import { assertUpdateLogsMemoAccess } from '../../../lib/utils/companyMemoDevAccess';
 import { normalizeMemoBodyForSave } from '../../../lib/utils/memoHtml';
+import { invalidateListCache } from '../../../lib/supabase/listQueryHelpers';
 import { requireAdminUser } from './_auth';
 
 const ALLOWED_PRIORITY = new Set(['low', 'medium', 'high']);
@@ -121,6 +122,7 @@ export default async function handler(req, res) {
   });
 
   await invalidateHeaderTickerMemoCache();
+  invalidateListCache('dashboard-bootstrap:');
 
   return res.status(201).json(data);
 }
