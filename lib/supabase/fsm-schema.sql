@@ -429,7 +429,7 @@ CREATE TABLE jobs (
     sap_cm_status VARCHAR(20),
     sap_job_income NUMERIC(14, 4) NOT NULL DEFAULT 0,
     payment_qr_uen VARCHAR(50),
-    payment_qr_amount INTEGER,
+    payment_qr_amount NUMERIC(12, 2),
     payment_qr_editable BOOLEAN DEFAULT false,
     payment_qr_expiry VARCHAR(8),
     payment_qr_ref_number VARCHAR(255),

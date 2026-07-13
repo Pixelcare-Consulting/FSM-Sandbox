@@ -100,10 +100,8 @@ import {
   toSingaporeYmd,
 } from "../../../../lib/utils/singaporeDateTime";
 import {
-  formatPaymentQrCentsForInput,
   getDefaultPaymentQrExpiryYmd,
   parsePaymentQrDollarInput,
-  paymentQrCentsToPaynowAmount,
   paymentQrDollarsToCents,
 } from "../../../../lib/jobs/paymentQrDefaults";
 import PaymentConfirmationWelcomeModal, {
@@ -1133,12 +1131,11 @@ const JobDetails = () => {
 
       const expiryValue = paymentDetails.expiry || null;
       const dollars = parsePaymentQrDollarInput(paymentDetails.amount);
-      const amountValue = dollars != null ? paymentQrDollarsToCents(dollars) : null;
       const invValue = String(paymentDetails.invNumber || '').trim() || null;
 
       const payload = {
         payment_qr_expiry: expiryValue,
-        payment_qr_amount: Number.isFinite(amountValue) ? amountValue : null,
+        payment_qr_amount: dollars != null && Number.isFinite(dollars) ? dollars : null,
         payment_qr_inv_number: invValue || resolvePaymentQrRefNumber('', job?.job_number),
         updated_at: new Date().toISOString(),
       };
@@ -1174,7 +1171,9 @@ const JobDetails = () => {
     const dollars = parsePaymentQrDollarInput(paymentDetails.amount);
     const amountCents = dollars != null
       ? paymentQrDollarsToCents(dollars)
-      : job?.payment_qr_amount;
+      : job?.payment_qr_amount != null
+        ? paymentQrDollarsToCents(Number(job.payment_qr_amount))
+        : null;
 
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
       toast.error('Enter a valid payment amount before marking as paid.');
@@ -6405,10 +6404,9 @@ const JobDetails = () => {
                             const PaynowQRClass = PaynowQRModule.default || PaynowQRModule;
                             const expiryValue = paymentDetails.expiry || getDefaultPaymentQrExpiryYmd();
                             const qrDollars = parsePaymentQrDollarInput(paymentDetails.amount);
-                            const qrCents = qrDollars != null ? paymentQrDollarsToCents(qrDollars) : null;
                             const qrcode = new PaynowQRClass({
                               uen: paymentDetails.uen,
-                              amount: qrCents != null ? paymentQrCentsToPaynowAmount(qrCents) : undefined,
+                              amount: qrDollars != null ? qrDollars : undefined,
                               editable: paymentDetails.editable,
                               expiry: expiryValue,
                               refNumber: qrRefNumber || undefined,
@@ -6425,7 +6423,7 @@ const JobDetails = () => {
                                   .from('jobs')
                                   .update({
                                     payment_qr_uen: paymentDetails.uen,
-                                    payment_qr_amount: qrCents,
+                                    payment_qr_amount: qrDollars,
                                     payment_qr_editable: paymentDetails.editable,
                                     payment_qr_expiry: expiryValue || null,
                                     payment_qr_inv_number: invNumberToSave,
@@ -6442,6 +6440,7 @@ const JobDetails = () => {
                                 } else {
                                   setJob((prev) => prev ? {
                                     ...prev,
+                                    payment_qr_amount: qrDollars,
                                     payment_qr_inv_number: invNumberToSave,
                                     payment_qr_ref_number: qrRefNumber || null,
                                     payment_qr_code_string: qrString,

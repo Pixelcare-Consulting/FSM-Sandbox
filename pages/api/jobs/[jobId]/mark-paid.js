@@ -45,7 +45,7 @@ export default async function handler(req, res) {
   const parsedAmount = amountCentsRaw != null && amountCentsRaw !== ''
     ? Number(amountCentsRaw)
     : job.payment_qr_amount != null
-      ? Number(job.payment_qr_amount)
+      ? Math.round(Number(job.payment_qr_amount) * 100)
       : null;
 
   if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
