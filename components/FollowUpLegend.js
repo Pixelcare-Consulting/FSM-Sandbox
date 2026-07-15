@@ -16,11 +16,10 @@ const FollowUpLegend = ({ followUpTypes }) => {
   ];
 
   const statuses = [
-    { value: 'Logged', color: '#c2410c' },
-    { value: 'In Progress', color: '#1d4ed8' },
-    { value: 'Pending', color: '#ca8a04' },
-    { value: 'Completed', color: '#15803d' },
-    { value: 'Cancelled', color: '#dc2626' }
+    { value: 'Quotation In Progress', color: '#6d28d9' },
+    { value: 'Quotation Sent', color: '#0f766e' },
+    { value: 'Open', color: '#1d4ed8' },
+    { value: 'Cancelled', color: '#dc2626' },
   ];
 
   return (

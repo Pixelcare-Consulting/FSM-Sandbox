@@ -1652,7 +1652,7 @@ const ViewJobs = () => {
     };
 
     realtimeChannel = supabase
-      .channel(`jobs-list-changes-${Date.now()}`)
+      .channel('jobs-list')
       .on(
         'postgres_changes',
         {

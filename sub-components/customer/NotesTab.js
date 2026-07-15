@@ -123,39 +123,6 @@ export const NotesTab = ({ customerId, customerUuid: customerUuidProp = null }) 
     fetchNotesPage(currentPage);
   }, [customerUuid, currentPage, notesPerPage, fetchNotesPage]);
 
-  useEffect(() => {
-    if (!customerUuid) return;
-
-    const supabase = getSupabaseClient();
-    if (!supabase) return;
-
-    let debounceTimer = null;
-
-    const channel = supabase
-      .channel(`customer_notes:${customerUuid}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'customer_notes',
-          filter: `customer_id=eq.${customerUuid}`
-        },
-        () => {
-          if (debounceTimer) clearTimeout(debounceTimer);
-          debounceTimer = setTimeout(() => {
-            fetchNotesPage(currentPage);
-          }, 400);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      supabase.removeChannel(channel);
-    };
-  }, [customerUuid, currentPage, fetchNotesPage]);
-
   // Filter notes based on search term
   const filteredNotes = notes.filter(note =>
     note.content.toLowerCase().includes(searchTerm.toLowerCase()) ||

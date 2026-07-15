@@ -10,6 +10,56 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.18',
+    date: '2026-07-15',
+    title: 'Clear job-detail server cache after follow-up mutations',
+    notes: [
+      'Follow-up create/edit/status/delete now patch React Query job detail and await invalidateJobDetailSatellites (UUID + job_number aliases) so the 45s server detail cache cannot restore stale notes/status.',
+      'Replace bare invalidateQueries on follow-up edit save with setQueryData + satellite invalidation.',
+    ],
+  },
+  {
+    version: '3.15.17',
+    date: '2026-07-15',
+    title: 'Follow-up notes persist + status trim + scheduler freshness',
+    notes: [
+      'Follow-up inline edit now persists notes; job-detail query invalidated after save.',
+      'Follow-up statuses restricted to Quotation In Progress, Quotation Sent, Open, Cancelled (default Open).',
+      'Scheduler freshness: stable Realtime channel, client-side range gate, poll only when Realtime down.',
+    ],
+  },
+  {
+    version: '3.15.16',
+    date: '2026-07-15',
+    title: 'TaskList + QuickMenu follow-ups dead-path cleanup',
+    notes: [
+      'Delete orphan TaskList.js and remove unused jobService.findTasksByJobId.',
+      'Strip QuickMenu dead follow-ups quick-summary fetch, followups Realtime channel, and unused tasks-panel query (not rendered in header JSX).',
+      'Keep followups in supabase_realtime publication for the follow-ups page; JobDetailsPage uses shared mapJobTasksToTaskList only.',
+    ],
+  },
+  {
+    version: '3.15.15',
+    date: '2026-07-15',
+    title: 'QuickMenu notification fetch dedupe',
+    notes: [
+      'Remove redundant QuickMenu mount notification fetch; useNotificationsQuery is the sole initial load.',
+      'Coalesce concurrent loadNotifications refetches via inFlightLoadRef; bind visibility/route/event listeners through loadNotificationsRef with stable deps.',
+      'Merge company logo effects into one bootstrap → localStorage → getCompanyDetails path; drop unused followUpFilters twin state.',
+    ],
+  },
+  {
+    version: '3.15.14',
+    date: '2026-07-15',
+    title: 'Realtime WAL remediation',
+    notes: [
+      'Align supabase_realtime publication: drop locations + customer_address_details; add followups; keep jobs, technician_jobs, notifications, job_technician_admin_messages.',
+      'Remove ineffective client Realtime subscriptions (users, job_schedule, job_tasks, customer_notes).',
+      'QuickMenu followups channel scoped to current worker user_id; drop pathname-driven resubscribe.',
+      'Stable Realtime channel names in jobs list, follow-ups page, and scheduler (no Date.now()).',
+    ],
+  },
+  {
     version: '3.15.13',
     date: '2026-07-15',
     title: 'Clear remaining dep deprecation advisories',

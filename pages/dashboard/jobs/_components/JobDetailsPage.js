@@ -294,23 +294,6 @@ const getLatestAttendanceForTechnicianJob = (attendanceRows, technicianJobId, te
   }, null);
 };
 
-/** Map Supabase job_tasks rows to UI taskList shape. Never fabricate createdAt. */
-const mapJobTasksToTaskList = (jobTasks) =>
-  (jobTasks || []).map((task, index) => ({
-    taskID: task.id || `task-${index}`,
-    taskName: task.task_name || '',
-    taskDescription: task.task_description || '',
-    isPriority: task.is_required || false,
-    isDone: task.is_completed === true,
-    completedByTechnicianId: task.completed_by_technician_id || null,
-    completedByName:
-      (Array.isArray(task.completed_by_technician)
-        ? task.completed_by_technician[0]?.full_name
-        : task.completed_by_technician?.full_name) || null,
-    createdAt: task.created_at || null,
-    completionDate: null,
-  }));
-
 const JOB_REALTIME_DEBOUNCE_MS = 2500;
 const JOB_REALTIME_FULL_REFETCH_MIN_MS = 30_000;
 
@@ -976,13 +959,10 @@ const JobDetails = () => {
 
   // Define constants
   const FOLLOW_UP_STATUSES = [
-    'Logged',
-    'In Progress',
-    'Pending',
-    'Completed',
-    'Closed',
-    'OPEN',
-    'Cancelled'
+    'Quotation In Progress',
+    'Quotation Sent',
+    'Open',
+    'Cancelled',
   ];
 
   useEffect(() => {
@@ -4725,7 +4705,7 @@ const JobDetails = () => {
         user_id: userId, // Required field - must not be null
         technician_id: technicianId,
         type: followUpData.type,
-        status: followUpData.status || 'Logged',
+        status: followUpData.status || 'Open',
         priority: priorityString
         // notes and due_date will be added if the columns exist in the table
         // If they don't exist, Supabase will ignore them
@@ -4841,7 +4821,7 @@ const JobDetails = () => {
         customerName: job.customerName,
         notes: followUpData.notes || '',
         type: followUpData.type,
-        status: followUpData.status || 'Logged',
+        status: followUpData.status || 'Open',
         priority: priorityString,
         dueDate: followUpData.dueDate,
         createdAt: createdFollowUp.created_at,
@@ -4853,6 +4833,11 @@ const JobDetails = () => {
       };
 
       // Update local state
+      const nextFollowUps = {
+        ...(job?.followUps || {}),
+        [createdFollowUp.id]: newFollowUp,
+      };
+      const nextFollowUpCount = Object.keys(nextFollowUps).length;
       setJob(prevJob => ({
         ...prevJob,
         followUps: {
@@ -4862,6 +4847,24 @@ const JobDetails = () => {
         followUpCount: ((prevJob.followUpCount || 0) + 1),
         lastFollowUp: new Date()
       }));
+
+      if (jobId) {
+        queryClient.setQueryData(queryKeys.jobDetail(jobId), (old) => {
+          if (!old?.job) return old;
+          return {
+            ...old,
+            job: {
+              ...old.job,
+              followUps: nextFollowUps,
+              followUpCount: nextFollowUpCount,
+              lastFollowUp: new Date(),
+            },
+          };
+        });
+      }
+      await invalidateJobDetailSatellites(queryClient, jobId || jobUuid, {
+        aliasIds: [jobUuid, job?.job_number, job?.jobNo].filter(Boolean),
+      });
 
       toast.success('Follow-up created successfully');
       void clientAuditLog({
@@ -4971,6 +4974,19 @@ const JobDetails = () => {
       }
 
       // Update local state
+      const updatedFollowUp = {
+        ...job?.followUps?.[followUpId],
+        status: newStatus,
+        updatedAt: new Date().toISOString(),
+        updatedBy: actor || job?.followUps?.[followUpId]?.updatedBy || null,
+        statusUpdatedBy: statusUpdatedBy || job?.followUps?.[followUpId]?.statusUpdatedBy || null,
+        statusUpdatedByAccount:
+          statusUpdatedByAccount || job?.followUps?.[followUpId]?.statusUpdatedByAccount || null,
+      };
+      const nextFollowUps = {
+        ...(job?.followUps || {}),
+        [followUpId]: updatedFollowUp,
+      };
       setJob(prevJob => ({
         ...prevJob,
         followUps: {
@@ -4985,6 +5001,23 @@ const JobDetails = () => {
           }
         }
       }));
+
+      if (jobId) {
+        queryClient.setQueryData(queryKeys.jobDetail(jobId), (old) => {
+          if (!old?.job) return old;
+          return {
+            ...old,
+            job: {
+              ...old.job,
+              followUps: nextFollowUps,
+              followUpCount: Object.keys(nextFollowUps).length,
+            },
+          };
+        });
+      }
+      await invalidateJobDetailSatellites(queryClient, jobId || jobUuid, {
+        aliasIds: [jobUuid, job?.job_number, job?.jobNo].filter(Boolean),
+      });
       
       void clientAuditLog({
         action: 'FOLLOWUP_UPDATE',
@@ -5026,6 +5059,7 @@ const JobDetails = () => {
         type: followUp.type,
         status: followUp.status,
         priority: followUp.priority,
+        notes: followUp.notes ?? '',
         updated_at: new Date().toISOString()
       };
 
@@ -5058,6 +5092,7 @@ const JobDetails = () => {
       // Update local state
       const updatedFollowUp = {
         ...followUp,
+        notes: followUp.notes ?? '',
         updatedAt: new Date().toISOString(),
         updatedBy: shouldTrackAttendedBy
           ? (statusUpdater?.actor || existingFollowUp?.updatedBy || null)
@@ -5077,6 +5112,27 @@ const JobDetails = () => {
           [followUp.id]: updatedFollowUp
         }
       }));
+
+      if (jobId) {
+        queryClient.setQueryData(queryKeys.jobDetail(jobId), (old) => {
+          if (!old?.job) return old;
+          const nextFollowUps = {
+            ...old.job.followUps,
+            [followUp.id]: updatedFollowUp,
+          };
+          return {
+            ...old,
+            job: {
+              ...old.job,
+              followUps: nextFollowUps,
+              followUpCount: Object.keys(nextFollowUps).length,
+            },
+          };
+        });
+      }
+      await invalidateJobDetailSatellites(queryClient, jobId || jobUuid, {
+        aliasIds: [jobUuid, job?.job_number, job?.jobNo].filter(Boolean),
+      });
 
       setEditingFollowUp(null);
       void clientAuditLog({
@@ -5119,6 +5175,9 @@ const JobDetails = () => {
         .eq('id', followUpToDelete.id);
 
       // Update local state
+      const nextFollowUps = { ...(job?.followUps || {}) };
+      delete nextFollowUps[followUpToDelete.id];
+      const nextFollowUpCount = Math.max(0, Object.keys(nextFollowUps).length);
       setJob(prevJob => {
         const newFollowUps = { ...prevJob.followUps };
         delete newFollowUps[followUpToDelete.id];
@@ -5127,6 +5186,23 @@ const JobDetails = () => {
           followUps: newFollowUps,
           followUpCount: Math.max(0, (prevJob.followUpCount || 0) - 1)
         };
+      });
+
+      if (jobId) {
+        queryClient.setQueryData(queryKeys.jobDetail(jobId), (old) => {
+          if (!old?.job) return old;
+          return {
+            ...old,
+            job: {
+              ...old.job,
+              followUps: nextFollowUps,
+              followUpCount: nextFollowUpCount,
+            },
+          };
+        });
+      }
+      await invalidateJobDetailSatellites(queryClient, jobId || jobUuid, {
+        aliasIds: [jobUuid, job?.job_number, job?.jobNo].filter(Boolean),
       });
 
       setShowDeleteConfirm(false);
@@ -5152,11 +5228,15 @@ const JobDetails = () => {
 
   // Add this helper function for status badge colors
   const getStatusBadgeColor = (status) => {
-    switch (status?.toLowerCase()) {
+    switch (status?.toLowerCase()?.replace(/_/g, ' ')) {
       case 'logged':
         return '#FFD580';
       case 'in progress':
         return '#6A89CC';
+      case 'quotation in progress':
+        return '#C4B5FD';
+      case 'quotation sent':
+        return '#5EEAD4';
       case 'pending':
         return '#CCCCCC';
       case 'completed':
@@ -5270,7 +5350,7 @@ const JobDetails = () => {
 
   // First, update or add these helper functions
   const getStatusBadgeStyles = (status) => {
-    switch (status?.toLowerCase()) {
+    switch (status?.toLowerCase()?.replace(/_/g, ' ')) {
       case 'logged':
         return {
           backgroundColor: '#FFD580',
@@ -5280,6 +5360,16 @@ const JobDetails = () => {
         return {
           backgroundColor: '#6A89CC',
           color: '#2E4A8C',
+        };
+      case 'quotation in progress':
+        return {
+          backgroundColor: '#EDE9FE',
+          color: '#6D28D9',
+        };
+      case 'quotation sent':
+        return {
+          backgroundColor: '#CCFBF1',
+          color: '#0F766E',
         };
       case 'pending':
         return {
@@ -5349,9 +5439,11 @@ const JobDetails = () => {
   };
 
   const getStatusIcon = (status) => {
-    switch (status?.toLowerCase()) {
+    switch (status?.toLowerCase()?.replace(/_/g, ' ')) {
       case 'logged': return 'fe-file-text';
       case 'in progress': return 'fe-loader';
+      case 'quotation in progress': return 'fe-edit';
+      case 'quotation sent': return 'fe-send';
       case 'pending': return 'fe-clock';
       case 'completed':
       case 'closed': return 'fe-check-circle';
@@ -5923,6 +6015,12 @@ const JobDetails = () => {
                                         {FOLLOW_UP_STATUSES.map(status => (
                                           <option key={status} value={status}>{status}</option>
                                         ))}
+                                        {editingFollowUp.status &&
+                                          !FOLLOW_UP_STATUSES.includes(editingFollowUp.status) && (
+                                          <option value={editingFollowUp.status}>
+                                            {editingFollowUp.status}
+                                          </option>
+                                        )}
                                       </Form.Select>
                                     </Form.Group>
                                     <Form.Group className="mb-3">

@@ -233,7 +233,7 @@ const FollowUpsPage = () => {
     };
 
     const realtimeChannel = supabase
-      .channel(`followups-changes-${Date.now()}`)
+      .channel('followups-page')
       .on(
         'postgres_changes',
         {
@@ -287,36 +287,46 @@ const FollowUpsPage = () => {
     let backgroundColor = '#e2e8f0';
     let textColor = '#64748b';
     
-    // Match list-jobs.js follow-up status badge colors exactly
+    // Match list-jobs / StatusBadge follow-up status colors (new + legacy)
     switch (statusUpper) {
       case 'LOGGED':
-        backgroundColor = '#fef3c7'; // orange-yellow background
-        textColor = '#f97316'; // orange text
+        backgroundColor = '#fef3c7';
+        textColor = '#f97316';
         break;
       case 'IN PROGRESS':
       case 'IN_PROGRESS':
-        backgroundColor = '#dbeafe'; // light blue background
-        textColor = '#3b82f6'; // blue text
+        backgroundColor = '#dbeafe';
+        textColor = '#3b82f6';
+        break;
+      case 'QUOTATION IN PROGRESS':
+      case 'QUOTATION_IN_PROGRESS':
+        backgroundColor = '#ede9fe';
+        textColor = '#6d28d9';
+        break;
+      case 'QUOTATION SENT':
+      case 'QUOTATION_SENT':
+        backgroundColor = '#ccfbf1';
+        textColor = '#0f766e';
         break;
       case 'PENDING':
-        backgroundColor = '#f1f5f9'; // light gray background
-        textColor = '#64748b'; // gray text
+        backgroundColor = '#f1f5f9';
+        textColor = '#64748b';
         break;
       case 'COMPLETED':
-        backgroundColor = '#f1f5f9'; // light gray background
-        textColor = '#64748b'; // gray text
+        backgroundColor = '#f1f5f9';
+        textColor = '#64748b';
         break;
       case 'CLOSED':
-        backgroundColor = '#f1f5f9'; // light gray background
-        textColor = '#64748b'; // gray text
+        backgroundColor = '#f1f5f9';
+        textColor = '#64748b';
         break;
       case 'CANCELLED':
-        backgroundColor = '#fee2e2'; // light red background
-        textColor = '#ef4444'; // red text
+        backgroundColor = '#fee2e2';
+        textColor = '#ef4444';
         break;
       case 'OPEN':
-        backgroundColor = '#e2e8f0'; // default gray background
-        textColor = '#64748b'; // gray text
+        backgroundColor = '#dbeafe';
+        textColor = '#1e40af';
         break;
       default:
         backgroundColor = '#e2e8f0';

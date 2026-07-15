@@ -21,6 +21,21 @@ const StatusBadge = ({
         color: '#2E4A8C',
         borderColor: '#2E4A8C',
       },
+      'quotation in progress': {
+        backgroundColor: '#EDE9FE',
+        color: '#6D28D9',
+        borderColor: '#6D28D9',
+      },
+      'quotation sent': {
+        backgroundColor: '#CCFBF1',
+        color: '#0F766E',
+        borderColor: '#0F766E',
+      },
+      open: {
+        backgroundColor: '#DBEAFE',
+        color: '#1E40AF',
+        borderColor: '#1E40AF',
+      },
       pending: {
         backgroundColor: '#CCCCCC',
         color: '#666666',
@@ -53,7 +68,8 @@ const StatusBadge = ({
       },
     };
 
-    return baseStyles[status?.toLowerCase()] || baseStyles.default;
+    const key = status?.toLowerCase()?.replace(/_/g, ' ');
+    return baseStyles[key] || baseStyles.default;
   };
 
   const styles = color ? {

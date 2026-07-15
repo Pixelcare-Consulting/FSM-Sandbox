@@ -45,7 +45,7 @@ const FollowUpModal = ({
         notes,
         priority,
         dueDate: dueDate ? dueDate.toISOString() : null,
-        status: "Logged"
+        status: "Open"
       };
 
       // handleCreateFollowUp returns the created follow-up

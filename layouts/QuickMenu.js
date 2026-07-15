@@ -5,28 +5,19 @@ import { useMediaQuery } from "react-responsive";
 import { ListGroup, Dropdown, Badge, Button, InputGroup, Form } from "react-bootstrap";
 import Image from "next/image";
 import SimpleBar from "simplebar-react";
-import { FaBell, FaSearch, FaTimes, FaTasks, FaCalendarAlt, FaFilter, FaStickyNote, FaChevronDown } from "react-icons/fa";
+import { FaBell, FaSearch, FaTimes } from "react-icons/fa";
 import { toast } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
-import { ToastContainer } from 'react-toastify';
 import { globalQuickSearch } from '../utils/searchUtils';
-import { GKTippy } from "widgets";
-import DarkLightMode from "layouts/DarkLightMode";
-import NotificationList from "data/Notification";
 import useMounted from "hooks/useMounted";
 import { useRouter } from "next/router";
 import Cookies from "js-cookie";
-import { useQueryClient, useQuery } from 'react-query';
+import { useQueryClient } from 'react-query';
 import { getSupabaseClient } from "../lib/supabase/client";
-import { queryKeys } from '../lib/cache/queryKeys';
 import { useNotificationsQuery } from '../hooks/queries/useNotificationsQuery';
-import { jobDisplayCustomerName } from "../lib/utils/embeddedCustomerName";
 import { useDashboardBootstrap } from '../hooks/useDashboardBootstrap';
 import { useCurrentUserProfile } from '@/hooks/useCurrentUser';
 import { readCachedDashboardBootstrap, invalidateDashboardBootstrapCache } from '../utils/dashboardBootstrapCache';
-import { userService } from "../lib/supabase/database";
-import DotBadge from "components/bootstrap/DotBadge";
-import { FaBriefcase, FaCheckCircle, FaExclamationCircle } from "react-icons/fa";
 import Swal from 'sweetalert2';
 import { invalidateNotificationCache } from '../utils/notificationCache';
 import { getCompanyDetails } from '../utils/companyCache';
@@ -359,31 +350,6 @@ const SearchBar = React.memo(({ value, onChange, onSubmit, onClear }) => {
 
 SearchBar.displayName = 'SearchBar';
 
-// Add these constants before the QuickMenu component
-const DEFAULT_FILTERS = {
-  status: 'all',
-  type: 'all',
-  dateRange: { start: null, end: null }
-};
-
-const DEFAULT_STATE = {
-  userDetails: null,
-  unreadCount: 0,
-  notifications: [],
-  searchQuery: '',
-  searchResults: [],
-  isSearching: false,
-  showSearchResults: false,
-  followUps: [],
-  followUpCount: 0,
-  taskCount: 0,
-  taskCategories: {
-    followUps: [],
-    appointments: [],
-    reminders: []
-  }
-};
-
 const QuickMenu = ({ children }) => {
   const queryClient = useQueryClient();
   const router = useRouter();
@@ -416,10 +382,36 @@ const QuickMenu = ({ children }) => {
     }
   }, [userDetails?.fullName, userDetails?.username]);
 
+  // Company logo: bootstrap → localStorage → getCompanyDetails (single path)
   useEffect(() => {
-    if (!bootstrap?.companyInfo?.logo || logo !== '/images/SAS-LOGO.png') return;
-    setLogo(bootstrap.companyInfo.logo);
-    localStorage.setItem('companyLogo', bootstrap.companyInfo.logo);
+    if (logo !== '/images/SAS-LOGO.png') return;
+
+    const fromBootstrap =
+      bootstrap?.companyInfo?.logo ||
+      readCachedDashboardBootstrap()?.companyInfo?.logo;
+    if (fromBootstrap) {
+      setLogo(fromBootstrap);
+      localStorage.setItem('companyLogo', fromBootstrap);
+      return;
+    }
+
+    const cachedLogo = localStorage.getItem('companyLogo');
+    if (cachedLogo) {
+      setLogo(cachedLogo);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      const companyData = await getCompanyDetails();
+      if (cancelled || !companyData?.logo) return;
+      setLogo(companyData.logo);
+      localStorage.setItem('companyLogo', companyData.logo);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [bootstrap?.companyInfo?.logo, logo, setLogo]);
 
   // Sign out function
@@ -688,7 +680,6 @@ const QuickMenu = ({ children }) => {
   /** After first fetch, used to toast only newly arriving job notifications (not backlog). */
   const seenNotificationIdsRef = useRef(new Set());
   const notificationDebounceRef = useRef(null);
-  const followUpDebounceRef = useRef(null);
   const lastNotifFetchRef = useRef(0);
   const inFlightLoadRef = useRef(null);
   const REALTIME_DEBOUNCE_MS = 2500;
@@ -733,8 +724,16 @@ const QuickMenu = ({ children }) => {
       return;
     }
 
+    if (inFlightLoadRef.current) {
+      return inFlightLoadRef.current;
+    }
+
     try {
-      await refetchNotificationsQuery();
+      const promise = refetchNotificationsQuery().finally(() => {
+        inFlightLoadRef.current = null;
+      });
+      inFlightLoadRef.current = promise;
+      await promise;
     } catch (error) {
       console.error('Error loading notifications:', error);
       setNotifications([]);
@@ -856,13 +855,7 @@ const QuickMenu = ({ children }) => {
   const patchNotificationFromRealtimeRef = useRef(patchNotificationFromRealtime);
   patchNotificationFromRealtimeRef.current = patchNotificationFromRealtime;
 
-  // Initial notification fetch (separate from realtime subscribe)
-  useEffect(() => {
-    if (!notificationSubjectIds.length) return;
-    void loadNotificationsRef.current();
-  }, [notificationSubjectIds]);
-
-  // Notification realtime subscribe
+  // Notification realtime subscribe (initial fetch is owned by useNotificationsQuery)
   useEffect(() => {
     if (!notificationSubjectIds.length) return;
 
@@ -908,11 +901,11 @@ const QuickMenu = ({ children }) => {
   useEffect(() => {
     if (!notificationSubjectIds.length) return;
     const refresh = () => {
-      void loadNotifications();
+      void loadNotificationsRef.current();
     };
     window.addEventListener('fsm:notifications-refresh', refresh);
     return () => window.removeEventListener('fsm:notifications-refresh', refresh);
-  }, [notificationSubjectIds, loadNotifications]);
+  }, [notificationSubjectIds]);
 
   /** Refetch when returning to the tab (throttled; Realtime can lag if reconnecting). */
   useEffect(() => {
@@ -926,7 +919,7 @@ const QuickMenu = ({ children }) => {
       if (now - lastNotifFetchRef.current < MIN_VISIBILITY_REFETCH_MS) {
         return;
       }
-      void loadNotifications();
+      void loadNotificationsRef.current();
     };
 
     document.addEventListener('visibilitychange', onBecameVisible);
@@ -934,7 +927,7 @@ const QuickMenu = ({ children }) => {
     return () => {
       document.removeEventListener('visibilitychange', onBecameVisible);
     };
-  }, [notificationSubjectIds, loadNotifications]);
+  }, [notificationSubjectIds]);
 
   /** New rows are created on other routes (e.g. job page); bell should update after navigation without waiting on Realtime. */
   useEffect(() => {
@@ -944,13 +937,13 @@ const QuickMenu = ({ children }) => {
       if (lastNotifFetchRef.current > 0 && now - lastNotifFetchRef.current < MIN_NOTIF_FETCH_MS) {
         return;
       }
-      void loadNotifications();
+      void loadNotificationsRef.current();
     };
     router.events.on('routeChangeComplete', onRouteDone);
     return () => {
       router.events.off('routeChangeComplete', onRouteDone);
     };
-  }, [notificationSubjectIds, loadNotifications, router]);
+  }, [notificationSubjectIds]);
 
   // Add mark all as read function
   const markAllAsRead = async () => {
@@ -1111,34 +1104,6 @@ const QuickMenu = ({ children }) => {
     );
   }, [searchQuery, handleSearchChange, handleSearchSubmit, handleClearSearch]);
 
-  // Company logo from session bootstrap (fallback if bootstrap did not run yet)
-  useEffect(() => {
-    const loadCompanyDetails = async () => {
-      if (logo !== '/images/SAS-LOGO.png') return;
-
-      const cachedLogo = localStorage.getItem('companyLogo');
-      if (cachedLogo) {
-        setLogo(cachedLogo);
-        return;
-      }
-
-      const bootstrap = readCachedDashboardBootstrap();
-      if (bootstrap?.companyInfo?.logo) {
-        setLogo(bootstrap.companyInfo.logo);
-        localStorage.setItem('companyLogo', bootstrap.companyInfo.logo);
-        return;
-      }
-
-      const companyData = await getCompanyDetails();
-      if (companyData?.logo) {
-        setLogo(companyData.logo);
-        localStorage.setItem('companyLogo', companyData.logo);
-      }
-    };
-
-    loadCompanyDetails();
-  }, [logo, setLogo]);
-
   // Add this effect to clear search when route changes
   useEffect(() => {
     // Clear search when route changes
@@ -1146,296 +1111,6 @@ const QuickMenu = ({ children }) => {
     setShowSearchResults(false);
     setSearchResults([]);
   }, [router.pathname]);
-
-  // Add clearSearch handler
-  const clearSearch = () => {
-    setSearchQuery('');
-    setShowSearchResults(false);
-    setSearchResults([]);
-  };
-
-  // Add necessary states
-  const [showTaskDropdown, setShowTaskDropdown] = useState(false);
-  const [taskCategories, setTaskCategories] = useState({
-    followUps: [],
-    appointments: [],
-    reminders: []
-  });
-  const [taskCount, setTaskCount] = useState(0);
-
-  const { data: tasksPanelData } = useQuery(
-    queryKeys.quickMenuTasks(workerId),
-    async () => {
-      const response = await fetch(
-        `/api/notifications/tasks-panel?workerId=${encodeURIComponent(workerId)}`,
-        { credentials: 'same-origin', cache: 'no-store' }
-      );
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        throw new Error(body.error || `Failed to load tasks (${response.status})`);
-      }
-      return response.json();
-    },
-    {
-      enabled: Boolean(workerId),
-      staleTime: 30 * 1000,
-      cacheTime: 5 * 60 * 1000,
-      refetchOnMount: false,
-      refetchOnWindowFocus: false,
-      refetchOnReconnect: false,
-      onError: (error) => {
-        console.error('Error loading tasks:', error);
-        toast.error('Error loading tasks');
-        setTaskCategories({ followUps: [], appointments: [], reminders: [] });
-        setTaskCount(0);
-      },
-    }
-  );
-
-  useEffect(() => {
-    if (!tasksPanelData) return;
-    setTaskCategories(
-      tasksPanelData.taskCategories || { followUps: [], appointments: [], reminders: [] }
-    );
-    setTaskCount(tasksPanelData.taskCount || 0);
-  }, [tasksPanelData]);
-
-  // Add these states
-  const [followUpFilters, setFollowUpFilters] = useState({
-    status: 'all',
-    type: 'all',
-    dateRange: {
-      start: null,
-      end: null
-    }
-  });
-  const [followUpCount, setFollowUpCount] = useState(0);
-  const [followUps, setFollowUps] = useState([]);
-
-  // Modified filter implementation
-  const [filters, setFilters] = useState({
-    status: 'all',
-    type: 'all',
-    dateRange: {
-      start: null,
-      end: null
-    }
-  });
-
-  const followUpFiltersRef = useRef(filters);
-  followUpFiltersRef.current = filters;
-  const lastFollowUpFullRefetchRef = useRef(0);
-  const FOLLOW_UP_FULL_REFETCH_MIN_MS = 30_000;
-
-  useEffect(() => {
-    if (!workerId) return;
-
-    let cancelled = false;
-
-    const buildQuickSummaryParams = () => {
-      const f = followUpFiltersRef.current;
-      const params = new URLSearchParams({ limit: '10' });
-      if (f.status !== 'all') params.set('status', f.status);
-      if (f.type !== 'all') params.set('type', f.type);
-      if (f.dateRange.start) params.set('dateFrom', f.dateRange.start);
-      if (f.dateRange.end) params.set('dateTo', f.dateRange.end);
-      return params;
-    };
-
-    const mapQuickSummaryItem = (item) => ({
-      id: item.id,
-      ...item,
-      jobID: item.jobNumber || item.jobID,
-      createdAt: item.createdAt,
-    });
-
-    const fetchFollowUps = async () => {
-      try {
-        const params = buildQuickSummaryParams();
-        const response = await fetch(`/api/follow-ups/quick-summary?${params.toString()}`, {
-          cache: 'no-store',
-        });
-
-        if (cancelled) return;
-
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({}));
-          throw new Error(body.error || `Failed to load follow-ups (${response.status})`);
-        }
-
-        const payload = await response.json();
-        const items = (payload.items || []).map(mapQuickSummaryItem);
-
-        setFollowUps(items);
-        setFollowUpCount(payload.openCount ?? items.length);
-      } catch (error) {
-        if (!cancelled) {
-          console.error('Error fetching follow-ups:', error);
-          toast.error('Error loading follow-ups');
-        }
-      }
-    };
-
-    void fetchFollowUps();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [workerId, filters]);
-
-  useEffect(() => {
-    if (!workerId) return;
-    if (router.pathname.startsWith('/dashboard/follow-ups')) return;
-
-    const supabase = getSupabaseClient();
-    if (!supabase) return;
-
-    let cancelled = false;
-
-    const buildQuickSummaryParams = () => {
-      const f = followUpFiltersRef.current;
-      const params = new URLSearchParams({ limit: '10' });
-      if (f.status !== 'all') params.set('status', f.status);
-      if (f.type !== 'all') params.set('type', f.type);
-      if (f.dateRange.start) params.set('dateFrom', f.dateRange.start);
-      if (f.dateRange.end) params.set('dateTo', f.dateRange.end);
-      return params;
-    };
-
-    const mapQuickSummaryItem = (item) => ({
-      id: item.id,
-      ...item,
-      jobID: item.jobNumber || item.jobID,
-      createdAt: item.createdAt,
-    });
-
-    const throttledFullRefresh = async () => {
-      const now = Date.now();
-      if (now - lastFollowUpFullRefetchRef.current < FOLLOW_UP_FULL_REFETCH_MIN_MS) {
-        return;
-      }
-      lastFollowUpFullRefetchRef.current = now;
-
-      const refreshParams = buildQuickSummaryParams();
-      const refreshRes = await fetch(
-        `/api/follow-ups/quick-summary?${refreshParams.toString()}`,
-        { cache: 'no-store' }
-      );
-      if (!refreshRes.ok || cancelled) return;
-      const refreshPayload = await refreshRes.json();
-      const refreshed = (refreshPayload.items || []).map(mapQuickSummaryItem);
-      setFollowUps(refreshed);
-      setFollowUpCount(refreshPayload.openCount ?? refreshed.length);
-    };
-
-    const realtimeChannel = supabase
-      .channel(`quickmenu-followups-${workerId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'followups',
-          filter: 'deleted_at=is.null',
-        },
-        (payload) => {
-          if (followUpDebounceRef.current) {
-            clearTimeout(followUpDebounceRef.current);
-          }
-          followUpDebounceRef.current = setTimeout(async () => {
-            if (cancelled) return;
-
-            const eventType = payload.eventType;
-            const rowId = payload.new?.id || payload.old?.id;
-
-            if (eventType === 'DELETE' || payload.new?.deleted_at) {
-              setFollowUps((prev) => prev.filter((fu) => fu.id !== rowId));
-              setFollowUpCount((c) => Math.max(0, c - 1));
-              return;
-            }
-
-            if (rowId) {
-              try {
-                const singleParams = new URLSearchParams({
-                  followUpId: rowId,
-                  limit: '1',
-                  page: '1',
-                });
-                const singleRes = await fetch(
-                  `/api/follow-ups/list-summary?${singleParams.toString()}`,
-                  { cache: 'no-store' }
-                );
-                if (singleRes.ok) {
-                  const singlePayload = await singleRes.json();
-                  const row = singlePayload.followUps?.[0];
-                  if (row) {
-                    const mapped = mapQuickSummaryItem(row);
-                    setFollowUps((prev) => {
-                      const idx = prev.findIndex((fu) => fu.id === rowId);
-                      if (idx >= 0) {
-                        const next = [...prev];
-                        next[idx] = mapped;
-                        return next;
-                      }
-                      return [mapped, ...prev].slice(0, 10);
-                    });
-                    return;
-                  }
-                }
-              } catch (patchErr) {
-                console.warn('QuickMenu follow-up row patch failed:', patchErr);
-              }
-            }
-
-            await throttledFullRefresh();
-          }, REALTIME_DEBOUNCE_MS);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      cancelled = true;
-      if (followUpDebounceRef.current) {
-        clearTimeout(followUpDebounceRef.current);
-      }
-      supabase.removeChannel(realtimeChannel);
-    };
-  }, [workerId, router.pathname]);
-
-  // Update the filter change handler with logging
-  const handleFilterChange = (type, value) => {
-    // console.log('Filter change:', { type, value });
-    setFilters(prev => {
-      const newFilters = {
-        ...prev,
-        [type]: value
-      };
-      // console.log('New filters state:', newFilters);
-      return newFilters;
-    });
-  };
-
-  // Add this function to handle View All click
-  const handleViewAllFollowUps = () => {
-    // Reset all filters to default
-    setFilters({
-      status: 'all',
-      type: 'all',
-      dateRange: {
-        start: null,
-        end: null
-      }
-    });
-
-    // Navigate to follow-ups page with reset filters
-    router.push({
-      pathname: '/dashboard/follow-ups',
-      query: {
-        status: 'all',
-        type: 'all'
-      }
-    });
-  };
 
   return (
     <Fragment>
