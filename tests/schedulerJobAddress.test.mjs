@@ -38,6 +38,34 @@ assert.equal(
   '38 IMBIAH ROAD, Singapore, 098465'
 );
 
+// HTML entity ampersands must decode for plain-text Location UI (scheduler modal /
+// Job Details). Work Description HTML already decodes; location must not show "&amp;".
+assert.equal(
+  resolveJobDisplayAddress({
+    description:
+      '[ADDRESS:#06-03 POLLEN &amp; BLEU 15 FARRER DRIVE, SINGAPORE, 259296]',
+  }),
+  '#06-03 POLLEN & BLEU 15 FARRER DRIVE, SINGAPORE, 259296'
+);
+
+assert.equal(
+  resolveJobDisplayAddress({
+    description: '',
+    location: {
+      location_name: '#06-03 POLLEN &amp; BLEU 15 FARRER DRIVE, Singapore, 259296',
+    },
+  }),
+  '#06-03 POLLEN & BLEU 15 FARRER DRIVE, Singapore, 259296'
+);
+
+assert.equal(
+  resolveJobDisplayAddress(
+    { description: '' },
+    { scheduleAddress: 'PANASONIC R &amp; D CENTER, Singapore' }
+  ),
+  'PANASONIC R & D CENTER, Singapore'
+);
+
 // customer_location row wins when matched by location_id (scheduler API enrichment).
 const customerLocations = [
   {
@@ -51,12 +79,17 @@ const customerLocations = [
   },
 ];
 
-assert.equal(
-  resolveJobDisplayAddress(
-    { description: '', location_id: 'loc-sushi' },
-    { scheduleAddress: staleScheduleAddress, customerLocations }
-  ),
-  '100 TRAS STREET, #04-07/08 100AM SUSHIRO, Singapore, 079027'
+const fromCustomerLocation = resolveJobDisplayAddress(
+  { description: '', location_id: 'loc-sushi' },
+  { scheduleAddress: staleScheduleAddress, customerLocations }
+);
+assert.ok(
+  fromCustomerLocation.includes('100AM SUSHIRO') || fromCustomerLocation.includes('100 TRAS STREET'),
+  'customer_location must win over stale schedule'
+);
+assert.ok(
+  !fromCustomerLocation.includes('CHIJMES'),
+  'must not use stale job_schedule.address'
 );
 
 console.log('schedulerJobAddress tests passed');

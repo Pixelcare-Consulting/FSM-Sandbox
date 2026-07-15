@@ -119,6 +119,22 @@ test('jobDisplayCustomerName — polluted tag with card-code prefix uses linked 
   assertEquals(jobDisplayCustomerName(job), 'HOR GUOYONG');
 });
 
+test('jobDisplayCustomerName — decodes HTML ampersand entities', () => {
+  assertEquals(
+    jobDisplayCustomerName({
+      description: '[CUSTOMER:PANASONIC R &amp; D CENTER SINGAPORE]',
+    }),
+    'PANASONIC R & D CENTER SINGAPORE'
+  );
+  assertEquals(
+    jobDisplayCustomerName({
+      customer: { customer_name: 'POLLEN &AMP; BLEU' },
+      description: '[AIFM:1]',
+    }),
+    'POLLEN & BLEU'
+  );
+});
+
 test('sortAifmJobsForJobNumberAssignment — by scheduled_start not AIFM id', () => {
   const jobs = [
     { id: 235578, job_start_date: '2026-06-13', job_start_time: '02:30' },

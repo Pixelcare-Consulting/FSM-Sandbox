@@ -10,6 +10,15 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.20',
+    date: '2026-07-15',
+    title: 'Decode HTML &amp; in job location and customer names',
+    notes: [
+      'resolveJobDisplayAddress now sanitizes ADDRESS tags, location_name, and schedule address so Location panels show & not literal &amp;.',
+      'jobDisplayCustomerName / job detail payload decode portal HTML entities in customer display names (e.g. PANASONIC R & D).',
+    ],
+  },
+  {
     version: '3.15.19',
     date: '2026-07-15',
     title: 'Fix Edit Job crash for null location_id',
