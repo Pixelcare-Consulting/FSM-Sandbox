@@ -10,6 +10,15 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.19',
+    date: '2026-07-15',
+    title: 'Fix Edit Job crash for null location_id',
+    notes: [
+      'Harden locationSelectOptionLabel so nested address objects are never rendered as React children.',
+      'EditJobs only seeds selectedLocation/selectedContact when a real site or contact label exists; mapJobDetailToEditForm returns null for empty locations and normalizes string addresses.',
+    ],
+  },
+  {
     version: '3.15.18',
     date: '2026-07-15',
     title: 'Clear job-detail server cache after follow-up mutations',

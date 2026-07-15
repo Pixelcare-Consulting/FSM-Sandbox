@@ -872,32 +872,93 @@ const EditJobs = ({ initialJobData, jobId: jobIdProp }) => {
     if (jobHydratedFromFetchRef.current) return;
     if (!initialJobData) return;
 
-    if (initialJobData.contact) {
+    const contact = initialJobData.contact;
+    if (contact && typeof contact === "object") {
+      const contactId =
+        contact.contactID || contact.id || contact.contactId || "";
       const contactFullName =
-        initialJobData.contact.contactFullname ||
-        `${initialJobData.contact.firstName || ""} ${initialJobData.contact.middleName || ""} ${initialJobData.contact.lastName || ""}`.trim() ||
-        initialJobData.contact.contactID;
-      setSelectedContact({
-        value: initialJobData.contact.contactID,
-        label: contactFullName,
-        ...initialJobData.contact,
-      });
+        contact.contactFullname ||
+        `${contact.firstName || ""} ${contact.middleName || ""} ${contact.lastName || ""}`.trim() ||
+        contactId;
+      const contactEmail = contact.email || "";
+      const hasSelectableContact =
+        String(contactId || "").trim() !== "" ||
+        String(contactFullName || "").trim() !== "" ||
+        String(contactEmail || "").trim() !== "";
+
       setFormData((prev) => ({
         ...prev,
-        contact: initialJobData.contact,
+        contact: {
+          contactID: contactId || "",
+          contactFullname: contact.contactFullname || "",
+          firstName: contact.firstName || "",
+          middleName: contact.middleName || "",
+          lastName: contact.lastName || "",
+          phoneNumber: contact.phoneNumber || "",
+          mobilePhone: contact.mobilePhone || "",
+          email: contactEmail || "",
+        },
       }));
+
+      if (hasSelectableContact) {
+        setSelectedContact({
+          value: contactId,
+          label: contactFullName || contactEmail || contactId,
+          ...contact,
+        });
+      }
     }
 
-    if (initialJobData.location) {
-      setSelectedLocation({
-        value: initialJobData.location.locationName,
-        label: initialJobData.location.locationName,
-        ...initialJobData.location,
-      });
+    const location = initialJobData.location;
+    if (location && typeof location === "object") {
+      const locationName = String(location.locationName || "").trim();
+      const siteId = String(location.siteId || "").trim();
+      const addressText =
+        typeof location.address === "string"
+          ? location.address.trim()
+          : "";
+      const hasSelectableLocation =
+        locationName !== "" || siteId !== "" || addressText !== "";
+
+      // Keep granular address fields for inputs even when Site Select stays empty.
+      const normalizedAddress =
+        location.address && typeof location.address === "object"
+          ? location.address
+          : {
+              streetNo: "",
+              streetAddress: addressText || "",
+              block: "",
+              buildingNo: "",
+              city: "",
+              stateProvince: "",
+              postalCode: "",
+              country: "",
+            };
+
       setFormData((prev) => ({
         ...prev,
-        location: initialJobData.location,
+        location: {
+          locationName: locationName || siteId || "",
+          address: normalizedAddress,
+          coordinates: location.coordinates || {
+            latitude: "",
+            longitude: "",
+          },
+        },
       }));
+
+      if (hasSelectableLocation) {
+        setSelectedLocation({
+          value: locationName || siteId || addressText,
+          label: locationName || siteId || addressText,
+          siteId: siteId || undefined,
+          ...location,
+          address:
+            typeof location.address === "string"
+              ? location.address
+              : addressText || locationName || siteId,
+        });
+      }
     }
   }, [initialJobData]);
 
