@@ -10,6 +10,33 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.13',
+    date: '2026-07-15',
+    title: 'Clear remaining dep deprecation advisories',
+    notes: [
+      'Upgrade @fortawesome/react-fontawesome 0.2 → 3.x (SVG core stays on v6; icons in app still use fas CSS classes).',
+      'Upgrade recharts 2 → 3.x and add react-is peer (no app imports today; chart demos remain compatible with v3 default API).',
+      'Upgrade uuid 10 → 14 (Node 20+ ESM); existing import { v4 } from \"uuid\" call sites unchanged.',
+    ],
+  },
+  {
+    version: '3.15.12',
+    date: '2026-07-15',
+    title: 'Align ESLint stack with Next.js 16',
+    notes: [
+      'Upgrade eslint-config-next 14 → 16.2.10 to match next; pin eslint to ^9 (plugins still peer eslint<=9; clears unmet peers from eslint 10).',
+      'Migrate .eslintrc.json → eslint.config.mjs flat config; lint script uses eslint .',
+    ],
+  },
+  {
+    version: '3.15.11',
+    date: '2026-07-15',
+    title: 'Align @supabase/supabase-js peer with SSR',
+    notes: [
+      'Bump @supabase/supabase-js to ^2.108.0 so it meets @supabase/ssr 0.12 peer (^2.108.0); clears unmet peer warning.',
+    ],
+  },
+  {
     version: '3.15.10',
     date: '2026-07-15',
     title: 'Allow Supabase storage hosts for next/image',

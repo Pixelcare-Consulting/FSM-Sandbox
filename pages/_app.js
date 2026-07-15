@@ -17,6 +17,7 @@ import { AppWarmupProvider } from '../contexts/AppWarmupContext';
 import { SettingsProvider } from '../contexts/SettingsContext';
 import { LogoProvider } from '../contexts/LogoContext';
 import { AuthProvider } from '../contexts/AuthContext';
+import { Analytics } from '@vercel/analytics/next';
 
 // Layouts
 import DefaultMarketingLayout from "layouts/marketing/DefaultLayout";
@@ -76,6 +77,7 @@ function MyApp({ Component, pageProps }) {
 
   return (
     <StyleSheetManager shouldForwardProp={shouldForwardProp}>
+    <Analytics />
     <AuthProvider>
       <LogoProvider>
         <SettingsProvider>
