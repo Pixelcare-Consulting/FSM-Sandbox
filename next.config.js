@@ -20,17 +20,25 @@ const nextConfig = {
   // Allow cross-origin requests from specific domains in development
   allowedDevOrigins: ['pxcserver.ddns.net'],
   
-  // Image configuration for external domains
+  // Image configuration for external domains.
+  // Allow any *.supabase.co project — avatar/logo URLs may still point at an older
+  // project ref than NEXT_PUBLIC_SUPABASE_URL (env-only allowlist would reject them).
   images: {
     remotePatterns: [
-      // Supabase storage images
-      ...(supabaseHostname ? [{
+      {
         protocol: 'https',
-        hostname: supabaseHostname,
-      }] : [{
-        protocol: 'https',
-        hostname: '*.supabase.co',
-      }]),
+        hostname: '**.supabase.co',
+        pathname: '/storage/v1/object/public/**',
+      },
+      ...(supabaseHostname
+        ? [
+            {
+              protocol: 'https',
+              hostname: supabaseHostname,
+              pathname: '/storage/v1/object/public/**',
+            },
+          ]
+        : []),
     ],
   },
   

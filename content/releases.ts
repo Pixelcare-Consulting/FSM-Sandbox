@@ -10,6 +10,22 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.10',
+    date: '2026-07-15',
+    title: 'Allow Supabase storage hosts for next/image',
+    notes: [
+      'next.config.js images.remotePatterns uses **.supabase.co (public storage pathname) so avatars from an older project ref are not rejected when NEXT_PUBLIC_SUPABASE_URL points at another project.',
+    ],
+  },
+  {
+    version: '3.15.9',
+    date: '2026-07-15',
+    title: 'Remove deprecated jsconfig baseUrl',
+    notes: [
+      'Drop compilerOptions.baseUrl from jsconfig.json — deprecated in TypeScript 6 / removed in 7; paths @/* remain relative to the config directory.',
+    ],
+  },
+  {
     version: '3.15.8',
     date: '2026-07-15',
     title: 'Field BFF login / logout APIs',
