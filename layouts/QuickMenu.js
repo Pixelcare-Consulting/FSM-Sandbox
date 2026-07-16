@@ -665,15 +665,16 @@ const QuickMenu = ({ children }) => {
     if (workerId && workerId !== uid) ids.push(workerId);
     return [...new Set(ids.filter(Boolean))];
   }, [uid, workerId]);
+  const userDetailsId = userDetails?.id;
 
-  const allNotificationSubjectIdsRef = useRef([]);
-  allNotificationSubjectIdsRef.current = useMemo(() => {
+  const allNotificationSubjectIds = useMemo(() => {
     const ids = [...notificationSubjectIds];
-    if (userDetails?.id && !ids.includes(userDetails.id)) {
-      ids.push(userDetails.id);
+    if (userDetailsId && !ids.includes(userDetailsId)) {
+      ids.push(userDetailsId);
     }
     return ids;
-  }, [notificationSubjectIds, userDetails?.id]);
+  }, [notificationSubjectIds, userDetailsId]);
+  const allNotificationSubjectIdsRef = useRef(allNotificationSubjectIds);
 
   const [notifMenuShow, setNotifMenuShow] = useState(false);
   const notifHoverCloseTimer = useRef(null);
@@ -696,15 +697,23 @@ const QuickMenu = ({ children }) => {
   });
 
   useEffect(() => {
+    allNotificationSubjectIdsRef.current = allNotificationSubjectIds;
+  }, [allNotificationSubjectIds]);
+
+  useEffect(() => {
     const notificationsList = notificationsPayload?.notifications || [];
+    const nextUnreadCount =
+      notificationsPayload?.unreadCount ?? notificationsList.filter((n) => !n.read).length;
+
     seenNotificationIdsRef.current = new Set(notificationsList.map((n) => n.id));
-    setNotifications(notificationsList);
-    setUnreadCount(
-      notificationsPayload?.unreadCount ?? notificationsList.filter((n) => !n.read).length
-    );
     if (notificationsPayload?.fetchedAt) {
       lastNotifFetchRef.current = Date.now();
     }
+
+    queueMicrotask(() => {
+      setNotifications(notificationsList);
+      setUnreadCount(nextUnreadCount);
+    });
   }, [notificationsPayload]);
 
   const clearNotifHoverCloseTimer = () => {
@@ -851,9 +860,12 @@ const QuickMenu = ({ children }) => {
   );
 
   const loadNotificationsRef = useRef(loadNotifications);
-  loadNotificationsRef.current = loadNotifications;
   const patchNotificationFromRealtimeRef = useRef(patchNotificationFromRealtime);
-  patchNotificationFromRealtimeRef.current = patchNotificationFromRealtime;
+
+  useEffect(() => {
+    loadNotificationsRef.current = loadNotifications;
+    patchNotificationFromRealtimeRef.current = patchNotificationFromRealtime;
+  }, [loadNotifications, patchNotificationFromRealtime]);
 
   // Notification realtime subscribe (initial fetch is owned by useNotificationsQuery)
   useEffect(() => {
@@ -895,7 +907,7 @@ const QuickMenu = ({ children }) => {
       }
       supabase.removeChannel(channel);
     };
-  }, [notificationSubjectIds]);
+  }, [notificationSubjectIds, router.events]);
 
   /** Instant refresh after local emits (`jobStakeholderNotificationsClient`); also catches missed Realtime events. */
   useEffect(() => {
@@ -905,7 +917,7 @@ const QuickMenu = ({ children }) => {
     };
     window.addEventListener('fsm:notifications-refresh', refresh);
     return () => window.removeEventListener('fsm:notifications-refresh', refresh);
-  }, [notificationSubjectIds]);
+  }, [notificationSubjectIds, router.events]);
 
   /** Refetch when returning to the tab (throttled; Realtime can lag if reconnecting). */
   useEffect(() => {
@@ -943,7 +955,7 @@ const QuickMenu = ({ children }) => {
     return () => {
       router.events.off('routeChangeComplete', onRouteDone);
     };
-  }, [notificationSubjectIds]);
+  }, [notificationSubjectIds, router.events]);
 
   // Add mark all as read function
   const markAllAsRead = async () => {
@@ -1022,8 +1034,8 @@ const QuickMenu = ({ children }) => {
   };
 
   // Add debounced search function
-  const debouncedSearch = useCallback(
-    debounce(async (value) => {
+  const debouncedSearch = useMemo(
+    () => debounce(async (value) => {
       if (!value.trim()) {
         setShowSearchResults(false);
         setSearchResults([]);
@@ -1044,9 +1056,15 @@ const QuickMenu = ({ children }) => {
       } finally {
         setIsSearching(false);
       }
-    }, 300), // 300ms delay
-    [] // Removed db dependency since Firebase is disabled
+    }, 300),
+    []
   );
+
+  useEffect(() => {
+    return () => {
+      debouncedSearch.cancel();
+    };
+  }, [debouncedSearch]);
 
   // Memoize search handlers
   const handleSearchChange = useCallback((e) => {
@@ -1104,13 +1122,18 @@ const QuickMenu = ({ children }) => {
     );
   }, [searchQuery, handleSearchChange, handleSearchSubmit, handleClearSearch]);
 
-  // Add this effect to clear search when route changes
   useEffect(() => {
-    // Clear search when route changes
-    setSearchQuery('');
-    setShowSearchResults(false);
-    setSearchResults([]);
-  }, [router.pathname]);
+    const clearSearchOnRouteChange = () => {
+      setSearchQuery('');
+      setShowSearchResults(false);
+      setSearchResults([]);
+    };
+
+    router.events.on('routeChangeStart', clearSearchOnRouteChange);
+    return () => {
+      router.events.off('routeChangeStart', clearSearchOnRouteChange);
+    };
+  }, [router.events]);
 
   return (
     <Fragment>

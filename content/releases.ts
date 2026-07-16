@@ -10,6 +10,15 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.21',
+    date: '2026-07-16',
+    title: 'Fix QuickMenu ref sync during render',
+    notes: [
+      'Move QuickMenu notification callback ref updates into an effect so React no longer throws "Cannot access refs during render".',
+      'Keeps realtime subscriptions reading the latest loadNotifications and patchNotificationFromRealtime callbacks without render-time ref mutation.',
+    ],
+  },
+  {
     version: '3.15.20',
     date: '2026-07-15',
     title: 'Decode HTML &amp; in job location and customer names',
