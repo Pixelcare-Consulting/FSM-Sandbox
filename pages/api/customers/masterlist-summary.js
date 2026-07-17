@@ -6,6 +6,7 @@ import {
   listRowFromSupabaseCustomer,
 } from '../../../lib/customers/supabaseCustomerSapShim';
 import { customerMatchesListGlobalSearch } from '../../../lib/customers/customerListGlobalSearchFilter';
+import { findCustomerIdsMatchingLocationTokens } from '../../../lib/customers/masterlistLocationSearch';
 import { isPortalCustomerCode } from '../../../lib/customers/promotePortalCustomerCodes';
 import { applySapCustomerMasterlistFilters } from '../../../lib/customers/sapMasterlistCustomerQuery';
 import {
@@ -19,6 +20,7 @@ import {
 
 const CACHE_TTL_MS = 45000;
 const COUNTRY_STATS_CACHE_TTL_MS = 12 * 60 * 1000;
+const LOCATION_MATCH_ID_LIMIT = 200;
 const CUSTOMER_SEARCH_FIELDS = [
   'customer_code',
   'customer_name',
@@ -144,6 +146,15 @@ export default withSession(async function handler(req, res) {
     }
 
     const tokens = parseSearchTokens(search);
+    const locationMatchedIds =
+      tokens.length > 0
+        ? await findCustomerIdsMatchingLocationTokens(
+            supabase,
+            tokens,
+            LOCATION_MATCH_ID_LIMIT
+          )
+        : [];
+    const locationIdSet = new Set(locationMatchedIds);
 
     const listSelect = country
       ? `${SUPABASE_CUSTOMER_LIST_FLAT_SELECT.trim()}, customer_location!inner(country_name)`
@@ -170,12 +181,37 @@ export default withSession(async function handler(req, res) {
       }
     );
 
+    let mergedRows = dbRows;
+    if (tokens.length > 0 && locationMatchedIds.length > 0) {
+      const presentIds = new Set(dbRows.map((row) => row.id).filter(Boolean));
+      const missingIds = locationMatchedIds.filter((id) => !presentIds.has(id));
+      if (missingIds.length > 0) {
+        let extraQuery = applySapCustomerMasterlistFilters(
+          supabase
+            .from('customer')
+            .select(listSelect)
+            .is('deleted_at', null)
+            .in('id', missingIds.slice(0, limit))
+        );
+        if (country) {
+          extraQuery = extraQuery.filter(
+            'customer_location.country_name',
+            'ilike',
+            `%${country}%`
+          );
+        }
+        const { data: extraRows, error: extraError } = await extraQuery;
+        if (extraError) throw extraError;
+        mergedRows = [...dbRows, ...(extraRows || [])];
+      }
+    }
+
     const locationSummariesByCustomerId = await fetchLocationSummariesByCustomerIds(
       supabase,
-      dbRows.map((row) => row.id)
+      mergedRows.map((row) => row.id)
     );
 
-    let customers = dbRows.map((row) => {
+    let customers = mergedRows.map((row) => {
       const { customer_location: _filterJoin, ...flatRow } = row;
       return listRowFromSupabaseCustomer({
         ...flatRow,
@@ -187,7 +223,18 @@ export default withSession(async function handler(req, res) {
 
     if (search) {
       const qLower = search.toLowerCase();
-      customers = customers.filter((c) => customerMatchesListGlobalSearch(c, qLower));
+      // After location summaries are attached, AllAddresses covers site text (incl. Other).
+      // Also keep location-ID hits if blob mapping ever omits a field.
+      const codeToId = new Map(
+        mergedRows
+          .filter((r) => r.customer_code && r.id)
+          .map((r) => [String(r.customer_code).toUpperCase(), r.id])
+      );
+      customers = customers.filter((c) => {
+        if (customerMatchesListGlobalSearch(c, qLower)) return true;
+        const id = codeToId.get(String(c.CardCode || '').toUpperCase());
+        return id ? locationIdSet.has(id) : false;
+      });
     }
 
     const stats = page === 1 && !search && !country ? await fetchCountryStats(supabase) : getListCache('customers-country-stats', COUNTRY_STATS_CACHE_TTL_MS) || { addressCount: 0, topCountry: '', topCountryCount: 0 };

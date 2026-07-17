@@ -10,6 +10,15 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.22',
+    date: '2026-07-17',
+    title: 'Global masterlist search includes site locations',
+    notes: [
+      'Global search (/api/search/global-masterlist) now matches customer_location and sap_lead_location site text (street, building, address, zip, site_id) so Other portal addresses like “#04-21 NASSIM PARK” are findable.',
+      'Customers masterlist-summary search unions the same location ID matches (capped 200) without full-table client fetches; Cache-Control private max-age=30 unchanged.',
+    ],
+  },
+  {
     version: '3.15.21',
     date: '2026-07-16',
     title: 'Fix QuickMenu ref sync during render',

@@ -1,6 +1,6 @@
 {
   "name": "sas-sapb1-portal",
-  "version": "3.15.21",
+  "version": "3.15.22",
   "private": true,
   "packageManager": "pnpm@10.8.0",
   "scripts": {

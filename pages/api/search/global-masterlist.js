@@ -11,7 +11,6 @@ import {
   SUPABASE_CUSTOMER_LIST_FLAT_SELECT,
   listRowFromSupabaseCustomer,
 } from '../../../lib/customers/supabaseCustomerSapShim';
-import { customerMatchesListGlobalSearch } from '../../../lib/customers/customerListGlobalSearchFilter';
 import { mergeSapAddressFieldsDeduped } from '../../../lib/customers/mergeSapAddressSegments';
 import {
   SUPABASE_SAP_LEAD_LIST_SUMMARY_SELECT,
@@ -24,11 +23,16 @@ import {
   parseSearchTokens,
   setListCache,
 } from '../../../lib/supabase/listQueryHelpers';
+import {
+  findCustomerIdsMatchingLocationTokens,
+  findSapLeadIdsMatchingLocationTokens,
+} from '../../../lib/customers/masterlistLocationSearch';
 
 const QUICK_LIMIT = 50;
 const FULL_LIMIT = 200;
 const MAX_FORM_LEADS = 200;
 const CACHE_TTL_MS = 30000;
+const LOCATION_MATCH_ID_LIMIT = 200;
 
 const CUSTOMER_SEARCH_FIELDS = [
   'customer_code',
@@ -57,32 +61,6 @@ const FORM_LEAD_SEARCH_FIELDS = [
   'street',
   'postcode',
 ];
-
-function leadMatchesListGlobalSearch(lead, qLower) {
-  const searchableFields = [
-    lead.CardCode,
-    lead.CardName,
-    lead.Phone1,
-    lead.Phone2,
-    lead.Cellular,
-    lead.EmailAddress,
-    lead.ContactPerson,
-    lead.Address,
-    lead.MailAddress,
-    lead.Street,
-    lead.ZipCode,
-    lead.City,
-    lead.Country,
-    lead.Building,
-    lead.BillToBuildingFloorRoom,
-    lead.Notes,
-    lead.FreeText,
-  ]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-  return textMatchesAllSearchTokens(searchableFields, qLower);
-}
 
 function formatCustomerResultAddress(c) {
   if (c.AllAddresses && c.AllAddresses.length > 0) {
@@ -221,97 +199,111 @@ function mergeMasterlistSearchResults(formLeadRows, customerResults, sapLeadResu
   return results;
 }
 
-async function searchViaRpc(supabase, q, limit) {
-  try {
-    const { data, error } = await supabase.rpc('search_masterlist', {
-      q,
-      result_limit: limit,
-    });
-    if (error || !Array.isArray(data)) return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
-
-function mapRpcRowsToResults(rpcRows) {
-  const customerResults = [];
-  const sapLeadResults = [];
-  const formLeadRows = [];
-
-  for (const row of rpcRows) {
-    const source = String(row.source_type || '').toLowerCase();
-    if (source === 'customer') {
-      customerResults.push(
-        mapMasterlistCustomerToResult({
-          CardCode: row.code,
-          CardName: row.name,
-          Phone1: row.phone,
-          EmailAddress: row.email,
-          AllAddresses: row.address
-            ? [{ Street: row.address, Address1: row.address }]
-            : [],
-        })
-      );
-    } else if (source === 'sap_lead') {
-      sapLeadResults.push(
-        mapMasterlistLeadToResult({
-          CardCode: row.code,
-          CardName: row.name,
-          Phone1: row.phone,
-          EmailAddress: row.email,
-          Address: row.address,
-          Street: row.address,
-        })
-      );
-    } else if (source === 'form_lead') {
-      formLeadRows.push(
-        mapFormLeadRow({
-          id: row.code,
-          full_name: row.name,
-          email: row.email,
-          handphone: row.phone,
-          address: row.address,
-        })
-      );
-    }
-  }
-
-  return mergeMasterlistSearchResults(formLeadRows, customerResults, sapLeadResults);
-}
-
 async function searchCustomersFiltered(supabase, tokens, limit) {
-  let query = supabase
+  const safeLimit = Math.min(Math.max(1, Number(limit) || QUICK_LIMIT), FULL_LIMIT);
+
+  let flatQuery = supabase
     .from('customer')
     .select(SUPABASE_CUSTOMER_LIST_FLAT_SELECT)
     .is('deleted_at', null)
     .order('customer_name', { ascending: true })
-    .limit(limit);
+    .limit(safeLimit);
 
   if (tokens.length > 0) {
-    query = applyMultiTokenIlikeFilters(query, tokens, CUSTOMER_SEARCH_FIELDS);
+    flatQuery = applyMultiTokenIlikeFilters(flatQuery, tokens, CUSTOMER_SEARCH_FIELDS);
   }
 
-  const { data, error } = await query;
-  if (error) throw error;
-  return data || [];
+  const locationIdsPromise =
+    tokens.length > 0
+      ? findCustomerIdsMatchingLocationTokens(supabase, tokens, LOCATION_MATCH_ID_LIMIT)
+      : Promise.resolve([]);
+
+  const [{ data: flatRows, error: flatError }, locationCustomerIds] = await Promise.all([
+    flatQuery,
+    locationIdsPromise,
+  ]);
+  if (flatError) throw flatError;
+
+  const byId = new Map();
+  for (const row of flatRows || []) {
+    if (row?.id) byId.set(row.id, row);
+  }
+
+  const missingIds = locationCustomerIds.filter((id) => id && !byId.has(id));
+  if (missingIds.length > 0) {
+    const { data: locationRows, error: locationError } = await supabase
+      .from('customer')
+      .select(SUPABASE_CUSTOMER_LIST_FLAT_SELECT)
+      .is('deleted_at', null)
+      .in('id', missingIds.slice(0, safeLimit))
+      .order('customer_name', { ascending: true });
+    if (locationError) throw locationError;
+    for (const row of locationRows || []) {
+      if (row?.id) byId.set(row.id, row);
+    }
+  }
+
+  return [...byId.values()]
+    .sort((a, b) =>
+      String(a.customer_name || '').localeCompare(String(b.customer_name || ''), undefined, {
+        sensitivity: 'base',
+      })
+    )
+    .slice(0, safeLimit);
 }
 
 async function searchSapLeadsFiltered(supabase, tokens, limit) {
-  let query = supabase
+  const safeLimit = Math.min(Math.max(1, Number(limit) || QUICK_LIMIT), FULL_LIMIT);
+  const leadSelect = `id, ${SUPABASE_SAP_LEAD_LIST_SUMMARY_SELECT.trim()}`;
+
+  let flatQuery = supabase
     .from('sap_lead')
-    .select(SUPABASE_SAP_LEAD_LIST_SUMMARY_SELECT)
+    .select(leadSelect)
     .is('deleted_at', null)
     .order('lead_name', { ascending: true })
-    .limit(limit);
+    .limit(safeLimit);
 
   if (tokens.length > 0) {
-    query = applyMultiTokenIlikeFilters(query, tokens, SAP_LEAD_SEARCH_FIELDS);
+    flatQuery = applyMultiTokenIlikeFilters(flatQuery, tokens, SAP_LEAD_SEARCH_FIELDS);
   }
 
-  const { data, error } = await query;
-  if (error) throw error;
-  return data || [];
+  const locationIdsPromise =
+    tokens.length > 0
+      ? findSapLeadIdsMatchingLocationTokens(supabase, tokens, LOCATION_MATCH_ID_LIMIT)
+      : Promise.resolve([]);
+
+  const [{ data: flatRows, error: flatError }, locationLeadIds] = await Promise.all([
+    flatQuery,
+    locationIdsPromise,
+  ]);
+  if (flatError) throw flatError;
+
+  const byId = new Map();
+  for (const row of flatRows || []) {
+    if (row?.id) byId.set(row.id, row);
+  }
+
+  const missingIds = locationLeadIds.filter((id) => id && !byId.has(id));
+  if (missingIds.length > 0) {
+    const { data: locationRows, error: locationError } = await supabase
+      .from('sap_lead')
+      .select(leadSelect)
+      .is('deleted_at', null)
+      .in('id', missingIds.slice(0, safeLimit))
+      .order('lead_name', { ascending: true });
+    if (locationError) throw locationError;
+    for (const row of locationRows || []) {
+      if (row?.id) byId.set(row.id, row);
+    }
+  }
+
+  return [...byId.values()]
+    .sort((a, b) =>
+      String(a.lead_name || '').localeCompare(String(b.lead_name || ''), undefined, {
+        sensitivity: 'base',
+      })
+    )
+    .slice(0, safeLimit);
 }
 
 async function searchFormLeadsFiltered(supabase, tokens, limit) {
@@ -365,22 +357,8 @@ export default withSession(async function handler(req, res) {
   }
 
   try {
-    const rpcRows = await searchViaRpc(supabase, q, resultLimit);
-    if (rpcRows && rpcRows.length > 0) {
-      const results = mapRpcRowsToResults(rpcRows).slice(0, resultLimit);
-      const payload = {
-        results,
-        totalCount: results.length,
-        counts: {
-          customers: results.filter((r) => r.type === 'customer').length,
-          leads: results.filter((r) => r.type === 'lead').length,
-        },
-      };
-      setListCache(cacheKey, payload, CACHE_TTL_MS);
-      logResponseSize('global-masterlist (rpc)', payload);
-      return res.status(200).json(payload);
-    }
-
+    // PostgREST path unions flat customer/sap_lead fields with customer_location /
+    // sap_lead_location site text (Other addresses included). Caps: 50 quick / 200 full.
     const perSourceLimit = Math.ceil(resultLimit / 2);
 
     const [customerBundles, sapLeadBundles, formLeadRowsRaw] = await Promise.all([
@@ -389,19 +367,15 @@ export default withSession(async function handler(req, res) {
       searchFormLeadsFiltered(supabase, tokens, perSourceLimit),
     ]);
 
-    const customerResults = [];
-    for (const bundle of customerBundles) {
-      const c = listRowFromSupabaseCustomer(bundle);
-      if (!customerMatchesListGlobalSearch(c, qLower)) continue;
-      customerResults.push(mapMasterlistCustomerToResult(c));
-    }
+    // Server already matched flat fields OR location site text — do not re-filter
+    // with flat-only blobs (list rows have no nested AllAddresses).
+    const customerResults = customerBundles.map((bundle) =>
+      mapMasterlistCustomerToResult(listRowFromSupabaseCustomer(bundle))
+    );
 
-    const sapLeadResults = [];
-    for (const bundle of sapLeadBundles) {
-      const lead = listRowFromSupabaseSapLead(bundle);
-      if (!leadMatchesListGlobalSearch(lead, qLower)) continue;
-      sapLeadResults.push(mapMasterlistLeadToResult(lead));
-    }
+    const sapLeadResults = sapLeadBundles.map((bundle) =>
+      mapMasterlistLeadToResult(listRowFromSupabaseSapLead(bundle))
+    );
 
     const formLeadRows = [];
     for (const l of formLeadRowsRaw) {
