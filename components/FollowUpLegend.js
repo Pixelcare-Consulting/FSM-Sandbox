@@ -19,6 +19,7 @@ const FollowUpLegend = ({ followUpTypes }) => {
     { value: 'Quotation In Progress', color: '#6d28d9' },
     { value: 'Quotation Sent', color: '#0f766e' },
     { value: 'Open', color: '#1d4ed8' },
+    { value: 'Completed', color: '#2d7a2d' },
     { value: 'Cancelled', color: '#dc2626' },
   ];
 

@@ -239,13 +239,19 @@ const mapStoredDocumentToDetailDocument = (document) => ({
 });
 
 const getFollowUpStatusColor = (status) => {
-  switch (status?.toLowerCase()) {
+  switch (status?.toLowerCase()?.replace(/_/g, ' ')) {
     case 'closed':
+    case 'completed':
       return 'success';
     case 'in progress':
+    case 'quotation in progress':
       return 'warning';
     case 'logged':
+    case 'quotation sent':
+    case 'open':
       return 'info';
+    case 'cancelled':
+      return 'danger';
     default:
       return 'secondary';
   }

@@ -2221,8 +2221,16 @@ const Settings = () => {
       }
 
       const currentStatuses = followUpSettings.statuses || [];
+      const nextName = newStatus.name.trim();
+      const duplicate = currentStatuses.some(
+        (s) => String(s?.name || '').toLowerCase() === nextName.toLowerCase()
+      );
+      if (duplicate) {
+        toast.error('That status already exists (case-insensitive)');
+        return;
+      }
       const updatedStatuses = [...currentStatuses, {
-        name: newStatus.name.trim(),
+        name: nextName,
         description: newStatus.description.trim(),
         isDefault: newStatus.isDefault,
         order: currentStatuses.length

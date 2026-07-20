@@ -153,6 +153,11 @@ import { showJobCompletedEmailToast } from '../../../../lib/email/jobEmailToastM
 import { getTechnicianStatusLabel, getTechnicianStatusColor } from '../../../../lib/scheduler/technicianSchedulerUtils';
 import StatusBadge from '../../../../components/StatusBadge';
 import FollowUpLegend from '../../../../components/FollowUpLegend';
+import {
+  DEFAULT_FOLLOW_UP_STATUS_OPTIONS,
+  canonicalizeFollowUpStatusLabel,
+  isKnownFollowUpStatusOption,
+} from '../../../../lib/followUps/followUpListSummary';
 import { QRCodeSVG } from 'qrcode.react';
 
 
@@ -957,13 +962,8 @@ const JobDetails = () => {
     return `${dateStr} - ${timeStr}`;
   };
 
-  // Define constants
-  const FOLLOW_UP_STATUSES = [
-    'Quotation In Progress',
-    'Quotation Sent',
-    'Open',
-    'Cancelled',
-  ];
+  // Define constants (shared list — Open only once; Completed included; OPEN aliased on edit)
+  const FOLLOW_UP_STATUSES = DEFAULT_FOLLOW_UP_STATUS_OPTIONS;
 
   useEffect(() => {
     // Retrieve email from cookies
@@ -4944,10 +4944,11 @@ const JobDetails = () => {
   const handleStatusChange = async (followUpId, newStatus) => {
     try {
       const beforeFollowUp = job?.followUps?.[followUpId];
+      const canonicalStatus = canonicalizeFollowUpStatusLabel(newStatus) || newStatus;
       const { statusUpdatedBy, actor } = await resolveStatusUpdater();
       const statusUpdatedByAccount = getActorDisplayLabel(actor);
       const updateData = {
-        status: newStatus,
+        status: canonicalStatus,
         updated_at: new Date().toISOString()
       };
 
@@ -4976,7 +4977,7 @@ const JobDetails = () => {
       // Update local state
       const updatedFollowUp = {
         ...job?.followUps?.[followUpId],
-        status: newStatus,
+        status: canonicalStatus,
         updatedAt: new Date().toISOString(),
         updatedBy: actor || job?.followUps?.[followUpId]?.updatedBy || null,
         statusUpdatedBy: statusUpdatedBy || job?.followUps?.[followUpId]?.statusUpdatedBy || null,
@@ -4993,7 +4994,7 @@ const JobDetails = () => {
           ...prevJob.followUps,
           [followUpId]: {
             ...prevJob.followUps[followUpId],
-            status: newStatus,
+            status: canonicalStatus,
             updatedAt: new Date().toISOString(),
             updatedBy: actor || prevJob.followUps[followUpId]?.updatedBy || null,
             statusUpdatedBy: statusUpdatedBy || prevJob.followUps[followUpId]?.statusUpdatedBy || null,
@@ -5028,7 +5029,7 @@ const JobDetails = () => {
         description: 'Follow-up status updated',
         changes: buildAuditChanges(
           buildFollowUpSnapshot(beforeFollowUp),
-          buildFollowUpSnapshot({ ...beforeFollowUp, status: newStatus }),
+          buildFollowUpSnapshot({ ...beforeFollowUp, status: canonicalStatus }),
         ),
       });
 
@@ -5052,12 +5053,13 @@ const JobDetails = () => {
   const handleEditSave = async (followUp) => {
     try {
       const existingFollowUp = job?.followUps?.[followUp.id];
-      const didStatusChange = existingFollowUp?.status !== followUp.status;
+      const canonicalStatus = canonicalizeFollowUpStatusLabel(followUp.status) || followUp.status;
+      const didStatusChange = existingFollowUp?.status !== canonicalStatus;
       const didTypeChange = existingFollowUp?.type !== followUp.type;
       const shouldTrackAttendedBy = didStatusChange || didTypeChange;
       const updateData = {
         type: followUp.type,
-        status: followUp.status,
+        status: canonicalStatus,
         priority: followUp.priority,
         notes: followUp.notes ?? '',
         updated_at: new Date().toISOString()
@@ -5092,6 +5094,7 @@ const JobDetails = () => {
       // Update local state
       const updatedFollowUp = {
         ...followUp,
+        status: canonicalStatus,
         notes: followUp.notes ?? '',
         updatedAt: new Date().toISOString(),
         updatedBy: shouldTrackAttendedBy
@@ -6005,7 +6008,11 @@ const JobDetails = () => {
                                     </Form.Group>
                                     <Form.Group className="mb-3">
                                       <Form.Select
-                                        value={editingFollowUp.status}
+                                        value={
+                                          isKnownFollowUpStatusOption(editingFollowUp.status, FOLLOW_UP_STATUSES)
+                                            ? canonicalizeFollowUpStatusLabel(editingFollowUp.status)
+                                            : (editingFollowUp.status || '')
+                                        }
                                         onChange={(e) => setEditingFollowUp({
                                           ...editingFollowUp,
                                           status: e.target.value
@@ -6016,9 +6023,9 @@ const JobDetails = () => {
                                           <option key={status} value={status}>{status}</option>
                                         ))}
                                         {editingFollowUp.status &&
-                                          !FOLLOW_UP_STATUSES.includes(editingFollowUp.status) && (
+                                          !isKnownFollowUpStatusOption(editingFollowUp.status, FOLLOW_UP_STATUSES) && (
                                           <option value={editingFollowUp.status}>
-                                            {editingFollowUp.status}
+                                            {canonicalizeFollowUpStatusLabel(editingFollowUp.status)}
                                           </option>
                                         )}
                                       </Form.Select>
@@ -6059,7 +6066,7 @@ const JobDetails = () => {
                                     <div className={styles.followUpStatus}>
                                       {/* Status badge without border */}
                                       <StatusBadge 
-                                        status={followUp.status}
+                                        status={canonicalizeFollowUpStatusLabel(followUp.status)}
                                         icon={getStatusIcon(followUp.status)}
                                       />
                                       

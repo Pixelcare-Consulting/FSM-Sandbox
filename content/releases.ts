@@ -10,6 +10,15 @@ export type ReleaseEntry = {
  */
 export const releases: ReleaseEntry[] = [
   {
+    version: '3.15.23',
+    date: '2026-07-20',
+    title: 'Follow-up status: Completed + Open/OPEN dedupe',
+    notes: [
+      'Follow-up status options are now Quotation In Progress, Quotation Sent, Open, Completed, Cancelled (single Open; no OPEN duplicate).',
+      'Legacy OPEN / COMPLETED rows stay readable via case-insensitive filters and Title Case display; saves write canonical labels.',
+    ],
+  },
+  {
     version: '3.15.22',
     date: '2026-07-17',
     title: 'Global masterlist search includes site locations',

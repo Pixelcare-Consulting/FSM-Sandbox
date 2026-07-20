@@ -25,6 +25,7 @@ import { Search, X as FeatherX } from 'react-feather';
 import { useSettings } from '../../../contexts/SettingsContext';
 import {
   FOLLOW_UP_PRIORITY_LABELS,
+  canonicalizeFollowUpStatusLabel,
 } from '../../../lib/followUps/followUpListSummary';
 import { useFollowUpsListQuery, fetchFollowUpsList } from '../../../hooks/queries/useFollowUpsListQuery';
 import { useEnterToSearch } from '../../../hooks/useEnterToSearch';
@@ -53,21 +54,86 @@ const FU_TD = {
 const REALTIME_DEBOUNCE_MS = 2500;
 const REALTIME_FULL_REFETCH_MIN_MS = 30_000;
 
+/** Normalize Next.js query values (string | string[] | undefined) to a single string. */
+function queryParam(value) {
+  if (Array.isArray(value)) return value[0] ?? '';
+  return typeof value === 'string' ? value : '';
+}
+
 const FollowUpsPage = () => {
   const router = useRouter();
   const realtimeDebounceRef = useRef(null);
-  const [filters, setFilters] = useState({
-    status: router.query.status || 'all',
-    type: router.query.type || 'all',
-    dateRange: {
-      start: router.query.startDate || null,
-      end: router.query.endDate || null
-    },
-    assignedWorker: router.query.workerId || 'all',
-    followUpId: router.query.followUpId || '',
-    /** @type {'all' | 'Low' | 'Normal' | 'High' | 'Urgent'} matches followups.priority labels */
-    priority: 'all'
-  });
+
+  // URL-backed filter seed (no useEffect sync — avoids cascading setState-in-effect lint).
+  const urlFilterKey = useMemo(() => {
+    if (!router.isReady) return '';
+    return [
+      queryParam(router.query.status),
+      queryParam(router.query.type),
+      queryParam(router.query.followUpId),
+      queryParam(router.query.workerId),
+      queryParam(router.query.startDate),
+      queryParam(router.query.endDate),
+    ].join('\0');
+  }, [
+    router.isReady,
+    router.query.status,
+    router.query.type,
+    router.query.followUpId,
+    router.query.workerId,
+    router.query.startDate,
+    router.query.endDate,
+  ]);
+
+  const filtersFromUrl = useMemo(() => {
+    return {
+      status: queryParam(router.query.status) || 'all',
+      type: queryParam(router.query.type) || 'all',
+      followUpId: queryParam(router.query.followUpId) || '',
+      assignedWorker: queryParam(router.query.workerId) || 'all',
+      dateRange: {
+        start: queryParam(router.query.startDate) || null,
+        end: queryParam(router.query.endDate) || null,
+      },
+    };
+  }, [
+    router.query.status,
+    router.query.type,
+    router.query.followUpId,
+    router.query.workerId,
+    router.query.startDate,
+    router.query.endDate,
+  ]);
+
+  const [filterOverride, setFilterOverride] = useState(null);
+
+  const filters = useMemo(() => {
+    const base = {
+      ...filtersFromUrl,
+      /** @type {'all' | 'Low' | 'Normal' | 'High' | 'Urgent'} matches followups.priority labels */
+      priority: filterOverride?.values?.priority ?? 'all',
+    };
+    if (filterOverride && filterOverride.urlKey === urlFilterKey) {
+      return { ...base, ...filterOverride.values };
+    }
+    return base;
+  }, [filtersFromUrl, filterOverride, urlFilterKey]);
+
+  const setFilters = (updater) => {
+    const urlKey = urlFilterKey;
+    const fromUrl = filtersFromUrl;
+    setFilterOverride((prev) => {
+      const current =
+        prev && prev.urlKey === urlKey
+          ? { ...fromUrl, priority: 'all', ...prev.values }
+          : {
+              ...fromUrl,
+              priority: prev?.values?.priority ?? 'all',
+            };
+      const next = typeof updater === 'function' ? updater(current) : { ...current, ...updater };
+      return { urlKey, values: next };
+    });
+  };
 
   const {
     draft: customerSearchDraft,
@@ -87,23 +153,28 @@ const FollowUpsPage = () => {
   const [workers, setWorkers] = useState([]);
   const [showDebug, setShowDebug] = useState(false);
   const { followUpTypes, followUpStatuses } = useSettings();
-  const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(25);
   const [viewMode, setViewMode] = useState('list'); // 'list' or 'grouped'
   const [expandedJobs, setExpandedJobs] = useState(new Set());
+  const [pageState, setPageState] = useState({ resetKey: '', page: 1 });
 
-  // Add a useEffect to update filters when URL changes
-  useEffect(() => {
-    if (router.isReady) {
-      setFilters(prev => ({
-        ...prev,
-        status: router.query.status || 'all',
-        type: router.query.type || 'all',
-        followUpId: router.query.followUpId || '',
-        assignedWorker: router.query.workerId || 'all'
-      }));
-    }
-  }, [router.isReady, router.query]);
+  // When filters / view mode change, page resets to 1 without a syncing useEffect.
+  const listResetKey = [
+    filters.status,
+    filters.type,
+    filters.assignedWorker,
+    filters.dateRange.start ?? '',
+    filters.dateRange.end ?? '',
+    appliedCustomerSearch,
+    appliedJobNumber,
+    filters.priority,
+    viewMode,
+  ].join('\0');
+
+  const currentPage = pageState.resetKey === listResetKey ? pageState.page : 1;
+  const setCurrentPage = (page) => {
+    setPageState({ resetKey: listResetKey, page });
+  };
 
   // Fetch active technicians for filter dropdown (assignable API)
   useEffect(() => {
@@ -159,9 +230,11 @@ const FollowUpsPage = () => {
   const patchRowRef = useRef(patchRow);
   const removeRowRef = useRef(removeRow);
   const refetchFollowUpsRef = useRef(refetchFollowUps);
-  patchRowRef.current = patchRow;
-  removeRowRef.current = removeRow;
-  refetchFollowUpsRef.current = refetchFollowUps;
+  useEffect(() => {
+    patchRowRef.current = patchRow;
+    removeRowRef.current = removeRow;
+    refetchFollowUpsRef.current = refetchFollowUps;
+  });
 
   const lastFullRefetchAtRef = useRef(0);
 
@@ -170,7 +243,8 @@ const FollowUpsPage = () => {
 
   const formatStatusForDisplay = (status) => {
     if (!status) return 'N/A';
-    return status.replace(/_/g, ' ');
+    // Legacy OPEN / COMPLETED → Title Case for badges (DB rows left unchanged)
+    return canonicalizeFollowUpStatusLabel(status);
   };
 
   // Realtime: batched patch/remove with throttled full refetch (mirrors list-jobs).
@@ -313,12 +387,12 @@ const FollowUpsPage = () => {
         textColor = '#64748b';
         break;
       case 'COMPLETED':
-        backgroundColor = '#f1f5f9';
-        textColor = '#64748b';
+        backgroundColor = '#dcfce7';
+        textColor = '#166534';
         break;
       case 'CLOSED':
-        backgroundColor = '#f1f5f9';
-        textColor = '#64748b';
+        backgroundColor = '#dcfce7';
+        textColor = '#166534';
         break;
       case 'CANCELLED':
         backgroundColor = '#fee2e2';
@@ -462,11 +536,6 @@ const FollowUpsPage = () => {
     (currentPage - 1) * itemsPerPage,
     currentPage * itemsPerPage
   );
-
-  // Reset to page 1 when filters or view mode change
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [filters.status, filters.type, filters.assignedWorker, filters.dateRange, appliedCustomerSearch, appliedJobNumber, filters.priority, viewMode]);
 
   const hasActiveFilters = !!(
     appliedCustomerSearch ||
